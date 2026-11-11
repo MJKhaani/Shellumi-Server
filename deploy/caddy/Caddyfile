@@ -1,0 +1,32 @@
+# Caddyfile for Shellumi Server
+# Automatic TLS termination and proxy to backend service
+
+{$SHELLUMI_SERVER_DOMAIN:localhost} {
+    encode zstd gzip
+
+    # Health endpoints
+    handle /health/* {
+        reverse_proxy server:8080
+    }
+
+    # API endpoints and SSE stream
+    handle /api/* {
+        reverse_proxy server:8080 {
+            # Disable buffering for real-time Server-Sent Events (SSE)
+            flush_interval -1
+            header_up X-Forwarded-Proto {scheme}
+            header_up X-Forwarded-Host {host}
+            header_up X-Forwarded-For {remote_host}
+        }
+    }
+
+    # Default fallback
+    handle {
+        reverse_proxy server:8080
+    }
+
+    log {
+        output stdout
+        format json
+    }
+}
