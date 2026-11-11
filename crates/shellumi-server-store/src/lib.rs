@@ -3,10 +3,11 @@
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use shellumi_server_domain::{
-    AuditEvent, ChangeLogEntry, Device, DomainError, MutationIdempotency, OrgMembership, OrgRole,
-    Organization, Record, ServerSettings, Session, User, Vault, VaultInvite, VaultKeyEnvelope,
-    VaultMember, VaultRole,
+    AuditEvent, ChangeLogEntry, CollabParticipant, CollabSession, Device, DomainError,
+    MutationIdempotency, OrgMembership, OrgRole, Organization, Record, ServerSettings, Session,
+    User, Vault, VaultInvite, VaultKeyEnvelope, VaultMember, VaultRole,
 };
+use shellumi_server_protocol::CollabFrame;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -212,6 +213,61 @@ pub trait SyncRepository: Send + Sync {
     async fn get_snapshot_records(&self, vault_id: Uuid) -> Result<Vec<Record>, DomainError>;
 }
 
+#[async_trait]
+pub trait CollabRepository: Send + Sync {
+    async fn create_collab_session(
+        &self,
+        session: &CollabSession,
+        host_participant: &CollabParticipant,
+    ) -> Result<(), DomainError>;
+    async fn find_collab_session(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Option<CollabSession>, DomainError>;
+    async fn list_active_collab_sessions_for_user(
+        &self,
+        user_id: Uuid,
+    ) -> Result<Vec<CollabSession>, DomainError>;
+    async fn add_collab_participant(
+        &self,
+        participant: &CollabParticipant,
+    ) -> Result<(), DomainError>;
+    async fn find_collab_participant(
+        &self,
+        session_id: Uuid,
+        user_id: Uuid,
+        device_id: Uuid,
+    ) -> Result<Option<CollabParticipant>, DomainError>;
+    async fn list_collab_participants(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Vec<CollabParticipant>, DomainError>;
+    async fn revoke_collab_participant(
+        &self,
+        session_id: Uuid,
+        user_id: Uuid,
+        device_id: Uuid,
+        revoked_at: i64,
+    ) -> Result<(), DomainError>;
+    async fn grant_collab_writer_lease(
+        &self,
+        session_id: Uuid,
+        writer_user_id: Uuid,
+        writer_device_id: Uuid,
+        lease_expires_at: Option<i64>,
+    ) -> Result<u64, DomainError>;
+    async fn revoke_collab_writer_lease(&self, session_id: Uuid) -> Result<u64, DomainError>;
+    async fn terminate_collab_session(&self, session_id: Uuid, now: i64)
+        -> Result<(), DomainError>;
+    async fn append_collab_frame(&self, frame: &CollabFrame) -> Result<(), DomainError>;
+    async fn get_collab_frames(
+        &self,
+        session_id: Uuid,
+        since_sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<CollabFrame>, DomainError>;
+}
+
 pub trait Store:
     SettingsRepository
     + UserRepository
@@ -223,6 +279,7 @@ pub trait Store:
     + InviteRepository
     + KeyEnvelopeRepository
     + AuditRepository
+    + CollabRepository
 {
 }
 
@@ -251,6 +308,9 @@ struct MemoryState {
     key_envelopes: Vec<VaultKeyEnvelope>,
     audit_events: Vec<AuditEvent>,
     next_audit_id: i64,
+    collab_sessions: HashMap<Uuid, CollabSession>,
+    collab_participants: Vec<CollabParticipant>,
+    collab_frames: HashMap<Uuid, Vec<CollabFrame>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1101,6 +1161,202 @@ impl SyncRepository for InMemoryStore {
     }
 }
 
+#[async_trait]
+impl CollabRepository for InMemoryStore {
+    async fn create_collab_session(
+        &self,
+        session: &CollabSession,
+        host_participant: &CollabParticipant,
+    ) -> Result<(), DomainError> {
+        let mut lock = self.state.write().await;
+        lock.collab_sessions.insert(session.id, session.clone());
+        lock.collab_participants.push(host_participant.clone());
+        Ok(())
+    }
+
+    async fn find_collab_session(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Option<CollabSession>, DomainError> {
+        let lock = self.state.read().await;
+        Ok(lock.collab_sessions.get(&session_id).cloned())
+    }
+
+    async fn list_active_collab_sessions_for_user(
+        &self,
+        user_id: Uuid,
+    ) -> Result<Vec<CollabSession>, DomainError> {
+        let lock = self.state.read().await;
+        let participant_session_ids: std::collections::HashSet<Uuid> = lock
+            .collab_participants
+            .iter()
+            .filter(|p| p.user_id == user_id && p.revoked_at.is_none())
+            .map(|p| p.session_id)
+            .collect();
+
+        let active_sessions = lock
+            .collab_sessions
+            .values()
+            .filter(|s| {
+                (s.host_user_id == user_id || participant_session_ids.contains(&s.id))
+                    && s.terminated_at.is_none()
+            })
+            .cloned()
+            .collect();
+
+        Ok(active_sessions)
+    }
+
+    async fn add_collab_participant(
+        &self,
+        participant: &CollabParticipant,
+    ) -> Result<(), DomainError> {
+        let mut lock = self.state.write().await;
+        if let Some(existing) = lock.collab_participants.iter_mut().find(|p| {
+            p.session_id == participant.session_id
+                && p.user_id == participant.user_id
+                && p.device_id == participant.device_id
+        }) {
+            existing.role = participant.role;
+            existing.revoked_at = None;
+        } else {
+            lock.collab_participants.push(participant.clone());
+        }
+        Ok(())
+    }
+
+    async fn find_collab_participant(
+        &self,
+        session_id: Uuid,
+        user_id: Uuid,
+        device_id: Uuid,
+    ) -> Result<Option<CollabParticipant>, DomainError> {
+        let lock = self.state.read().await;
+        Ok(lock
+            .collab_participants
+            .iter()
+            .find(|p| {
+                p.session_id == session_id && p.user_id == user_id && p.device_id == device_id
+            })
+            .cloned())
+    }
+
+    async fn list_collab_participants(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Vec<CollabParticipant>, DomainError> {
+        let lock = self.state.read().await;
+        Ok(lock
+            .collab_participants
+            .iter()
+            .filter(|p| p.session_id == session_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn revoke_collab_participant(
+        &self,
+        session_id: Uuid,
+        user_id: Uuid,
+        device_id: Uuid,
+        revoked_at: i64,
+    ) -> Result<(), DomainError> {
+        let mut lock = self.state.write().await;
+        let p = lock
+            .collab_participants
+            .iter_mut()
+            .find(|p| {
+                p.session_id == session_id && p.user_id == user_id && p.device_id == device_id
+            })
+            .ok_or(DomainError::NotFound)?;
+        p.revoked_at = Some(revoked_at);
+        Ok(())
+    }
+
+    async fn grant_collab_writer_lease(
+        &self,
+        session_id: Uuid,
+        writer_user_id: Uuid,
+        writer_device_id: Uuid,
+        lease_expires_at: Option<i64>,
+    ) -> Result<u64, DomainError> {
+        let mut lock = self.state.write().await;
+        let session = lock
+            .collab_sessions
+            .get_mut(&session_id)
+            .ok_or(DomainError::CollabSessionNotFound(session_id))?;
+
+        session.lease_token += 1;
+        session.active_writer_user_id = Some(writer_user_id);
+        session.active_writer_device_id = Some(writer_device_id);
+        session.lease_expires_at = lease_expires_at;
+
+        let token = session.lease_token;
+        Ok(token)
+    }
+
+    async fn revoke_collab_writer_lease(&self, session_id: Uuid) -> Result<u64, DomainError> {
+        let mut lock = self.state.write().await;
+        let session = lock
+            .collab_sessions
+            .get_mut(&session_id)
+            .ok_or(DomainError::CollabSessionNotFound(session_id))?;
+
+        session.lease_token += 1;
+        session.active_writer_user_id = None;
+        session.active_writer_device_id = None;
+        session.lease_expires_at = None;
+
+        let token = session.lease_token;
+        Ok(token)
+    }
+
+    async fn terminate_collab_session(
+        &self,
+        session_id: Uuid,
+        now: i64,
+    ) -> Result<(), DomainError> {
+        let mut lock = self.state.write().await;
+        let session = lock
+            .collab_sessions
+            .get_mut(&session_id)
+            .ok_or(DomainError::CollabSessionNotFound(session_id))?;
+
+        session.terminated_at = Some(now);
+        session.active_writer_user_id = None;
+        session.active_writer_device_id = None;
+        Ok(())
+    }
+
+    async fn append_collab_frame(&self, frame: &CollabFrame) -> Result<(), DomainError> {
+        let mut lock = self.state.write().await;
+        lock.collab_frames
+            .entry(frame.session_id)
+            .or_default()
+            .push(frame.clone());
+        Ok(())
+    }
+
+    async fn get_collab_frames(
+        &self,
+        session_id: Uuid,
+        since_sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<CollabFrame>, DomainError> {
+        let lock = self.state.read().await;
+        let empty = Vec::new();
+        let frames = lock.collab_frames.get(&session_id).unwrap_or(&empty);
+        let mut matching: Vec<CollabFrame> = frames
+            .iter()
+            .filter(|f| f.sequence > since_sequence)
+            .cloned()
+            .collect();
+        matching.sort_by_key(|f| f.sequence);
+        matching.truncate(limit);
+        Ok(matching)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1607,5 +1863,148 @@ mod tests {
         let sessions = store.list_sessions_for_user(user.id).await.unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, session.id);
+    }
+
+    #[tokio::test]
+    async fn test_collab_repository_lifecycle_and_fencing() {
+        use shellumi_server_domain::{CollabMode, CollabRole};
+        use shellumi_server_protocol::CollabFrameType;
+
+        let store = InMemoryStore::new();
+        let session_id = Uuid::new_v4();
+        let host_user_id = Uuid::new_v4();
+        let host_device_id = Uuid::new_v4();
+        let writer_user_id = Uuid::new_v4();
+        let writer_device_id = Uuid::new_v4();
+        let now = chrono::Utc::now().timestamp();
+
+        let session = CollabSession {
+            id: session_id,
+            host_user_id,
+            host_device_id,
+            title: "Test Collab Pairing".to_string(),
+            mode: CollabMode::Controllable,
+            active_writer_user_id: None,
+            active_writer_device_id: None,
+            lease_token: 1,
+            lease_expires_at: None,
+            expires_at: now + 3600,
+            terminated_at: None,
+            created_at: now,
+        };
+
+        let host_participant = CollabParticipant {
+            session_id,
+            user_id: host_user_id,
+            device_id: host_device_id,
+            role: CollabRole::Host,
+            joined_at: now,
+            revoked_at: None,
+        };
+
+        store
+            .create_collab_session(&session, &host_participant)
+            .await
+            .unwrap();
+
+        // Check find_collab_session
+        let found = store
+            .find_collab_session(session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.title, "Test Collab Pairing");
+        assert_eq!(found.lease_token, 1);
+
+        // Add participant
+        let viewer = CollabParticipant {
+            session_id,
+            user_id: writer_user_id,
+            device_id: writer_device_id,
+            role: CollabRole::Viewer,
+            joined_at: now + 1,
+            revoked_at: None,
+        };
+        store.add_collab_participant(&viewer).await.unwrap();
+        assert_eq!(
+            store
+                .list_collab_participants(session_id)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+
+        // Grant writer lease
+        let token2 = store
+            .grant_collab_writer_lease(session_id, writer_user_id, writer_device_id, Some(now + 60))
+            .await
+            .unwrap();
+        assert_eq!(token2, 2);
+
+        let after_grant = store
+            .find_collab_session(session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_grant.active_writer_user_id, Some(writer_user_id));
+        assert_eq!(after_grant.lease_token, 2);
+
+        // Revoke writer lease
+        let token3 = store.revoke_collab_writer_lease(session_id).await.unwrap();
+        assert_eq!(token3, 3);
+        let after_revoke = store
+            .find_collab_session(session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_revoke.active_writer_user_id, None);
+        assert_eq!(after_revoke.lease_token, 3);
+
+        // Append and read frames
+        let frame1 = CollabFrame {
+            session_id,
+            sequence: 1,
+            frame_type: CollabFrameType::Output,
+            sender_user_id: host_user_id,
+            sender_device_id: host_device_id,
+            lease_token: None,
+            encrypted_envelope: "cipher1".to_string(),
+            created_at: now + 2,
+        };
+        let frame2 = CollabFrame {
+            session_id,
+            sequence: 2,
+            frame_type: CollabFrameType::Input,
+            sender_user_id: writer_user_id,
+            sender_device_id: writer_device_id,
+            lease_token: Some(2),
+            encrypted_envelope: "cipher2".to_string(),
+            created_at: now + 3,
+        };
+
+        store.append_collab_frame(&frame1).await.unwrap();
+        store.append_collab_frame(&frame2).await.unwrap();
+
+        let frames = store.get_collab_frames(session_id, 0, 10).await.unwrap();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].sequence, 1);
+        assert_eq!(frames[1].sequence, 2);
+
+        let frames_since_1 = store.get_collab_frames(session_id, 1, 10).await.unwrap();
+        assert_eq!(frames_since_1.len(), 1);
+        assert_eq!(frames_since_1[0].sequence, 2);
+
+        // Terminate session
+        store
+            .terminate_collab_session(session_id, now + 10)
+            .await
+            .unwrap();
+        let terminated = store
+            .find_collab_session(session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(terminated.terminated_at, Some(now + 10));
     }
 }

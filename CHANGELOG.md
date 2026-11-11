@@ -47,3 +47,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Cryptographic database dump verifier (`shellumi-server backup verify <file>`) verifying archive headers, schema signatures, and absence of leaked plaintext private keys.
   - Multi-architecture container build (`Dockerfile`) for `linux/amd64` and `linux/arm64` with non-root security.
   - Tag-triggered release automation workflow (`.github/workflows/release.yml`) with strict SemVer validation, binary matrix compilation, SHA256 checksums, and GHCR publishing.
+- **Milestone M5: Optional live terminal collaboration signaling & ciphertext relay**
+  - Opt-in feature gating (`SHELLUMI_SERVER_COLLAB_ENABLED=false` default) returning HTTP 403 `COLLAB_DISABLED` when disabled and advertising `terminal_collab_v1` in `/api/v1/capabilities` when enabled.
+  - Ephemeral E2EE session models and relay engine enforcing strict zero server plaintext (blind forwarding of client-sealed ciphertext frames).
+  - Monotonic single-writer fencing token (`lease_token`) incremented on control grants and revocations; frames with stale tokens rejected with HTTP 409 `STALE_LEASE_TOKEN`.
+  - Strict role enforcement: viewers cannot type (`403 NOT_AUTHORIZED_WRITER`), and only session host can emit `TerminalOutput` frames. Read-only sessions reject all input and control grants.
+  - Unilateral host emergency control revocation (`/api/v1/collab/sessions/:id/control/revoke`) and session termination (`/api/v1/collab/sessions/:id/terminate`).
+  - Real-time Server-Sent Events stream (`/api/v1/collab/sessions/:id/events`) and cursor-based ordered polling fallback (`/api/v1/collab/sessions/:id/poll`).
+  - PostgreSQL schema migration `20261111000004_collab_sessions.sql` for session state and enrolled participants.
+  - Comprehensive integration test suite in `tests/collab_relay.rs` validating gating, single-writer fencing, emergency termination, and ciphertext preservation.

@@ -433,3 +433,140 @@ pub struct AuditLogResponse {
     pub vault_id: Uuid,
     pub events: Vec<AuditEventResponse>,
 }
+
+// ---------------------------------------------------------------------------
+// Live Terminal Collaboration DTOs
+// ---------------------------------------------------------------------------
+
+/// Request payload to create a new collaboration session (`POST /api/v1/collab/sessions`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateCollabSessionRequest {
+    pub title: String,
+    pub mode: String, // "read_only" or "controllable"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl_secs: Option<u64>,
+}
+
+/// Representation of a collaboration session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollabSessionResponse {
+    pub session_id: Uuid,
+    pub host_user_id: Uuid,
+    pub host_device_id: Uuid,
+    pub title: String,
+    pub mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_writer_user_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_writer_device_id: Option<Uuid>,
+    pub lease_token: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_expires_at: Option<i64>,
+    pub expires_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminated_at: Option<i64>,
+    pub created_at: i64,
+}
+
+/// List of collaboration sessions (`GET /api/v1/collab/sessions`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollabSessionListResponse {
+    pub sessions: Vec<CollabSessionResponse>,
+}
+
+/// Representation of a participant in a collaboration session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollabParticipantResponse {
+    pub session_id: Uuid,
+    pub user_id: Uuid,
+    pub device_id: Uuid,
+    pub role: String,
+    pub joined_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revoked_at: Option<i64>,
+}
+
+/// List of participants (`GET /api/v1/collab/sessions/{id}/participants`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollabParticipantListResponse {
+    pub participants: Vec<CollabParticipantResponse>,
+}
+
+/// Request to join or enroll a participant in a session (`POST /api/v1/collab/sessions/{id}/participants`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnrollParticipantRequest {
+    pub user_id: Uuid,
+    pub device_id: Uuid,
+    pub role: String, // "writer" or "viewer"
+}
+
+/// Request to grant write control to a participant (`POST /api/v1/collab/sessions/{id}/control/grant`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrantControlRequest {
+    pub target_user_id: Uuid,
+    pub target_device_id: Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl_secs: Option<u64>,
+}
+
+/// Types of collaboration frames forwarded across the relay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CollabFrameType {
+    Output,         // Host -> Viewers (terminal PTY output)
+    Input,          // Writer -> Host (keystrokes / PTY input)
+    Signal,         // Host <-> Participant key exchange / handshake
+    ControlGranted, // Control grant notice
+    ControlRevoked, // Control revoke notice
+    Terminated,     // Session termination notice
+}
+
+impl CollabFrameType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Output => "output",
+            Self::Input => "input",
+            Self::Signal => "signal",
+            Self::ControlGranted => "control_granted",
+            Self::ControlRevoked => "control_revoked",
+            Self::Terminated => "terminated",
+        }
+    }
+}
+
+/// Monotonically sequenced, client-encrypted collaboration frame.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollabFrame {
+    pub session_id: Uuid,
+    pub sequence: u64,
+    pub frame_type: CollabFrameType,
+    pub sender_user_id: Uuid,
+    pub sender_device_id: Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_token: Option<u64>,
+    pub encrypted_envelope: String, // Opaque client-sealed ciphertext
+    pub created_at: i64,
+}
+
+/// Request to submit an encrypted frame to the relay (`POST /api/v1/collab/sessions/{id}/frames`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendCollabFrameRequest {
+    pub frame_type: CollabFrameType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_token: Option<u64>,
+    pub encrypted_envelope: String,
+}
+
+/// Query parameters for polling frames (`GET /api/v1/collab/sessions/{id}/poll`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct CollabPollQuery {
+    pub since_sequence: Option<u64>,
+    pub limit: Option<usize>,
+}
+
+/// Response payload for polled frames.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollabPollResponse {
+    pub frames: Vec<CollabFrame>,
+    pub latest_sequence: u64,
+}

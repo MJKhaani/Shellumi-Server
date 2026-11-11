@@ -673,6 +673,297 @@ paths:
               schema:
                 $ref: '#/components/schemas/AuditLogResponse'
 
+  /api/v1/collab/sessions:
+    get:
+      summary: List active collaboration sessions
+      description: Returns active sessions where the user is host or enrolled participant.
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Active sessions
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CollabSessionListResponse'
+        '403':
+          description: Collaboration disabled or unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+    post:
+      summary: Create live terminal collaboration session
+      description: Starts a new live collaboration session in read-only or controllable mode.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: X-Device-Id
+          in: header
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateCollabSessionRequest'
+      responses:
+        '201':
+          description: Session created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CollabSessionResponse'
+        '403':
+          description: Collaboration feature disabled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/collab/sessions/{id}:
+    get:
+      summary: Get collaboration session details
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Session details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CollabSessionResponse'
+        '404':
+          description: Session not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/collab/sessions/{id}/participants:
+    get:
+      summary: List session participants
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Participant list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CollabParticipantListResponse'
+    post:
+      summary: Enroll participant into session
+      description: Adds an invited user and device as viewer or writer (host only).
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EnrollParticipantRequest'
+      responses:
+        '201':
+          description: Participant enrolled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CollabParticipantResponse'
+
+  /api/v1/collab/sessions/{id}/control/grant:
+    post:
+      summary: Grant write control to participant
+      description: Advances monotonic lease token and assigns active writer (host only).
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GrantControlRequest'
+      responses:
+        '200':
+          description: Write control granted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CollabSessionResponse'
+
+  /api/v1/collab/sessions/{id}/control/revoke:
+    post:
+      summary: Revoke write control
+      description: Immediately resets active writer and advances lease token (host only).
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Write control revoked
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CollabSessionResponse'
+
+  /api/v1/collab/sessions/{id}/terminate:
+    post:
+      summary: Emergency terminate session
+      description: Immediately closes subscriber channels and shuts down session (host only).
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Session terminated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+
+  /api/v1/collab/sessions/{id}/frames:
+    post:
+      summary: Submit client-encrypted collaboration frame
+      description: Forwards terminal output (host) or input (writer holding active lease token).
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: X-Device-Id
+          in: header
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SendCollabFrameRequest'
+      responses:
+        '201':
+          description: Frame broadcasted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CollabFrame'
+        '403':
+          description: Unauthorized role or not active writer
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Stale lease token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/collab/sessions/{id}/poll:
+    get:
+      summary: Poll past frames
+      description: Cursor-based polling of ordered frames for fallback environments.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: since_sequence
+          in: query
+          required: false
+          schema:
+            type: integer
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Polled frames
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CollabPollResponse'
+
+  /api/v1/collab/sessions/{id}/events:
+    get:
+      summary: Real-time event stream
+      description: Server-Sent Events (SSE) stream delivering real-time encrypted frames.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Text event stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+
 components:
   securitySchemes:
     BearerAuth:
@@ -1468,3 +1759,204 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/AuditEventResponse'
+
+    CreateCollabSessionRequest:
+      type: object
+      required:
+        - title
+        - mode
+      properties:
+        title:
+          type: string
+        mode:
+          type: string
+          enum: [read_only, controllable]
+        ttl_secs:
+          type: integer
+          nullable: true
+
+    CollabSessionResponse:
+      type: object
+      required:
+        - session_id
+        - host_user_id
+        - host_device_id
+        - title
+        - mode
+        - lease_token
+        - expires_at
+        - created_at
+      properties:
+        session_id:
+          type: string
+          format: uuid
+        host_user_id:
+          type: string
+          format: uuid
+        host_device_id:
+          type: string
+          format: uuid
+        title:
+          type: string
+        mode:
+          type: string
+        active_writer_user_id:
+          type: string
+          format: uuid
+          nullable: true
+        active_writer_device_id:
+          type: string
+          format: uuid
+          nullable: true
+        lease_token:
+          type: integer
+        lease_expires_at:
+          type: integer
+          nullable: true
+        expires_at:
+          type: integer
+        terminated_at:
+          type: integer
+          nullable: true
+        created_at:
+          type: integer
+
+    CollabSessionListResponse:
+      type: object
+      required:
+        - sessions
+      properties:
+        sessions:
+          type: array
+          items:
+            $ref: '#/components/schemas/CollabSessionResponse'
+
+    CollabParticipantResponse:
+      type: object
+      required:
+        - session_id
+        - user_id
+        - device_id
+        - role
+        - joined_at
+      properties:
+        session_id:
+          type: string
+          format: uuid
+        user_id:
+          type: string
+          format: uuid
+        device_id:
+          type: string
+          format: uuid
+        role:
+          type: string
+        joined_at:
+          type: integer
+        revoked_at:
+          type: integer
+          nullable: true
+
+    CollabParticipantListResponse:
+      type: object
+      required:
+        - participants
+      properties:
+        participants:
+          type: array
+          items:
+            $ref: '#/components/schemas/CollabParticipantResponse'
+
+    EnrollParticipantRequest:
+      type: object
+      required:
+        - user_id
+        - device_id
+        - role
+      properties:
+        user_id:
+          type: string
+          format: uuid
+        device_id:
+          type: string
+          format: uuid
+        role:
+          type: string
+          enum: [writer, viewer]
+
+    GrantControlRequest:
+      type: object
+      required:
+        - target_user_id
+        - target_device_id
+      properties:
+        target_user_id:
+          type: string
+          format: uuid
+        target_device_id:
+          type: string
+          format: uuid
+        ttl_secs:
+          type: integer
+          nullable: true
+
+    SendCollabFrameRequest:
+      type: object
+      required:
+        - frame_type
+        - encrypted_envelope
+      properties:
+        frame_type:
+          type: string
+          enum: [output, input, signal]
+        lease_token:
+          type: integer
+          nullable: true
+        encrypted_envelope:
+          type: string
+
+    CollabFrame:
+      type: object
+      required:
+        - session_id
+        - sequence
+        - frame_type
+        - sender_user_id
+        - sender_device_id
+        - encrypted_envelope
+        - created_at
+      properties:
+        session_id:
+          type: string
+          format: uuid
+        sequence:
+          type: integer
+        frame_type:
+          type: string
+        sender_user_id:
+          type: string
+          format: uuid
+        sender_device_id:
+          type: string
+          format: uuid
+        lease_token:
+          type: integer
+          nullable: true
+        encrypted_envelope:
+          type: string
+        created_at:
+          type: integer
+
+    CollabPollResponse:
+      type: object
+      required:
+        - frames
+        - latest_sequence
+      properties:
+        frames:
+          type: array
+          items:
+            $ref: '#/components/schemas/CollabFrame'
+        latest_sequence:
+          type: integer
+

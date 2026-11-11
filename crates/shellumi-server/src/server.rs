@@ -1,5 +1,6 @@
 //! HTTP server routing, handlers, middleware, and lifecycle.
 
+use crate::collab::{into_collab_stream, CollabHub};
 use crate::config::ServerConfig;
 use crate::metrics::MetricsRegistry;
 use crate::rate_limit::{extract_client_ip, rate_limit_response, RateLimitCategory, RateLimiter};
@@ -14,9 +15,11 @@ use shellumi_server_auth::{AccessTokenClaims, AuthService};
 use shellumi_server_domain::DomainError;
 use shellumi_server_protocol::{
     AcceptInviteRequest, AddVaultMemberRequest, BootstrapRequest, CapabilitiesResponse,
-    CommitBatchRequest, CreateInviteRequest, CreateVaultRequest, ErrorResponse, HealthResponse,
-    LoginRequest, LogoutRequest, PublishKeyEnvelopesRequest, RefreshTokenRequest,
-    RegisterDeviceRequest, RotateKeyEpochRequest, ServerLimits, UpdateVaultRequest,
+    CollabParticipantListResponse, CollabPollQuery, CollabPollResponse, CollabSessionListResponse,
+    CommitBatchRequest, CreateCollabSessionRequest, CreateInviteRequest, CreateVaultRequest,
+    EnrollParticipantRequest, ErrorResponse, GrantControlRequest, HealthResponse, LoginRequest,
+    LogoutRequest, PublishKeyEnvelopesRequest, RefreshTokenRequest, RegisterDeviceRequest,
+    RotateKeyEpochRequest, SendCollabFrameRequest, ServerLimits, UpdateVaultRequest,
     CURRENT_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION,
 };
 use shellumi_server_store::{InMemoryStore, UserRepository};
@@ -35,6 +38,7 @@ pub struct AppState {
     pub config: Arc<ServerConfig>,
     pub auth: Arc<AuthService<InMemoryStore>>,
     pub sync: Arc<SyncEngine<InMemoryStore>>,
+    pub collab: Arc<CollabHub<InMemoryStore>>,
     pub rate_limiter: Arc<RateLimiter>,
     pub metrics: Arc<MetricsRegistry>,
 }
@@ -76,11 +80,13 @@ pub fn create_router_with_auth_and_sync(
         Duration::from_secs(60),
     ));
     let metrics = Arc::new(MetricsRegistry::new());
+    let collab = Arc::new(CollabHub::new(auth.store().clone()));
 
     let state = AppState {
         config: Arc::new(config),
         auth,
         sync,
+        collab,
         rate_limiter,
         metrics,
     };
@@ -150,6 +156,43 @@ pub fn create_router_with_auth_and_sync(
         )
         // Audit Log
         .route("/api/v1/vaults/:id/audit", get(get_audit_log_handler))
+        // Live Terminal Collaboration (Milestone M5)
+        .route(
+            "/api/v1/collab/sessions",
+            get(list_collab_sessions_handler).post(create_collab_session_handler),
+        )
+        .route(
+            "/api/v1/collab/sessions/:id",
+            get(get_collab_session_handler),
+        )
+        .route(
+            "/api/v1/collab/sessions/:id/participants",
+            get(list_collab_participants_handler).post(enroll_collab_participant_handler),
+        )
+        .route(
+            "/api/v1/collab/sessions/:id/control/grant",
+            post(grant_collab_control_handler),
+        )
+        .route(
+            "/api/v1/collab/sessions/:id/control/revoke",
+            post(revoke_collab_control_handler),
+        )
+        .route(
+            "/api/v1/collab/sessions/:id/terminate",
+            post(terminate_collab_session_handler),
+        )
+        .route(
+            "/api/v1/collab/sessions/:id/frames",
+            post(send_collab_frame_handler),
+        )
+        .route(
+            "/api/v1/collab/sessions/:id/poll",
+            get(poll_collab_frames_handler),
+        )
+        .route(
+            "/api/v1/collab/sessions/:id/events",
+            get(collab_events_sse_handler),
+        )
         .fallback(not_found_handler);
 
     // Apply CORS
@@ -274,15 +317,20 @@ async fn capabilities_handler(State(state): State<AppState>) -> impl IntoRespons
         max_mutations_per_commit: 100,
     };
 
+    let mut supported_features = vec![
+        "vault_sync_v1".to_string(),
+        "device_auth".to_string(),
+        "team_sharing".to_string(),
+    ];
+    if state.config.collab_enabled {
+        supported_features.push("terminal_collab_v1".to_string());
+    }
+
     let capabilities = CapabilitiesResponse {
         server_version: env!("CARGO_PKG_VERSION").to_string(),
         protocol_version: CURRENT_PROTOCOL_VERSION,
         min_protocol_version: MIN_PROTOCOL_VERSION,
-        supported_features: vec![
-            "vault_sync_v1".to_string(),
-            "device_auth".to_string(),
-            "team_sharing".to_string(),
-        ],
+        supported_features,
         supported_e2ee_suites: vec![
             "x25519_hkdf_aes256gcm".to_string(),
             "argon2id_aes256gcm_legacy".to_string(),
@@ -1058,6 +1106,418 @@ async fn get_audit_log_handler(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Live Terminal Collaboration Handlers (Milestone M5)
+// ---------------------------------------------------------------------------
+
+fn check_collab_enabled(state: &AppState) -> Result<(), DomainError> {
+    if !state.config.collab_enabled {
+        return Err(DomainError::CollabDisabled);
+    }
+    Ok(())
+}
+
+async fn create_collab_session_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<CreateCollabSessionRequest>,
+) -> impl IntoResponse {
+    if let Err(err) = check_collab_enabled(&state) {
+        let (status, err_resp) = map_domain_error(err);
+        return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
+    }
+
+    let claims = match extract_auth_claims(&state.auth, &headers) {
+        Ok(c) => c,
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
+        }
+    };
+
+    let device_id = match extract_device_id(&headers) {
+        Ok(d) => d,
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
+        }
+    };
+
+    let now = chrono::Utc::now().timestamp();
+    match state
+        .collab
+        .create_session(claims.sub, device_id, req, now)
+        .await
+    {
+        Ok(resp) => (
+            StatusCode::CREATED,
+            Json(serde_json::to_value(resp).unwrap()),
+        ),
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            (status, Json(serde_json::to_value(err_resp.0).unwrap()))
+        }
+    }
+}
+
+async fn list_collab_sessions_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(err) = check_collab_enabled(&state) {
+        let (status, err_resp) = map_domain_error(err);
+        return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
+    }
+
+    let claims = match extract_auth_claims(&state.auth, &headers) {
+        Ok(c) => c,
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
+        }
+    };
+
+    match state.collab.list_active_sessions(claims.sub).await {
+        Ok(sessions) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(CollabSessionListResponse { sessions }).unwrap()),
+        ),
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            (status, Json(serde_json::to_value(err_resp.0).unwrap()))
+        }
+    }
+}
+
+async fn get_collab_session_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<Uuid>,
+) -> impl IntoResponse {
+    if let Err(err) = check_collab_enabled(&state) {
+        let (status, err_resp) = map_domain_error(err);
+        return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
+    }
+
+    let claims = match extract_auth_claims(&state.auth, &headers) {
+        Ok(c) => c,
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
+        }
+    };
+
+    match state.collab.get_session(session_id, claims.sub).await {
+        Ok(resp) => (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())),
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            (status, Json(serde_json::to_value(err_resp.0).unwrap()))
+        }
+    }
+}
+
+async fn enroll_collab_participant_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<Uuid>,
+    Json(req): Json<EnrollParticipantRequest>,
+) -> impl IntoResponse {
+    if let Err(err) = check_collab_enabled(&state) {
+        let (status, err_resp) = map_domain_error(err);
+        return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
+    }
+
+    let claims = match extract_auth_claims(&state.auth, &headers) {
+        Ok(c) => c,
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
+        }
+    };
+
+    let now = chrono::Utc::now().timestamp();
+    match state
+        .collab
+        .enroll_participant(session_id, claims.sub, req, now)
+        .await
+    {
+        Ok(resp) => (
+            StatusCode::CREATED,
+            Json(serde_json::to_value(resp).unwrap()),
+        ),
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            (status, Json(serde_json::to_value(err_resp.0).unwrap()))
+        }
+    }
+}
+
+async fn list_collab_participants_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<Uuid>,
+) -> impl IntoResponse {
+    if let Err(err) = check_collab_enabled(&state) {
+        let (status, err_resp) = map_domain_error(err);
+        return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
+    }
+
+    let claims = match extract_auth_claims(&state.auth, &headers) {
+        Ok(c) => c,
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
+        }
+    };
+
+    match state.collab.list_participants(session_id, claims.sub).await {
+        Ok(participants) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(CollabParticipantListResponse { participants }).unwrap()),
+        ),
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            (status, Json(serde_json::to_value(err_resp.0).unwrap()))
+        }
+    }
+}
+
+async fn grant_collab_control_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<Uuid>,
+    Json(req): Json<GrantControlRequest>,
+) -> impl IntoResponse {
+    if let Err(err) = check_collab_enabled(&state) {
+        let (status, err_resp) = map_domain_error(err);
+        return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
+    }
+
+    let claims = match extract_auth_claims(&state.auth, &headers) {
+        Ok(c) => c,
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
+        }
+    };
+
+    let now = chrono::Utc::now().timestamp();
+    match state
+        .collab
+        .grant_control(session_id, claims.sub, req, now)
+        .await
+    {
+        Ok(resp) => (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())),
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            (status, Json(serde_json::to_value(err_resp.0).unwrap()))
+        }
+    }
+}
+
+async fn revoke_collab_control_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<Uuid>,
+) -> impl IntoResponse {
+    if let Err(err) = check_collab_enabled(&state) {
+        let (status, err_resp) = map_domain_error(err);
+        return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
+    }
+
+    let claims = match extract_auth_claims(&state.auth, &headers) {
+        Ok(c) => c,
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
+        }
+    };
+
+    let now = chrono::Utc::now().timestamp();
+    match state
+        .collab
+        .revoke_control(session_id, claims.sub, now)
+        .await
+    {
+        Ok(resp) => (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())),
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            (status, Json(serde_json::to_value(err_resp.0).unwrap()))
+        }
+    }
+}
+
+async fn terminate_collab_session_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<Uuid>,
+) -> impl IntoResponse {
+    if let Err(err) = check_collab_enabled(&state) {
+        let (status, err_resp) = map_domain_error(err);
+        return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
+    }
+
+    let claims = match extract_auth_claims(&state.auth, &headers) {
+        Ok(c) => c,
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
+        }
+    };
+
+    let now = chrono::Utc::now().timestamp();
+    match state
+        .collab
+        .terminate_session(session_id, claims.sub, now)
+        .await
+    {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "status": "terminated" })),
+        ),
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            (status, Json(serde_json::to_value(err_resp.0).unwrap()))
+        }
+    }
+}
+
+async fn send_collab_frame_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<Uuid>,
+    Json(req): Json<SendCollabFrameRequest>,
+) -> impl IntoResponse {
+    if let Err(err) = check_collab_enabled(&state) {
+        let (status, err_resp) = map_domain_error(err);
+        return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
+    }
+
+    let claims = match extract_auth_claims(&state.auth, &headers) {
+        Ok(c) => c,
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
+        }
+    };
+
+    let device_id = match extract_device_id(&headers) {
+        Ok(d) => d,
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
+        }
+    };
+
+    let now = chrono::Utc::now().timestamp();
+    match state
+        .collab
+        .send_frame(session_id, claims.sub, device_id, req, now)
+        .await
+    {
+        Ok(frame) => (
+            StatusCode::CREATED,
+            Json(serde_json::to_value(frame).unwrap()),
+        ),
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            (status, Json(serde_json::to_value(err_resp.0).unwrap()))
+        }
+    }
+}
+
+async fn poll_collab_frames_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<Uuid>,
+    Query(query): Query<CollabPollQuery>,
+) -> impl IntoResponse {
+    if let Err(err) = check_collab_enabled(&state) {
+        let (status, err_resp) = map_domain_error(err);
+        return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
+    }
+
+    let claims = match extract_auth_claims(&state.auth, &headers) {
+        Ok(c) => c,
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
+        }
+    };
+
+    let since = query.since_sequence.unwrap_or(0);
+    let limit = query.limit.unwrap_or(50);
+
+    match state
+        .collab
+        .poll_frames(session_id, claims.sub, since, limit)
+        .await
+    {
+        Ok(frames) => {
+            let latest_sequence = frames.last().map(|f| f.sequence).unwrap_or(since);
+            (
+                StatusCode::OK,
+                Json(
+                    serde_json::to_value(CollabPollResponse {
+                        frames,
+                        latest_sequence,
+                    })
+                    .unwrap(),
+                ),
+            )
+        }
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            (status, Json(serde_json::to_value(err_resp.0).unwrap()))
+        }
+    }
+}
+
+async fn collab_events_sse_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<Uuid>,
+) -> Response {
+    if let Err(err) = check_collab_enabled(&state) {
+        let (status, err_resp) = map_domain_error(err);
+        return (status, Json(serde_json::to_value(err_resp.0).unwrap())).into_response();
+    }
+
+    let claims = match extract_auth_claims(&state.auth, &headers) {
+        Ok(c) => c,
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            return (status, Json(serde_json::to_value(err_resp.0).unwrap())).into_response();
+        }
+    };
+
+    let rx = match state.collab.subscribe(session_id, claims.sub).await {
+        Ok(r) => r,
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            return (status, Json(serde_json::to_value(err_resp.0).unwrap())).into_response();
+        }
+    };
+
+    use futures_util::StreamExt;
+    let stream = into_collab_stream(rx).filter_map(|item| async move {
+        match item {
+            Ok(frame) => {
+                let data = serde_json::to_string(&frame).unwrap_or_default();
+                let event = axum::response::sse::Event::default()
+                    .event(frame.frame_type.as_str())
+                    .data(data);
+                Some(Ok::<_, std::convert::Infallible>(event))
+            }
+            Err(_) => None,
+        }
+    });
+
+    axum::response::sse::Sse::new(stream)
+        .keep_alive(axum::response::sse::KeepAlive::default())
+        .into_response()
+}
+
 fn extract_device_id(headers: &HeaderMap) -> Result<Uuid, DomainError> {
     let header_val = headers
         .get("x-device-id")
@@ -1126,6 +1586,16 @@ fn map_domain_error(err: DomainError) -> (StatusCode, Json<ErrorResponse>) {
             (StatusCode::UNPROCESSABLE_ENTITY, "INVALID_INPUT")
         }
         DomainError::PayloadTooLarge { .. } => (StatusCode::PAYLOAD_TOO_LARGE, "PAYLOAD_TOO_LARGE"),
+        DomainError::CollabDisabled => (StatusCode::FORBIDDEN, "COLLAB_DISABLED"),
+        DomainError::CollabSessionNotFound(_) => {
+            (StatusCode::NOT_FOUND, "COLLAB_SESSION_NOT_FOUND")
+        }
+        DomainError::CollabSessionExpired => (StatusCode::GONE, "COLLAB_SESSION_EXPIRED"),
+        DomainError::CollabSessionTerminated => (StatusCode::GONE, "COLLAB_SESSION_TERMINATED"),
+        DomainError::NotAuthorizedWriter => (StatusCode::FORBIDDEN, "NOT_AUTHORIZED_WRITER"),
+        DomainError::StaleLeaseToken { .. } => (StatusCode::CONFLICT, "STALE_LEASE_TOKEN"),
+        DomainError::ParticipantRevoked => (StatusCode::FORBIDDEN, "PARTICIPANT_REVOKED"),
+        DomainError::NotSessionHost => (StatusCode::FORBIDDEN, "NOT_SESSION_HOST"),
         DomainError::Configuration(_) | DomainError::Internal(_) => {
             (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR")
         }

@@ -385,3 +385,112 @@ This journal records every increment, decision, test execution, and verification
   - Milestone M5: Optional Live Terminal Collaboration (WSS signaling/relay, ephemeral E2EE session keys, single-writer lease fencing token, owner emergency revocation).
 - Issue / PR / CI evidence:
   - All 62 automated tests pass across unit and integration suites with strict compiler warnings denied.
+
+---
+
+## 2026-11-11T10:15:00Z — TASK-006 — M5: Optional Live Terminal Collaboration
+- Status: complete
+- Baseline / commit: e84a67f
+- Objective and acceptance criteria:
+  - Create forward-only SQL migration `migrations/20261111000004_collab_sessions.sql` covering `collab_sessions` and `collab_participants`.
+  - Add domain models (`CollabSession`, `CollabParticipant`, `CollabMode`, `CollabRole`) and domain errors (`CollabDisabled`, `CollabSessionNotFound`, `CollabSessionExpired`, `CollabSessionTerminated`, `NotAuthorizedWriter`, `StaleLeaseToken`) in `crates/shellumi-server-domain`.
+  - Add request/response DTOs and frame types (`CreateCollabSessionRequest`, `CollabSessionResponse`, `CollabFrame`, `GrantControlRequest`, `CollabPollQuery`, `CollabPollResponse`) in `crates/shellumi-server-protocol`.
+  - Add `CollabRepository` trait and implement on `InMemoryStore` in `crates/shellumi-server-store`.
+  - Implement collaboration engine and real-time duplex frame relay in `crates/shellumi-server/src/collab/`:
+    - Feature gate: endpoints return HTTP 403 Forbidden (`COLLAB_DISABLED`) when `collab_enabled = false`.
+    - Host starts session with mode (`ReadOnly` or `Controllable`), title, and TTL.
+    - Outsiders blocked: only authenticated enrolled participants with registered devices can access session stream/frames.
+    - Single writer enforcement: only the designated active writer can transmit `TerminalInput` frames. Viewers are strictly prohibited (403 Forbidden).
+    - Monotonic writer fencing token/lease: control grants increment `lease_token`. Input frames with stale tokens are rejected (409 Conflict).
+    - Owner emergency override: host can instantly revoke control or terminate the session; all subscriber streams close immediately and future frames are rejected.
+    - Real-time frame streaming via Server-Sent Events (`GET /api/v1/collab/sessions/:id/events`) and frame ingestion (`POST /api/v1/collab/sessions/:id/frames`) plus long-polling fallback (`GET /api/v1/collab/sessions/:id/poll`).
+    - Zero server plaintext: server handles only opaque encrypted ciphertext envelopes and never possesses session keys.
+  - Wire collaboration routes in `crates/shellumi-server/src/server.rs`.
+  - Update `docs/API.md`, `openapi/shellumi-server-v1.yaml`, `docs/ROADMAP.md`, `CHANGELOG.md`, and author `docs/adr/0006-m5-live-terminal-collaboration.md`.
+  - Comprehensive automated test suite verifying feature gating, single writer enforcement, fencing token increments, stale token rejection, owner emergency revocation, and zero-knowledge ciphertext transit.
+- Implementation / files changed:
+  - `Cargo.toml`, `Cargo.lock`
+  - `docs/adr/0006-m5-live-terminal-collaboration.md`
+  - `migrations/20261111000004_collab_sessions.sql`
+  - `crates/shellumi-server-domain/src/lib.rs`
+  - `crates/shellumi-server-protocol/src/lib.rs`
+  - `crates/shellumi-server-store/src/lib.rs`
+  - `crates/shellumi-server/Cargo.toml`
+  - `crates/shellumi-server/src/lib.rs`
+  - `crates/shellumi-server/src/collab/mod.rs`
+  - `crates/shellumi-server/src/server.rs`
+  - `crates/shellumi-server/tests/collab_relay.rs`
+  - `openapi/shellumi-server-v1.yaml`
+  - `docs/API.md`
+  - `docs/ROADMAP.md`
+  - `CHANGELOG.md`
+  - `docs/PROGRESS.md`
+- Data migration or API compatibility:
+  - Added migration `20261111000004_collab_sessions.sql`.
+  - Added routes:
+    - `POST /api/v1/collab/sessions`
+    - `GET /api/v1/collab/sessions`
+    - `GET /api/v1/collab/sessions/:id`
+    - `POST /api/v1/collab/sessions/:id/participants`
+    - `GET /api/v1/collab/sessions/:id/participants`
+    - `POST /api/v1/collab/sessions/:id/control/grant`
+    - `POST /api/v1/collab/sessions/:id/control/revoke`
+    - `POST /api/v1/collab/sessions/:id/terminate`
+    - `POST /api/v1/collab/sessions/:id/frames`
+    - `GET /api/v1/collab/sessions/:id/poll`
+    - `GET /api/v1/collab/sessions/:id/events`
+- Security / privacy review:
+  - Collaboration relay is disabled by default (`SHELLUMI_SERVER_COLLAB_ENABLED=false`).
+  - Terminal frames transmitted across relay are client-encrypted envelopes; server memory and storage never contain plaintext keystrokes, terminal screens, or SSH credentials.
+  - Monotonic lease token eliminates split-brain / race conditions between multiple writers.
+  - Host retains instant unilateral emergency revoke and termination.
+- Tests added (file + test names):
+  - `crates/shellumi-server-store/src/lib.rs`:
+    - `test_collab_repository_lifecycle_and_fencing`
+  - `crates/shellumi-server/tests/collab_relay.rs`:
+    - `test_collab_feature_gate_disabled_rejects_and_hides_capability`
+    - `test_collab_feature_gate_enabled_advertises_capability`
+    - `test_full_live_terminal_collaboration_relay_lifecycle`
+    - `test_read_only_collab_session_prohibits_all_input_and_control_grants`
+    - `test_collab_realtime_sse_event_streaming`
+- Verification executed (exact commands, OS, counts, pass/fail/skip):
+  - `cargo fmt --all -- --check` (macOS Darwin arm64, 0 errors, pass)
+  - `cargo clippy --offline --workspace --all-targets --all-features -- -D warnings` (macOS Darwin arm64, 0 warnings, pass)
+  - `cargo test --offline --workspace --all-features` (macOS Darwin arm64, 68 tests: 68 passed, 0 failed, 0 skipped, pass)
+  - `cargo test --offline --doc --workspace` (macOS Darwin arm64, 0 doc-tests, pass)
+  - `cargo build --offline --workspace --all-features` (macOS Darwin arm64, 0 errors, pass)
+- Known limitations / failed attempts:
+  - Disambiguated `create_session` method between `SessionRepository` and `CollabRepository` on `InMemoryStore` by naming collab methods `create_collab_session`, `find_collab_session`, etc.
+  - Replaced manual `poll_recv` wrapper with `futures_util::stream::unfold` for Axum Server-Sent Events stream generation.
+- Next precise step:
+  - Milestone M6: Advanced Self-Hosting & Client Integration Polish (end-to-end verification, contract fixtures, and documentation finalization).
+- Issue / PR / CI evidence:
+  - All 68 tests across unit, store, sync, auth, ops, and collaboration suites passing cleanly.
+
+---
+
+## 2026-11-11T10:45:00Z — TASK-007 — M6: Advanced Self-Hosting & Client Integration Polish
+- Status: planned
+- Baseline / commit: HEAD (after M5)
+- Objective and acceptance criteria:
+  - Review end-to-end protocol compatibility against Shellumi desktop client contracts.
+  - Ensure all database migrations, OpenAPI 3.1 definitions, and documentation deliverables from AGENTS.md §8 are complete, synchronized, and verified.
+  - Run all release validation quality gates.
+- Implementation / files changed:
+  - `docs/COMPATIBILITY.md`
+  - `docs/ARCHITECTURE.md`
+  - `docs/PROGRESS.md`
+- Data migration or API compatibility:
+  - Full compatibility table audit.
+- Security / privacy review:
+  - Final threat model review against `docs/security/THREAT_MODEL.md`.
+- Tests added (file + test names):
+  - Contract validation and end-to-end checks.
+- Verification executed (exact commands, OS, counts, pass/fail/skip):
+  - Planned: fmt, clippy, test, doc, build.
+- Known limitations / failed attempts:
+  - None yet.
+- Next precise step:
+  - Commit Milestone M5 and review M6 deliverables.
+- Issue / PR / CI evidence:
+  - Planned.

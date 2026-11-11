@@ -35,6 +35,7 @@ chrono.workspace = true
 rand.workspace = true
 sha2.workspace = true
 hex.workspace = true
+futures-util.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

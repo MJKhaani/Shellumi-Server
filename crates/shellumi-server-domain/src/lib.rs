@@ -88,6 +88,30 @@ pub enum DomainError {
     #[error("Payload too large: limit {limit} bytes, actual {actual} bytes")]
     PayloadTooLarge { limit: usize, actual: usize },
 
+    #[error("Terminal collaboration is disabled on this server")]
+    CollabDisabled,
+
+    #[error("Collaboration session not found: {0}")]
+    CollabSessionNotFound(Uuid),
+
+    #[error("Collaboration session has expired")]
+    CollabSessionExpired,
+
+    #[error("Collaboration session has been terminated")]
+    CollabSessionTerminated,
+
+    #[error("Only the active writer holding the current lease may transmit input")]
+    NotAuthorizedWriter,
+
+    #[error("Stale lease token: active token is {current}, frame used {provided}")]
+    StaleLeaseToken { current: u64, provided: u64 },
+
+    #[error("Participant has been revoked from this session")]
+    ParticipantRevoked,
+
+    #[error("Only the session host can execute this operation")]
+    NotSessionHost,
+
     #[error("Invalid input: {0}")]
     InvalidInput(String),
 
@@ -345,4 +369,84 @@ pub struct AuditEvent {
     pub predecessor_hash: String,
     pub event_hash: String,
     pub created_at: i64,
+}
+
+// ---------------------------------------------------------------------------
+// Live Terminal Collaboration Domain Entities
+// ---------------------------------------------------------------------------
+
+/// Collaboration session operating mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CollabMode {
+    ReadOnly,
+    Controllable,
+}
+
+impl CollabMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read_only",
+            Self::Controllable => "controllable",
+        }
+    }
+}
+
+impl fmt::Display for CollabMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// Role of a participant in a collaboration session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CollabRole {
+    Host,
+    Writer,
+    Viewer,
+}
+
+impl CollabRole {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Host => "host",
+            Self::Writer => "writer",
+            Self::Viewer => "viewer",
+        }
+    }
+}
+
+impl fmt::Display for CollabRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// Live terminal collaboration session entity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollabSession {
+    pub id: Uuid,
+    pub host_user_id: Uuid,
+    pub host_device_id: Uuid,
+    pub title: String,
+    pub mode: CollabMode,
+    pub active_writer_user_id: Option<Uuid>,
+    pub active_writer_device_id: Option<Uuid>,
+    pub lease_token: u64,
+    pub lease_expires_at: Option<i64>,
+    pub expires_at: i64,
+    pub terminated_at: Option<i64>,
+    pub created_at: i64,
+}
+
+/// Participant enrolled in a collaboration session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollabParticipant {
+    pub session_id: Uuid,
+    pub user_id: Uuid,
+    pub device_id: Uuid,
+    pub role: CollabRole,
+    pub joined_at: i64,
+    pub revoked_at: Option<i64>,
 }

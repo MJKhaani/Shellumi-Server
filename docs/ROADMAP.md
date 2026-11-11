@@ -11,7 +11,7 @@ This document outlines the milestones and progress of Shellumi Server.
 | **M2** | Encrypted Private Vault & Sync v1 | **Complete** | Stable UUIDs, opaque ciphertext envelopes, device signatures, transactional change feed, conditional `expected_revision` writes, conflict resolution (409), tombstones. |
 | **M3** | Team Vaults, Invites, RBAC & E2EE Keys | **Complete** | Owner/Admin/Editor/Viewer permission matrix, one-time invitations, per-device recipient-wrapped DEKs, epoch rotation, audit trail. |
 | **M4** | Resilience, Operations & Releases | **Complete** | CLI admin commands, backup/restore verification, metrics, rate limits, multi-arch Docker image, reproducible release automation. |
-| **M5** | Optional Live Terminal Collaboration | Current | WSS relay, ephemeral E2EE session keys, single-writer fencing token, owner emergency revocation, bounded queues. Relay disabled until gates pass. |
+| **M5** | Optional Live Terminal Collaboration | **Complete** | Signaling relay, ephemeral E2EE session keys, single-writer fencing token, owner emergency revocation, bounded queues, SSE & polling. |
 | **M6** | Advanced Self-Hosting & Integrations | Planned | OIDC/SSO, optional SMTP, large encrypted attachments, horizontal PostgreSQL coordination. |
 
 ---
@@ -68,3 +68,12 @@ This document outlines the milestones and progress of Shellumi Server.
 - **Prometheus Telemetry:** Standard Prometheus text exposition at `/metrics` with strictly bounded label cardinality (no UUID leaks).
 - **Disaster Recovery:** Comprehensive guide and verification utility in `docs/BACKUP_RESTORE.md` and `shellumi-server backup verify <file>`.
 - **Containers & Releases:** Multi-arch Docker container (`linux/amd64`, `linux/arm64`) with non-root security, CI smoke testing, and tag-triggered release workflow in `.github/workflows/release.yml`.
+
+### M5 — Optional Live Terminal Collaboration (Complete)
+- **Feature Gating:** Strictly opt-in (`SHELLUMI_SERVER_COLLAB_ENABLED=false` default). When disabled, returns HTTP 403 `COLLAB_DISABLED` and suppresses capability advertisement.
+- **Zero Server Plaintext:** Ephemeral E2EE session keys negotiated directly between clients; server operates as a blind ciphertext forwarder. Keystrokes, PTY screens, and SSH credentials never touch server memory in plaintext.
+- **Single-Writer Fencing Token:** Monotonically advancing `lease_token` incremented on write control grants and revocations. Frames bearing stale tokens are rejected with HTTP 409 `STALE_LEASE_TOKEN`.
+- **Role Enforcement:** Viewers are strictly prohibited from transmitting `TerminalInput` frames; non-hosts cannot emit `TerminalOutput` frames. Read-only sessions prohibit all input and control grants.
+- **Host Emergency Override:** Immediate unilateral lease revocation and session termination (`POST /api/v1/collab/sessions/:id/terminate`). Closes active subscriber channels immediately; subsequent frame sends return HTTP 410 `COLLAB_SESSION_TERMINATED`.
+- **Transports:** Real-time Server-Sent Events stream (`GET /api/v1/collab/sessions/:id/events`) and cursor-based ordered frame polling (`GET /api/v1/collab/sessions/:id/poll?since_sequence=...`).
+

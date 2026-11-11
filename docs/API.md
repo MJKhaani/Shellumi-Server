@@ -577,6 +577,187 @@ Sensitive endpoints are protected by in-memory sliding-window rate limiters:
 }
 ```
 
+---
+
+## 6. Live Terminal Collaboration (Milestone M5)
+
+> **Security Invariant:** Zero Server Plaintext. All terminal output and input frames are client-encrypted with ephemeral E2EE session keys. The server acts purely as an authenticated signaling and ciphertext frame relay and never holds session keys or SSH credentials.
+
+### Feature Gating
+- Disabled by default (`SHELLUMI_SERVER_COLLAB_ENABLED=false`).
+- When disabled, all collaboration endpoints reject with HTTP `403 Forbidden` (`COLLAB_DISABLED`).
+- When enabled, `GET /api/v1/capabilities` includes `"terminal_collab_v1"` in `supported_features`.
+
+### Create Collaboration Session
+- **Path:** `POST /api/v1/collab/sessions`
+- **Auth:** Bearer Token + `X-Device-Id: <uuid>`
+- **Request Body:**
+```json
+{
+  "title": "Pair Debugging Session",
+  "mode": "controllable",
+  "ttl_secs": 7200
+}
+```
+- **Response:** `201 Created`
+```json
+{
+  "session_id": "019abcde-1234-7000-8000-000000000001",
+  "host_user_id": "019abcde-0000-7000-8000-000000000001",
+  "host_device_id": "019abcde-0000-7000-8000-000000000002",
+  "title": "Pair Debugging Session",
+  "mode": "controllable",
+  "active_writer_user_id": null,
+  "active_writer_device_id": null,
+  "lease_token": 1,
+  "lease_expires_at": null,
+  "expires_at": 1700007200,
+  "terminated_at": null,
+  "created_at": 1700000000
+}
+```
+
+### List Active Sessions
+- **Path:** `GET /api/v1/collab/sessions`
+- **Auth:** Bearer Token
+- **Response:** `200 OK`
+```json
+{
+  "sessions": [
+    {
+      "session_id": "019abcde-...",
+      "host_user_id": "019abcde-...",
+      "host_device_id": "019abcde-...",
+      "title": "Pair Debugging Session",
+      "mode": "controllable",
+      "active_writer_user_id": null,
+      "active_writer_device_id": null,
+      "lease_token": 1,
+      "lease_expires_at": null,
+      "expires_at": 1700007200,
+      "terminated_at": null,
+      "created_at": 1700000000
+    }
+  ]
+}
+```
+
+### Get Session Details
+- **Path:** `GET /api/v1/collab/sessions/:id`
+- **Auth:** Bearer Token (Host or Enrolled Participant)
+- **Response:** `200 OK`
+
+### Enroll Participant
+- **Path:** `POST /api/v1/collab/sessions/:id/participants`
+- **Auth:** Bearer Token (Host only)
+- **Request Body:**
+```json
+{
+  "user_id": "019abcde-...",
+  "device_id": "019abcde-...",
+  "role": "viewer"
+}
+```
+- **Response:** `201 Created`
+```json
+{
+  "session_id": "019abcde-...",
+  "user_id": "019abcde-...",
+  "device_id": "019abcde-...",
+  "role": "viewer",
+  "joined_at": 1700000100,
+  "revoked_at": null
+}
+```
+
+### List Participants
+- **Path:** `GET /api/v1/collab/sessions/:id/participants`
+- **Auth:** Bearer Token (Host or Enrolled Participant)
+- **Response:** `200 OK`
+
+### Grant Write Control (Fencing Token)
+- **Path:** `POST /api/v1/collab/sessions/:id/control/grant`
+- **Auth:** Bearer Token (Host only)
+- **Description:** Transactionally advances the monotonic `lease_token` and designates the active writer.
+- **Request Body:**
+```json
+{
+  "target_user_id": "019abcde-...",
+  "target_device_id": "019abcde-...",
+  "ttl_secs": 300
+}
+```
+- **Response:** `200 OK` (Updated `CollabSessionResponse` with advanced `lease_token`)
+
+### Revoke Write Control (Emergency Revoke)
+- **Path:** `POST /api/v1/collab/sessions/:id/control/revoke`
+- **Auth:** Bearer Token (Host only)
+- **Description:** Instantly revokes write control back to host and advances `lease_token`. Former writer input frames are immediately rejected.
+- **Response:** `200 OK`
+
+### Emergency Terminate Session
+- **Path:** `POST /api/v1/collab/sessions/:id/terminate`
+- **Auth:** Bearer Token (Host only)
+- **Description:** Immediately terminates the session and closes active subscriber streams. Subsequent frame submissions return `410 Gone`.
+- **Response:** `200 OK`
+
+### Submit Encrypted Frame
+- **Path:** `POST /api/v1/collab/sessions/:id/frames`
+- **Auth:** Bearer Token + `X-Device-Id: <uuid>`
+- **Request Body:**
+```json
+{
+  "frame_type": "input",
+  "lease_token": 2,
+  "encrypted_envelope": "base64_encoded_client_ciphertext_envelope"
+}
+```
+- **Fencing Rules:**
+  - `output`: Host only.
+  - `input`: Controllable sessions only; active writer only; `lease_token` must strictly match active session token (otherwise `409 STALE_LEASE_TOKEN`).
+- **Response:** `201 Created`
+```json
+{
+  "session_id": "019abcde-...",
+  "sequence": 3,
+  "frame_type": "input",
+  "sender_user_id": "019abcde-...",
+  "sender_device_id": "019abcde-...",
+  "lease_token": 2,
+  "encrypted_envelope": "base64_encoded_client_ciphertext_envelope",
+  "created_at": 1700000200
+}
+```
+
+### Cursor-Based Frame Polling
+- **Path:** `GET /api/v1/collab/sessions/:id/poll?since_sequence=0&limit=50`
+- **Auth:** Bearer Token (Host or Enrolled Participant)
+- **Response:** `200 OK`
+```json
+{
+  "frames": [
+    {
+      "session_id": "019abcde-...",
+      "sequence": 1,
+      "frame_type": "output",
+      "sender_user_id": "019abcde-...",
+      "sender_device_id": "019abcde-...",
+      "lease_token": null,
+      "encrypted_envelope": "...",
+      "created_at": 1700000050
+    }
+  ],
+  "latest_sequence": 1
+}
+```
+
+### Server-Sent Events Real-Time Streaming
+- **Path:** `GET /api/v1/collab/sessions/:id/events`
+- **Auth:** Bearer Token (Host or Enrolled Participant)
+- **Content-Type:** `text/event-stream`
+- **Description:** Delivers live encrypted frames to subscribers as Server-Sent Events. Disconnects immediately upon session termination or participant revocation.
+
+
 
 ### Rotate Key Epoch
 - **Path:** `POST /api/v1/vaults/{id}/keys/epochs`
@@ -676,6 +857,187 @@ Sensitive endpoints are protected by in-memory sliding-window rate limiters:
   "request_id": "019abcde-..."
 }
 ```
+
+---
+
+## 6. Live Terminal Collaboration (Milestone M5)
+
+> **Security Invariant:** Zero Server Plaintext. All terminal output and input frames are client-encrypted with ephemeral E2EE session keys. The server acts purely as an authenticated signaling and ciphertext frame relay and never holds session keys or SSH credentials.
+
+### Feature Gating
+- Disabled by default (`SHELLUMI_SERVER_COLLAB_ENABLED=false`).
+- When disabled, all collaboration endpoints reject with HTTP `403 Forbidden` (`COLLAB_DISABLED`).
+- When enabled, `GET /api/v1/capabilities` includes `"terminal_collab_v1"` in `supported_features`.
+
+### Create Collaboration Session
+- **Path:** `POST /api/v1/collab/sessions`
+- **Auth:** Bearer Token + `X-Device-Id: <uuid>`
+- **Request Body:**
+```json
+{
+  "title": "Pair Debugging Session",
+  "mode": "controllable",
+  "ttl_secs": 7200
+}
+```
+- **Response:** `201 Created`
+```json
+{
+  "session_id": "019abcde-1234-7000-8000-000000000001",
+  "host_user_id": "019abcde-0000-7000-8000-000000000001",
+  "host_device_id": "019abcde-0000-7000-8000-000000000002",
+  "title": "Pair Debugging Session",
+  "mode": "controllable",
+  "active_writer_user_id": null,
+  "active_writer_device_id": null,
+  "lease_token": 1,
+  "lease_expires_at": null,
+  "expires_at": 1700007200,
+  "terminated_at": null,
+  "created_at": 1700000000
+}
+```
+
+### List Active Sessions
+- **Path:** `GET /api/v1/collab/sessions`
+- **Auth:** Bearer Token
+- **Response:** `200 OK`
+```json
+{
+  "sessions": [
+    {
+      "session_id": "019abcde-...",
+      "host_user_id": "019abcde-...",
+      "host_device_id": "019abcde-...",
+      "title": "Pair Debugging Session",
+      "mode": "controllable",
+      "active_writer_user_id": null,
+      "active_writer_device_id": null,
+      "lease_token": 1,
+      "lease_expires_at": null,
+      "expires_at": 1700007200,
+      "terminated_at": null,
+      "created_at": 1700000000
+    }
+  ]
+}
+```
+
+### Get Session Details
+- **Path:** `GET /api/v1/collab/sessions/:id`
+- **Auth:** Bearer Token (Host or Enrolled Participant)
+- **Response:** `200 OK`
+
+### Enroll Participant
+- **Path:** `POST /api/v1/collab/sessions/:id/participants`
+- **Auth:** Bearer Token (Host only)
+- **Request Body:**
+```json
+{
+  "user_id": "019abcde-...",
+  "device_id": "019abcde-...",
+  "role": "viewer"
+}
+```
+- **Response:** `201 Created`
+```json
+{
+  "session_id": "019abcde-...",
+  "user_id": "019abcde-...",
+  "device_id": "019abcde-...",
+  "role": "viewer",
+  "joined_at": 1700000100,
+  "revoked_at": null
+}
+```
+
+### List Participants
+- **Path:** `GET /api/v1/collab/sessions/:id/participants`
+- **Auth:** Bearer Token (Host or Enrolled Participant)
+- **Response:** `200 OK`
+
+### Grant Write Control (Fencing Token)
+- **Path:** `POST /api/v1/collab/sessions/:id/control/grant`
+- **Auth:** Bearer Token (Host only)
+- **Description:** Transactionally advances the monotonic `lease_token` and designates the active writer.
+- **Request Body:**
+```json
+{
+  "target_user_id": "019abcde-...",
+  "target_device_id": "019abcde-...",
+  "ttl_secs": 300
+}
+```
+- **Response:** `200 OK` (Updated `CollabSessionResponse` with advanced `lease_token`)
+
+### Revoke Write Control (Emergency Revoke)
+- **Path:** `POST /api/v1/collab/sessions/:id/control/revoke`
+- **Auth:** Bearer Token (Host only)
+- **Description:** Instantly revokes write control back to host and advances `lease_token`. Former writer input frames are immediately rejected.
+- **Response:** `200 OK`
+
+### Emergency Terminate Session
+- **Path:** `POST /api/v1/collab/sessions/:id/terminate`
+- **Auth:** Bearer Token (Host only)
+- **Description:** Immediately terminates the session and closes active subscriber streams. Subsequent frame submissions return `410 Gone`.
+- **Response:** `200 OK`
+
+### Submit Encrypted Frame
+- **Path:** `POST /api/v1/collab/sessions/:id/frames`
+- **Auth:** Bearer Token + `X-Device-Id: <uuid>`
+- **Request Body:**
+```json
+{
+  "frame_type": "input",
+  "lease_token": 2,
+  "encrypted_envelope": "base64_encoded_client_ciphertext_envelope"
+}
+```
+- **Fencing Rules:**
+  - `output`: Host only.
+  - `input`: Controllable sessions only; active writer only; `lease_token` must strictly match active session token (otherwise `409 STALE_LEASE_TOKEN`).
+- **Response:** `201 Created`
+```json
+{
+  "session_id": "019abcde-...",
+  "sequence": 3,
+  "frame_type": "input",
+  "sender_user_id": "019abcde-...",
+  "sender_device_id": "019abcde-...",
+  "lease_token": 2,
+  "encrypted_envelope": "base64_encoded_client_ciphertext_envelope",
+  "created_at": 1700000200
+}
+```
+
+### Cursor-Based Frame Polling
+- **Path:** `GET /api/v1/collab/sessions/:id/poll?since_sequence=0&limit=50`
+- **Auth:** Bearer Token (Host or Enrolled Participant)
+- **Response:** `200 OK`
+```json
+{
+  "frames": [
+    {
+      "session_id": "019abcde-...",
+      "sequence": 1,
+      "frame_type": "output",
+      "sender_user_id": "019abcde-...",
+      "sender_device_id": "019abcde-...",
+      "lease_token": null,
+      "encrypted_envelope": "...",
+      "created_at": 1700000050
+    }
+  ],
+  "latest_sequence": 1
+}
+```
+
+### Server-Sent Events Real-Time Streaming
+- **Path:** `GET /api/v1/collab/sessions/:id/events`
+- **Auth:** Bearer Token (Host or Enrolled Participant)
+- **Content-Type:** `text/event-stream`
+- **Description:** Delivers live encrypted frames to subscribers as Server-Sent Events. Disconnects immediately upon session termination or participant revocation.
+
 
 
 
