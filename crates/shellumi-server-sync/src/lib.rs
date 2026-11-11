@@ -17,9 +17,11 @@ use shellumi_server_store::Store;
 use std::sync::Arc;
 use uuid::Uuid;
 
+mod collab;
+
 pub struct SyncEngine<S: Store> {
-    store: Arc<S>,
-    max_record_bytes: usize,
+    pub(crate) store: Arc<S>,
+    pub(crate) max_record_bytes: usize,
 }
 
 impl<S: Store> SyncEngine<S> {
@@ -263,6 +265,13 @@ impl<S: Store> SyncEngine<S> {
 
         // Validate cryptographic signatures and envelopes for each mutation
         for mutation in &req.mutations {
+            if mutation.key_epoch < vault.active_key_epoch {
+                return Err(DomainError::StaleKeyEpoch {
+                    current: vault.active_key_epoch,
+                    provided: mutation.key_epoch,
+                });
+            }
+
             let digest = compute_ciphertext_digest(mutation.encrypted_envelope.as_ref());
             let preimage = canonical_mutation_preimage(
                 req.vault_id,

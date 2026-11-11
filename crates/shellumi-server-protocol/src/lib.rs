@@ -290,3 +290,146 @@ pub struct SnapshotResponse {
     pub server_sequence: u64,
     pub records: Vec<SyncChangeItem>,
 }
+
+// ---------------------------------------------------------------------------
+// Team Collaboration, Invites, Key Envelopes & Audit DTOs
+// ---------------------------------------------------------------------------
+
+/// Representation of a vault member.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VaultMemberResponse {
+    pub vault_id: Uuid,
+    pub user_id: Uuid,
+    pub username: String,
+    pub role: String,
+    pub joined_at: i64,
+}
+
+/// List of members in a vault (`GET /api/v1/vaults/{id}/members`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VaultMemberListResponse {
+    pub members: Vec<VaultMemberResponse>,
+}
+
+/// Request to add or update a member's role (`POST /api/v1/vaults/{id}/members`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AddVaultMemberRequest {
+    pub user_id: Uuid,
+    pub role: String,
+}
+
+/// Request to create a scoped invitation (`POST /api/v1/vaults/{id}/invites`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateInviteRequest {
+    pub role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recipient_email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl_secs: Option<u64>,
+}
+
+/// Representation of an invitation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InviteResponse {
+    pub invite_id: Uuid,
+    pub vault_id: Uuid,
+    pub role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invite_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recipient_email: Option<String>,
+    pub expires_at: i64,
+    pub created_at: i64,
+}
+
+/// List of invitations (`GET /api/v1/vaults/{id}/invites`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InviteListResponse {
+    pub invites: Vec<InviteResponse>,
+}
+
+/// Request to accept an invitation (`POST /api/v1/invites/accept`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcceptInviteRequest {
+    pub invite_token: String,
+}
+
+/// Response payload for accepted invitation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcceptInviteResponse {
+    pub vault_id: Uuid,
+    pub role: String,
+}
+
+/// Item representing a wrapped DEK for a recipient device.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyEnvelopeItem {
+    pub recipient_device_id: Uuid,
+    pub wrapped_dek: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_agreement_ephemeral_pk: Option<String>,
+}
+
+/// Request to publish wrapped key envelopes (`POST /api/v1/vaults/{id}/keys/envelopes`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublishKeyEnvelopesRequest {
+    pub epoch: u32,
+    pub envelopes: Vec<KeyEnvelopeItem>,
+}
+
+/// Representation of a stored key envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyEnvelopeResponse {
+    pub vault_id: Uuid,
+    pub epoch: u32,
+    pub recipient_device_id: Uuid,
+    pub sender_device_id: Uuid,
+    pub wrapped_dek: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_agreement_ephemeral_pk: Option<String>,
+    pub created_at: i64,
+}
+
+/// List of key envelopes for the calling device (`GET /api/v1/vaults/{id}/keys/envelopes`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyEnvelopeListResponse {
+    pub envelopes: Vec<KeyEnvelopeResponse>,
+}
+
+/// Request to rotate key epoch (`POST /api/v1/vaults/{id}/keys/epochs`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RotateKeyEpochRequest {
+    pub new_epoch: u32,
+    pub envelopes: Vec<KeyEnvelopeItem>,
+}
+
+/// Response for rotated key epoch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RotateKeyEpochResponse {
+    pub vault_id: Uuid,
+    pub active_key_epoch: u32,
+    pub enrolled_envelopes: usize,
+}
+
+/// Representation of an audit event (`GET /api/v1/vaults/{id}/audit`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditEventResponse {
+    pub id: i64,
+    pub vault_id: Uuid,
+    pub actor_user_id: Uuid,
+    pub actor_device_id: Option<Uuid>,
+    pub action: String,
+    pub target_type: String,
+    pub target_id: String,
+    pub details: Option<String>,
+    pub predecessor_hash: String,
+    pub event_hash: String,
+    pub created_at: i64,
+}
+
+/// List of audit events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditLogResponse {
+    pub vault_id: Uuid,
+    pub events: Vec<AuditEventResponse>,
+}

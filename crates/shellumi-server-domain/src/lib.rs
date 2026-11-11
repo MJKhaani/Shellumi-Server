@@ -67,6 +67,24 @@ pub enum DomainError {
     #[error("Vault not found: {0}")]
     VaultNotFound(Uuid),
 
+    #[error("Invitation not found")]
+    InviteNotFound,
+
+    #[error("Invitation has expired")]
+    InviteExpired,
+
+    #[error("Invitation has already been accepted")]
+    InviteAlreadyAccepted,
+
+    #[error("Invitation has been revoked")]
+    InviteRevoked,
+
+    #[error("Cannot revoke or demote the last vault owner")]
+    CannotRevokeLastOwner,
+
+    #[error("Stale key epoch: active vault epoch is {current}, commit used epoch {provided}")]
+    StaleKeyEpoch { current: u32, provided: u32 },
+
     #[error("Payload too large: limit {limit} bytes, actual {actual} bytes")]
     PayloadTooLarge { limit: usize, actual: usize },
 
@@ -281,5 +299,50 @@ pub struct MutationIdempotency {
     pub device_id: Uuid,
     pub request_hash: String,
     pub response_payload: String,
+    pub created_at: i64,
+}
+
+/// One-time scoped vault invitation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VaultInvite {
+    pub id: Uuid,
+    pub vault_id: Uuid,
+    pub inviter_user_id: Uuid,
+    pub role: VaultRole,
+    pub invite_token_hash: String,
+    pub recipient_email: Option<String>,
+    pub expires_at: i64,
+    pub accepted_at: Option<i64>,
+    pub accepted_by_user_id: Option<Uuid>,
+    pub revoked_at: Option<i64>,
+    pub created_at: i64,
+}
+
+/// Client-wrapped Data Encryption Key (DEK) envelope for a recipient device.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VaultKeyEnvelope {
+    pub vault_id: Uuid,
+    pub epoch: u32,
+    pub recipient_device_id: Uuid,
+    pub sender_device_id: Uuid,
+    pub wrapped_dek: String,
+    pub key_agreement_ephemeral_pk: Option<String>,
+    pub created_at: i64,
+}
+
+/// Append-only hash-chained audit event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditEvent {
+    pub id: i64,
+    pub vault_id: Uuid,
+    pub tenant_id: Uuid,
+    pub actor_user_id: Uuid,
+    pub actor_device_id: Option<Uuid>,
+    pub action: String,
+    pub target_type: String,
+    pub target_id: String,
+    pub details: Option<String>,
+    pub predecessor_hash: String,
+    pub event_hash: String,
     pub created_at: i64,
 }

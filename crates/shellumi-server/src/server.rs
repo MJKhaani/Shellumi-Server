@@ -11,9 +11,11 @@ use axum::{
 use shellumi_server_auth::{AccessTokenClaims, AuthService};
 use shellumi_server_domain::DomainError;
 use shellumi_server_protocol::{
-    BootstrapRequest, CapabilitiesResponse, CommitBatchRequest, CreateVaultRequest, ErrorResponse,
-    HealthResponse, LoginRequest, LogoutRequest, RefreshTokenRequest, RegisterDeviceRequest,
-    ServerLimits, UpdateVaultRequest, CURRENT_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION,
+    AcceptInviteRequest, AddVaultMemberRequest, BootstrapRequest, CapabilitiesResponse,
+    CommitBatchRequest, CreateInviteRequest, CreateVaultRequest, ErrorResponse, HealthResponse,
+    LoginRequest, LogoutRequest, PublishKeyEnvelopesRequest, RefreshTokenRequest,
+    RegisterDeviceRequest, RotateKeyEpochRequest, ServerLimits, UpdateVaultRequest,
+    CURRENT_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION,
 };
 use shellumi_server_store::InMemoryStore;
 use shellumi_server_sync::SyncEngine;
@@ -105,6 +107,36 @@ pub fn create_router_with_auth_and_sync(
             "/api/v1/vaults/:id/snapshots/:revision",
             get(get_snapshot_handler),
         )
+        // Team Members
+        .route(
+            "/api/v1/vaults/:id/members",
+            get(list_members_handler).post(add_member_handler),
+        )
+        .route(
+            "/api/v1/vaults/:id/members/:user_id",
+            delete(remove_member_handler),
+        )
+        // Invitations
+        .route(
+            "/api/v1/vaults/:id/invites",
+            get(list_invites_handler).post(create_invite_handler),
+        )
+        .route(
+            "/api/v1/vaults/:id/invites/:invite_id",
+            delete(revoke_invite_handler),
+        )
+        .route("/api/v1/invites/accept", post(accept_invite_handler))
+        // Recipient-Wrapped Key Envelopes & Epoch Rotation
+        .route(
+            "/api/v1/vaults/:id/keys/envelopes",
+            get(get_key_envelopes_handler).post(publish_key_envelopes_handler),
+        )
+        .route(
+            "/api/v1/vaults/:id/keys/epochs",
+            post(rotate_key_epoch_handler),
+        )
+        // Audit Log
+        .route("/api/v1/vaults/:id/audit", get(get_audit_log_handler))
         .fallback(not_found_handler);
 
     // Apply CORS
@@ -599,6 +631,355 @@ async fn get_snapshot_handler(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Team Member Handlers
+// ---------------------------------------------------------------------------
+
+async fn list_members_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(vault_id): Path<Uuid>,
+) -> impl IntoResponse {
+    let claims = match extract_auth_claims(&state.auth, &headers) {
+        Ok(c) => c,
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
+        }
+    };
+
+    match state.sync.list_members(claims.sub, vault_id).await {
+        Ok(resp) => (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())),
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            (status, Json(serde_json::to_value(err_resp.0).unwrap()))
+        }
+    }
+}
+
+async fn add_member_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(vault_id): Path<Uuid>,
+    Json(req): Json<AddVaultMemberRequest>,
+) -> impl IntoResponse {
+    let claims = match extract_auth_claims(&state.auth, &headers) {
+        Ok(c) => c,
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
+        }
+    };
+
+    match state
+        .sync
+        .add_or_update_member(claims.sub, vault_id, req)
+        .await
+    {
+        Ok(resp) => (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())),
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            (status, Json(serde_json::to_value(err_resp.0).unwrap()))
+        }
+    }
+}
+
+async fn remove_member_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((vault_id, target_user_id)): Path<(Uuid, Uuid)>,
+) -> impl IntoResponse {
+    let claims = match extract_auth_claims(&state.auth, &headers) {
+        Ok(c) => c,
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
+        }
+    };
+
+    match state
+        .sync
+        .remove_member(claims.sub, vault_id, target_user_id)
+        .await
+    {
+        Ok(()) => (StatusCode::NO_CONTENT, Json(serde_json::Value::Null)),
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            (status, Json(serde_json::to_value(err_resp.0).unwrap()))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Invitation Handlers
+// ---------------------------------------------------------------------------
+
+async fn create_invite_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(vault_id): Path<Uuid>,
+    Json(req): Json<CreateInviteRequest>,
+) -> impl IntoResponse {
+    let claims = match extract_auth_claims(&state.auth, &headers) {
+        Ok(c) => c,
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
+        }
+    };
+
+    match state.sync.create_invite(claims.sub, vault_id, req).await {
+        Ok(resp) => (
+            StatusCode::CREATED,
+            Json(serde_json::to_value(resp).unwrap()),
+        ),
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            (status, Json(serde_json::to_value(err_resp.0).unwrap()))
+        }
+    }
+}
+
+async fn list_invites_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(vault_id): Path<Uuid>,
+) -> impl IntoResponse {
+    let claims = match extract_auth_claims(&state.auth, &headers) {
+        Ok(c) => c,
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
+        }
+    };
+
+    match state.sync.list_invites(claims.sub, vault_id).await {
+        Ok(resp) => (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())),
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            (status, Json(serde_json::to_value(err_resp.0).unwrap()))
+        }
+    }
+}
+
+async fn revoke_invite_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((vault_id, invite_id)): Path<(Uuid, Uuid)>,
+) -> impl IntoResponse {
+    let claims = match extract_auth_claims(&state.auth, &headers) {
+        Ok(c) => c,
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
+        }
+    };
+
+    match state
+        .sync
+        .revoke_invite(claims.sub, vault_id, invite_id)
+        .await
+    {
+        Ok(()) => (StatusCode::NO_CONTENT, Json(serde_json::Value::Null)),
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            (status, Json(serde_json::to_value(err_resp.0).unwrap()))
+        }
+    }
+}
+
+async fn accept_invite_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<AcceptInviteRequest>,
+) -> impl IntoResponse {
+    let claims = match extract_auth_claims(&state.auth, &headers) {
+        Ok(c) => c,
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
+        }
+    };
+
+    match state.sync.accept_invite(claims.sub, req).await {
+        Ok(resp) => (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())),
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            (status, Json(serde_json::to_value(err_resp.0).unwrap()))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Recipient-Wrapped Key Envelope Handlers
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, serde::Deserialize)]
+pub struct KeyEnvelopesQuery {
+    pub epoch: Option<u32>,
+}
+
+async fn publish_key_envelopes_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(vault_id): Path<Uuid>,
+    Json(req): Json<PublishKeyEnvelopesRequest>,
+) -> impl IntoResponse {
+    let claims = match extract_auth_claims(&state.auth, &headers) {
+        Ok(c) => c,
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
+        }
+    };
+
+    let device_id = match extract_device_id(&headers) {
+        Ok(d) => d,
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
+        }
+    };
+
+    match state
+        .sync
+        .publish_key_envelopes(claims.sub, device_id, vault_id, req)
+        .await
+    {
+        Ok(count) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({ "published": count })),
+        ),
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            (status, Json(serde_json::to_value(err_resp.0).unwrap()))
+        }
+    }
+}
+
+async fn get_key_envelopes_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(vault_id): Path<Uuid>,
+    Query(query): Query<KeyEnvelopesQuery>,
+) -> impl IntoResponse {
+    let claims = match extract_auth_claims(&state.auth, &headers) {
+        Ok(c) => c,
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
+        }
+    };
+
+    let device_id = match extract_device_id(&headers) {
+        Ok(d) => d,
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
+        }
+    };
+
+    match state
+        .sync
+        .get_envelopes_for_device(claims.sub, device_id, vault_id, query.epoch)
+        .await
+    {
+        Ok(resp) => (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())),
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            (status, Json(serde_json::to_value(err_resp.0).unwrap()))
+        }
+    }
+}
+
+async fn rotate_key_epoch_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(vault_id): Path<Uuid>,
+    Json(req): Json<RotateKeyEpochRequest>,
+) -> impl IntoResponse {
+    let claims = match extract_auth_claims(&state.auth, &headers) {
+        Ok(c) => c,
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
+        }
+    };
+
+    let device_id = match extract_device_id(&headers) {
+        Ok(d) => d,
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
+        }
+    };
+
+    match state
+        .sync
+        .rotate_key_epoch(claims.sub, device_id, vault_id, req)
+        .await
+    {
+        Ok(resp) => (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())),
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            (status, Json(serde_json::to_value(err_resp.0).unwrap()))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Audit Log Handler
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, serde::Deserialize)]
+pub struct AuditLogQuery {
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+}
+
+async fn get_audit_log_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(vault_id): Path<Uuid>,
+    Query(query): Query<AuditLogQuery>,
+) -> impl IntoResponse {
+    let claims = match extract_auth_claims(&state.auth, &headers) {
+        Ok(c) => c,
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
+        }
+    };
+
+    match state
+        .sync
+        .get_audit_log(
+            claims.sub,
+            vault_id,
+            query.limit.unwrap_or(50),
+            query.offset.unwrap_or(0),
+        )
+        .await
+    {
+        Ok(resp) => (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())),
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            (status, Json(serde_json::to_value(err_resp.0).unwrap()))
+        }
+    }
+}
+
+fn extract_device_id(headers: &HeaderMap) -> Result<Uuid, DomainError> {
+    let header_val = headers
+        .get("x-device-id")
+        .or_else(|| headers.get("X-Device-Id"))
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| DomainError::InvalidInput("Missing X-Device-Id header".to_string()))?;
+
+    Uuid::parse_str(header_val)
+        .map_err(|_| DomainError::InvalidInput("Invalid X-Device-Id UUID format".to_string()))
+}
+
 async fn not_found_handler() -> impl IntoResponse {
     (
         StatusCode::NOT_FOUND,
@@ -646,6 +1027,12 @@ fn map_domain_error(err: DomainError) -> (StatusCode, Json<ErrorResponse>) {
         DomainError::IdempotencyConflict { .. } => (StatusCode::CONFLICT, "IDEMPOTENCY_CONFLICT"),
         DomainError::InvalidSignature(_) => (StatusCode::FORBIDDEN, "INVALID_SIGNATURE"),
         DomainError::VaultNotFound(_) => (StatusCode::NOT_FOUND, "NOT_FOUND"),
+        DomainError::InviteNotFound => (StatusCode::NOT_FOUND, "INVITE_NOT_FOUND"),
+        DomainError::InviteExpired => (StatusCode::GONE, "INVITE_EXPIRED"),
+        DomainError::InviteAlreadyAccepted => (StatusCode::CONFLICT, "INVITE_ALREADY_ACCEPTED"),
+        DomainError::InviteRevoked => (StatusCode::FORBIDDEN, "INVITE_REVOKED"),
+        DomainError::CannotRevokeLastOwner => (StatusCode::CONFLICT, "CANNOT_REVOKE_LAST_OWNER"),
+        DomainError::StaleKeyEpoch { .. } => (StatusCode::CONFLICT, "STALE_KEY_EPOCH"),
         DomainError::InvalidInput(_) | DomainError::InvalidPublicKey(_) => {
             (StatusCode::UNPROCESSABLE_ENTITY, "INVALID_INPUT")
         }

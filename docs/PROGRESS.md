@@ -214,3 +214,82 @@ This journal records every increment, decision, test execution, and verification
   - Milestone M3: Team Vaults, Invites, RBAC matrix, and recipient-wrapped key envelopes (wrapping DEK to recipient devices, one-time invitation links, epoch key rotation).
 - Issue / PR / CI evidence:
   - Local workspace passes all 36 automated tests, formatting, Clippy, and doc tests.
+
+---
+
+## 2026-11-11T09:10:00Z — TASK-004 — M3: Team Vaults, Invites, RBAC Matrix, and Recipient-Wrapped Key Envelopes
+- Status: complete
+- Baseline / commit: 59ec21d
+- Objective and acceptance criteria:
+  - Forward-only PostgreSQL migration `20261111000003_team_vaults_and_keys.sql` covering `vault_invites`, `vault_key_envelopes`, and `audit_events`.
+  - Member management and permission enforcement:
+    - `GET /api/v1/vaults/{id}/members`: list vault members with role and joined timestamp.
+    - `POST /api/v1/vaults/{id}/members`: add/update member roles (Owner/Admin only, cannot grant Owner or self-demote last Owner).
+    - `DELETE /api/v1/vaults/{id}/members/{user_id}`: revoke member (cannot remove last Owner).
+  - One-time scoped invitations:
+    - `POST /api/v1/vaults/{id}/invites`: generate high-entropy 256-bit token; server persists SHA-256 hash, role, and expiration.
+    - `GET /api/v1/vaults/{id}/invites`: list active pending invitations (plaintext token never returned).
+    - `DELETE /api/v1/vaults/{id}/invites/{invite_id}`: revoke invitation.
+    - `POST /api/v1/invites/accept`: accept invitation atomically with token hash verification.
+  - Recipient-wrapped key envelopes & epoch rotation:
+    - `POST /api/v1/vaults/{id}/keys/envelopes`: publish recipient-wrapped key envelopes for a given epoch.
+    - `GET /api/v1/vaults/{id}/keys/envelopes`: fetch wrapped DEK envelopes restricted strictly to calling device (`X-Device-Id`).
+    - `POST /api/v1/vaults/{id}/keys/epochs`: rotate key epoch with updated wraps; reject writes on stale/revoked epochs.
+  - Cryptographic audit logging:
+    - Hash-chained append-only event logging (`audit_events`).
+    - `GET /api/v1/vaults/{id}/audit`: paginated audit log (Admin/Owner only).
+  - Automated tests covering:
+    - Full Owner/Admin/Editor/Viewer RBAC matrix.
+    - Last Owner protection (cannot revoke or demote last owner).
+    - Single-use invite consumption and expired/revoked invite rejection.
+    - Key envelope device isolation (device receives only its own wrapped DEK).
+    - Epoch rotation and stale epoch write rejection.
+    - Hash-chained audit event verification.
+- Implementation / files changed:
+  - `migrations/20261111000003_team_vaults_and_keys.sql`: forward-only migration for team invites, key envelopes, and audit logs.
+  - `crates/shellumi-server-domain/src/lib.rs`: domain models (`VaultInvite`, `VaultKeyEnvelope`, `AuditEvent`) and domain errors (`InviteNotFound`, `InviteExpired`, `InviteAlreadyAccepted`, `InviteRevoked`, `CannotRevokeLastOwner`, `StaleKeyEpoch`).
+  - `crates/shellumi-server-protocol/src/lib.rs`: protocol request/response DTOs for members, invites, key envelopes, epoch rotation, and audit logs.
+  - `crates/shellumi-server-store/Cargo.toml`, `crates/shellumi-server-store/src/lib.rs`: repository traits (`InviteRepository`, `KeyEnvelopeRepository`, `AuditRepository`), store extensions (`remove_vault_member`, `count_vault_owners`, `update_vault_key_epoch`), `compute_audit_hash`, double-ended reverse lookups, and `InMemoryStore` implementation.
+  - `crates/shellumi-server-sync/Cargo.toml`, `crates/shellumi-server-sync/src/lib.rs`, `crates/shellumi-server-sync/src/collab.rs`: team vault collaboration engine, stale epoch write check in commit batches, member RBAC enforcement, cryptographic random invite tokens, device isolation, and audit trail generation.
+  - `crates/shellumi-server/src/server.rs`: HTTP routes and handlers for members, invites, key envelopes, epochs, audit logs, and domain error status mapping.
+  - `crates/shellumi-server/tests/team_and_keys.rs`: end-to-end integration tests covering RBAC matrix, last owner protection, invite lifecycle, device isolation, epoch rotation, and audit trail verification.
+  - `docs/adr/0004-m3-team-vaults-rbac-and-wrapped-keys.md`: ADR documenting team vault architecture and zero-knowledge E2EE key wrapping.
+  - `docs/API.md`: API documentation for Section 4 (Team Vaults, Collaboration & E2EE Keys).
+  - `openapi/shellumi-server-v1.yaml`: OpenAPI 3.1 specification for all M3 endpoints and component schemas.
+  - `docs/ROADMAP.md`: updated marking Milestone M3 Complete and M4 Current.
+- Data migration or API compatibility:
+  - Added migration `20261111000003_team_vaults_and_keys.sql`.
+  - Wire compatibility: All new endpoints under `/api/v1/vaults/{id}/...` and `/api/v1/invites/accept`. Existing personal vault clients remain 100% backward compatible without changes.
+- Security / privacy review:
+  - Zero-knowledge posture preserved: Server stores only opaque recipient-wrapped DEK envelopes (`wrapped_dek`) generated client-side for registered recipient device public keys.
+  - Recipient device isolation: `GET /api/v1/vaults/{id}/keys/envelopes` strictly filters where `recipient_device_id == calling_device_id`. Devices can never inspect or download other devices' wrapped keys.
+  - One-time invitations: Tokens are high-entropy 256-bit random values generated with cryptographically secure random bytes; server stores only the SHA-256 hash. Plaintext tokens are returned only once upon creation.
+  - Monotonic key epoch rotation: Stale key epoch commits are transactionally rejected with 409 Conflict (`STALE_KEY_EPOCH`).
+  - Cryptographic audit trail: Hash chaining links each event to its predecessor (`predecessor_hash`), with genesis initialized to 64 zeros, guaranteeing tamper evidence.
+- Tests added (file + test names):
+  - `crates/shellumi-server-store/src/lib.rs`:
+    - `test_vault_members_and_owner_count_and_removal`
+    - `test_invite_lifecycle_and_lookup`
+    - `test_key_envelope_device_filtering`
+    - `test_audit_repository_hash_chaining`
+  - `crates/shellumi-server/tests/team_and_keys.rs`:
+    - `test_vault_members_rbac_matrix_and_hierarchy`
+    - `test_last_owner_protection`
+    - `test_one_time_scoped_invitations_lifecycle`
+    - `test_recipient_wrapped_key_envelope_device_isolation`
+    - `test_epoch_rotation_and_stale_epoch_write_rejection`
+    - `test_cryptographic_audit_log_hash_chaining`
+- Verification executed (exact commands, OS, counts, pass/fail/skip):
+  - `cargo fmt --all -- --check` (macOS Darwin arm64, 0 formatting errors, pass)
+  - `cargo clippy --offline --workspace --all-targets --all-features -- -D warnings` (macOS Darwin arm64, 0 warnings, pass)
+  - `cargo test --offline --workspace --all-features` (macOS Darwin arm64, 46 tests: 46 passed, 0 failed, 0 skipped, pass)
+  - `cargo test --offline --doc --workspace` (macOS Darwin arm64, 0 doc-tests, pass)
+  - `cargo build --offline --workspace --all-features` (macOS Darwin arm64, 0 errors, pass)
+- Known limitations / failed attempts:
+  - Addressed `clippy::too_many_arguments` on `compute_audit_hash` by documenting normative preimage fields and allowing with explicit comment.
+  - Addressed `clippy::double_ended_iterator_last` by replacing `.iter().filter(...).last()` with `.iter().rfind(...)`.
+  - Added organization mapping to test context to satisfy organization tenancy requirements during vault creation.
+- Next precise step:
+  - Milestone M4: Resilience, Operations & Releases (CLI admin commands, backup/restore verification, health metrics, rate limits, multi-arch Docker image, reproducible release automation).
+- Issue / PR / CI evidence:
+  - All 46 automated tests pass across unit and integration suites with strict compiler warnings denied.

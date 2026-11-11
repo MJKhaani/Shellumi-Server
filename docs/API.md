@@ -370,3 +370,214 @@ All JSON error responses use standard status codes and the following body struct
 }
 ```
 
+---
+
+## 4. Team Vaults, Collaboration & E2EE Keys
+
+### List Vault Members
+- **Path:** `GET /api/v1/vaults/{id}/members`
+- **Auth:** Bearer Token (any member: Owner, Administrator, Editor, Viewer)
+- **Response:** `200 OK`
+```json
+{
+  "members": [
+    {
+      "vault_id": "019abcde-...",
+      "user_id": "019abcde-...",
+      "username": "alice",
+      "role": "owner",
+      "joined_at": 1700000000
+    }
+  ]
+}
+```
+
+### Add or Update Vault Member
+- **Path:** `POST /api/v1/vaults/{id}/members`
+- **Auth:** Bearer Token (Owner or Administrator)
+- **Request Body:**
+```json
+{
+  "user_id": "019abcde-...",
+  "role": "editor"
+}
+```
+- **Response:** `200 OK`
+- **Errors:**
+  - `403 Forbidden` (`PERMISSION_DENIED`) if caller is not an Owner/Administrator or an Administrator attempts to assign Owner/Administrator.
+  - `409 Conflict` (`CANNOT_REVOKE_LAST_OWNER`) if updating the sole owner to a non-owner role.
+
+### Remove Vault Member
+- **Path:** `DELETE /api/v1/vaults/{id}/members/{user_id}`
+- **Auth:** Bearer Token (Owner or Administrator)
+- **Response:** `204 No Content`
+- **Errors:**
+  - `409 Conflict` (`CANNOT_REVOKE_LAST_OWNER`) if attempting to remove the sole owner.
+  - `403 Forbidden` (`PERMISSION_DENIED`) if an Administrator attempts to remove an Owner or another Administrator.
+
+### Create One-Time Invitation
+- **Path:** `POST /api/v1/vaults/{id}/invites`
+- **Auth:** Bearer Token (Owner or Administrator)
+- **Request Body:**
+```json
+{
+  "role": "editor",
+  "recipient_email": "colleague@example.com",
+  "ttl_secs": 86400
+}
+```
+- **Response:** `201 Created`
+```json
+{
+  "invite_id": "019abcde-...",
+  "vault_id": "019abcde-...",
+  "role": "editor",
+  "invite_token": "a1b2c3d4e5f6... (256-bit random hex)",
+  "recipient_email": "colleague@example.com",
+  "expires_at": 1700086400,
+  "created_at": 1700000000
+}
+```
+
+### List Active Invitations
+- **Path:** `GET /api/v1/vaults/{id}/invites`
+- **Auth:** Bearer Token (Owner or Administrator)
+- **Response:** `200 OK` (Note: `invite_token` is never returned after creation)
+```json
+{
+  "invites": [
+    {
+      "invite_id": "019abcde-...",
+      "vault_id": "019abcde-...",
+      "role": "editor",
+      "recipient_email": "colleague@example.com",
+      "expires_at": 1700086400,
+      "created_at": 1700000000
+    }
+  ]
+}
+```
+
+### Revoke Invitation
+- **Path:** `DELETE /api/v1/vaults/{id}/invites/{invite_id}`
+- **Auth:** Bearer Token (Owner or Administrator)
+- **Response:** `204 No Content`
+
+### Accept Invitation
+- **Path:** `POST /api/v1/invites/accept`
+- **Auth:** Bearer Token (Authenticated user)
+- **Request Body:**
+```json
+{
+  "invite_token": "a1b2c3d4e5f6..."
+}
+```
+- **Response:** `200 OK`
+```json
+{
+  "vault_id": "019abcde-...",
+  "role": "editor"
+}
+```
+- **Errors:**
+  - `404 Not Found` (`INVITE_NOT_FOUND`) if token hash does not match.
+  - `409 Conflict` (`INVITE_ALREADY_ACCEPTED`) if token was already used.
+  - `403 Forbidden` (`INVITE_REVOKED`) if invitation was revoked.
+  - `410 Gone` (`INVITE_EXPIRED`) if invitation has expired.
+
+### Publish Recipient-Wrapped Key Envelopes
+- **Path:** `POST /api/v1/vaults/{id}/keys/envelopes`
+- **Auth:** Bearer Token + `X-Device-Id` header (Editor, Administrator, Owner)
+- **Request Body:**
+```json
+{
+  "epoch": 1,
+  "envelopes": [
+    {
+      "recipient_device_id": "019abcde-...",
+      "wrapped_dek": "base64-ciphertext-of-wrapped-dek",
+      "key_agreement_ephemeral_pk": "optional-ephemeral-pk"
+    }
+  ]
+}
+```
+- **Response:** `201 Created`
+```json
+{
+  "published": 1
+}
+```
+
+### Fetch Recipient-Wrapped Key Envelopes
+- **Path:** `GET /api/v1/vaults/{id}/keys/envelopes?epoch=1`
+- **Auth:** Bearer Token + `X-Device-Id` header (Any vault member)
+- **Security Guarantee:** Devices can only fetch key envelopes wrapped specifically for their own registered `device_id`.
+- **Response:** `200 OK`
+```json
+{
+  "envelopes": [
+    {
+      "vault_id": "019abcde-...",
+      "epoch": 1,
+      "recipient_device_id": "019abcde-...",
+      "sender_device_id": "019abcde-...",
+      "wrapped_dek": "base64-ciphertext-of-wrapped-dek",
+      "key_agreement_ephemeral_pk": "optional-ephemeral-pk",
+      "created_at": 1700000000
+    }
+  ]
+}
+```
+
+### Rotate Key Epoch
+- **Path:** `POST /api/v1/vaults/{id}/keys/epochs`
+- **Auth:** Bearer Token + `X-Device-Id` header (Owner or Administrator)
+- **Request Body:**
+```json
+{
+  "new_epoch": 2,
+  "envelopes": [
+    {
+      "recipient_device_id": "019abcde-...",
+      "wrapped_dek": "new-wrapped-dek-for-epoch-2"
+    }
+  ]
+}
+```
+- **Response:** `200 OK`
+```json
+{
+  "vault_id": "019abcde-...",
+  "active_key_epoch": 2,
+  "enrolled_envelopes": 1
+}
+```
+- **Errors:**
+  - `409 Conflict` (`STALE_KEY_EPOCH`) if `new_epoch <= active_key_epoch`.
+
+### Cryptographic Audit Log
+- **Path:** `GET /api/v1/vaults/{id}/audit?limit=50&offset=0`
+- **Auth:** Bearer Token (Owner or Administrator)
+- **Response:** `200 OK`
+```json
+{
+  "vault_id": "019abcde-...",
+  "events": [
+    {
+      "id": 1,
+      "vault_id": "019abcde-...",
+      "actor_user_id": "019abcde-...",
+      "actor_device_id": "019abcde-...",
+      "action": "member.add_or_update",
+      "target_type": "user",
+      "target_id": "019abcde-...",
+      "details": "role=editor",
+      "predecessor_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "event_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "created_at": 1700000000
+    }
+  ]
+}
+```
+
+

@@ -1,9 +1,11 @@
 //! Storage interfaces, traits, and implementations for Shellumi Server.
 
 use async_trait::async_trait;
+use sha2::{Digest, Sha256};
 use shellumi_server_domain::{
-    ChangeLogEntry, Device, DomainError, MutationIdempotency, OrgMembership, OrgRole, Organization,
-    Record, ServerSettings, Session, User, Vault, VaultMember, VaultRole,
+    AuditEvent, ChangeLogEntry, Device, DomainError, MutationIdempotency, OrgMembership, OrgRole,
+    Organization, Record, ServerSettings, Session, User, Vault, VaultInvite, VaultKeyEnvelope,
+    VaultMember, VaultRole,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -96,6 +98,82 @@ pub trait VaultRepository: Send + Sync {
     ) -> Result<Option<VaultRole>, DomainError>;
     async fn add_vault_member(&self, member: &VaultMember) -> Result<(), DomainError>;
     async fn list_vault_members(&self, vault_id: Uuid) -> Result<Vec<VaultMember>, DomainError>;
+    async fn remove_vault_member(&self, vault_id: Uuid, user_id: Uuid) -> Result<(), DomainError>;
+    async fn count_vault_owners(&self, vault_id: Uuid) -> Result<usize, DomainError>;
+    async fn update_vault_key_epoch(
+        &self,
+        vault_id: Uuid,
+        new_epoch: u32,
+    ) -> Result<(), DomainError>;
+}
+
+#[async_trait]
+pub trait InviteRepository: Send + Sync {
+    async fn create_invite(&self, invite: &VaultInvite) -> Result<(), DomainError>;
+    async fn find_invite_by_id(&self, invite_id: Uuid) -> Result<Option<VaultInvite>, DomainError>;
+    async fn find_invite_by_hash(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<VaultInvite>, DomainError>;
+    async fn list_active_invites(&self, vault_id: Uuid) -> Result<Vec<VaultInvite>, DomainError>;
+    async fn revoke_invite(&self, invite_id: Uuid, revoked_at: i64) -> Result<(), DomainError>;
+    async fn accept_invite(
+        &self,
+        invite_id: Uuid,
+        accepted_by_user_id: Uuid,
+        accepted_at: i64,
+    ) -> Result<(), DomainError>;
+}
+
+#[async_trait]
+pub trait KeyEnvelopeRepository: Send + Sync {
+    async fn save_envelopes(&self, envelopes: &[VaultKeyEnvelope]) -> Result<(), DomainError>;
+    async fn get_envelopes_for_device(
+        &self,
+        vault_id: Uuid,
+        recipient_device_id: Uuid,
+        epoch: Option<u32>,
+    ) -> Result<Vec<VaultKeyEnvelope>, DomainError>;
+    async fn list_all_envelopes_for_vault(
+        &self,
+        vault_id: Uuid,
+        epoch: Option<u32>,
+    ) -> Result<Vec<VaultKeyEnvelope>, DomainError>;
+}
+
+pub const GENESIS_AUDIT_HASH: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
+
+/// Computes the cryptographic hash of an audit event linked to its predecessor.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_audit_hash(
+    id: i64,
+    vault_id: Uuid,
+    actor_user_id: Uuid,
+    action: &str,
+    target_type: &str,
+    target_id: &str,
+    predecessor_hash: &str,
+    created_at: i64,
+) -> String {
+    let mut hasher = Sha256::new();
+    let preimage = format!(
+        "{id}:{vault_id}:{actor_user_id}:{action}:{target_type}:{target_id}:{predecessor_hash}:{created_at}"
+    );
+    hasher.update(preimage.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+#[async_trait]
+pub trait AuditRepository: Send + Sync {
+    async fn append_audit_event(&self, event: &mut AuditEvent) -> Result<(), DomainError>;
+    async fn list_audit_events(
+        &self,
+        vault_id: Uuid,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<AuditEvent>, DomainError>;
+    async fn get_latest_audit_hash(&self, vault_id: Uuid) -> Result<String, DomainError>;
 }
 
 #[async_trait]
@@ -139,6 +217,9 @@ pub trait Store:
     + SessionRepository
     + VaultRepository
     + SyncRepository
+    + InviteRepository
+    + KeyEnvelopeRepository
+    + AuditRepository
 {
 }
 
@@ -162,6 +243,11 @@ struct MemoryState {
     records: HashMap<(Uuid, String), Record>,
     change_log: Vec<ChangeLogEntry>,
     idempotency: HashMap<(Uuid, String), MutationIdempotency>,
+    invites: HashMap<Uuid, VaultInvite>,
+    invites_by_hash: HashMap<String, Uuid>,
+    key_envelopes: Vec<VaultKeyEnvelope>,
+    audit_events: Vec<AuditEvent>,
+    next_audit_id: i64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -658,6 +744,230 @@ impl VaultRepository for InMemoryStore {
             .collect();
         Ok(members)
     }
+
+    async fn remove_vault_member(&self, vault_id: Uuid, user_id: Uuid) -> Result<(), DomainError> {
+        let mut lock = self.state.write().await;
+        lock.vault_members
+            .retain(|m| !(m.vault_id == vault_id && m.user_id == user_id));
+        Ok(())
+    }
+
+    async fn count_vault_owners(&self, vault_id: Uuid) -> Result<usize, DomainError> {
+        let lock = self.state.read().await;
+        let count = lock
+            .vault_members
+            .iter()
+            .filter(|m| m.vault_id == vault_id && m.role == VaultRole::Owner)
+            .count();
+        Ok(count)
+    }
+
+    async fn update_vault_key_epoch(
+        &self,
+        vault_id: Uuid,
+        new_epoch: u32,
+    ) -> Result<(), DomainError> {
+        let mut lock = self.state.write().await;
+        let vault = lock
+            .vaults
+            .get_mut(&vault_id)
+            .ok_or(DomainError::VaultNotFound(vault_id))?;
+        vault.active_key_epoch = new_epoch;
+        vault.updated_at = chrono::Utc::now().timestamp();
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl InviteRepository for InMemoryStore {
+    async fn create_invite(&self, invite: &VaultInvite) -> Result<(), DomainError> {
+        let mut lock = self.state.write().await;
+        if lock.invites.contains_key(&invite.id) {
+            return Err(DomainError::Conflict(format!(
+                "Invite with id '{}' already exists",
+                invite.id
+            )));
+        }
+        lock.invites.insert(invite.id, invite.clone());
+        lock.invites_by_hash
+            .insert(invite.invite_token_hash.clone(), invite.id);
+        Ok(())
+    }
+
+    async fn find_invite_by_id(&self, invite_id: Uuid) -> Result<Option<VaultInvite>, DomainError> {
+        let lock = self.state.read().await;
+        Ok(lock.invites.get(&invite_id).cloned())
+    }
+
+    async fn find_invite_by_hash(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<VaultInvite>, DomainError> {
+        let lock = self.state.read().await;
+        if let Some(id) = lock.invites_by_hash.get(token_hash) {
+            Ok(lock.invites.get(id).cloned())
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn list_active_invites(&self, vault_id: Uuid) -> Result<Vec<VaultInvite>, DomainError> {
+        let lock = self.state.read().await;
+        let now = chrono::Utc::now().timestamp();
+        let invites = lock
+            .invites
+            .values()
+            .filter(|inv| {
+                inv.vault_id == vault_id
+                    && inv.revoked_at.is_none()
+                    && inv.accepted_at.is_none()
+                    && inv.expires_at > now
+            })
+            .cloned()
+            .collect();
+        Ok(invites)
+    }
+
+    async fn revoke_invite(&self, invite_id: Uuid, revoked_at: i64) -> Result<(), DomainError> {
+        let mut lock = self.state.write().await;
+        let invite = lock
+            .invites
+            .get_mut(&invite_id)
+            .ok_or(DomainError::InviteNotFound)?;
+        invite.revoked_at = Some(revoked_at);
+        Ok(())
+    }
+
+    async fn accept_invite(
+        &self,
+        invite_id: Uuid,
+        accepted_by_user_id: Uuid,
+        accepted_at: i64,
+    ) -> Result<(), DomainError> {
+        let mut lock = self.state.write().await;
+        let invite = lock
+            .invites
+            .get_mut(&invite_id)
+            .ok_or(DomainError::InviteNotFound)?;
+        invite.accepted_at = Some(accepted_at);
+        invite.accepted_by_user_id = Some(accepted_by_user_id);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl KeyEnvelopeRepository for InMemoryStore {
+    async fn save_envelopes(&self, envelopes: &[VaultKeyEnvelope]) -> Result<(), DomainError> {
+        let mut lock = self.state.write().await;
+        for env in envelopes {
+            if let Some(existing) = lock.key_envelopes.iter_mut().find(|e| {
+                e.vault_id == env.vault_id
+                    && e.epoch == env.epoch
+                    && e.recipient_device_id == env.recipient_device_id
+            }) {
+                *existing = env.clone();
+            } else {
+                lock.key_envelopes.push(env.clone());
+            }
+        }
+        Ok(())
+    }
+
+    async fn get_envelopes_for_device(
+        &self,
+        vault_id: Uuid,
+        recipient_device_id: Uuid,
+        epoch: Option<u32>,
+    ) -> Result<Vec<VaultKeyEnvelope>, DomainError> {
+        let lock = self.state.read().await;
+        let envelopes = lock
+            .key_envelopes
+            .iter()
+            .filter(|e| {
+                e.vault_id == vault_id
+                    && e.recipient_device_id == recipient_device_id
+                    && epoch.map_or(true, |ep| e.epoch == ep)
+            })
+            .cloned()
+            .collect();
+        Ok(envelopes)
+    }
+
+    async fn list_all_envelopes_for_vault(
+        &self,
+        vault_id: Uuid,
+        epoch: Option<u32>,
+    ) -> Result<Vec<VaultKeyEnvelope>, DomainError> {
+        let lock = self.state.read().await;
+        let envelopes = lock
+            .key_envelopes
+            .iter()
+            .filter(|e| e.vault_id == vault_id && epoch.map_or(true, |ep| e.epoch == ep))
+            .cloned()
+            .collect();
+        Ok(envelopes)
+    }
+}
+
+#[async_trait]
+impl AuditRepository for InMemoryStore {
+    async fn append_audit_event(&self, event: &mut AuditEvent) -> Result<(), DomainError> {
+        let mut lock = self.state.write().await;
+        lock.next_audit_id += 1;
+        let new_id = lock.next_audit_id;
+        event.id = new_id;
+
+        let latest_hash = lock
+            .audit_events
+            .iter()
+            .rfind(|e| e.vault_id == event.vault_id)
+            .map(|e| e.event_hash.clone())
+            .unwrap_or_else(|| GENESIS_AUDIT_HASH.to_string());
+
+        event.predecessor_hash = latest_hash.clone();
+        event.event_hash = compute_audit_hash(
+            new_id,
+            event.vault_id,
+            event.actor_user_id,
+            &event.action,
+            &event.target_type,
+            &event.target_id,
+            &latest_hash,
+            event.created_at,
+        );
+
+        lock.audit_events.push(event.clone());
+        Ok(())
+    }
+
+    async fn list_audit_events(
+        &self,
+        vault_id: Uuid,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<AuditEvent>, DomainError> {
+        let lock = self.state.read().await;
+        let mut events: Vec<AuditEvent> = lock
+            .audit_events
+            .iter()
+            .filter(|e| e.vault_id == vault_id)
+            .cloned()
+            .collect();
+        events.sort_by_key(|e| e.id);
+        let paged = events.into_iter().skip(offset).take(limit).collect();
+        Ok(paged)
+    }
+
+    async fn get_latest_audit_hash(&self, vault_id: Uuid) -> Result<String, DomainError> {
+        let lock = self.state.read().await;
+        let latest = lock
+            .audit_events
+            .iter()
+            .rfind(|e| e.vault_id == vault_id)
+            .map(|e| e.event_hash.clone())
+            .unwrap_or_else(|| GENESIS_AUDIT_HASH.to_string());
+        Ok(latest)
+    }
 }
 
 #[async_trait]
@@ -1038,5 +1348,191 @@ mod tests {
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].object_id, "host-1");
         assert_eq!(changes[0].sequence, 1);
+    }
+
+    #[tokio::test]
+    async fn test_vault_members_and_owner_count_and_removal() {
+        let store = InMemoryStore::new();
+        let vault_id = Uuid::new_v4();
+        let user1 = Uuid::new_v4();
+        let user2 = Uuid::new_v4();
+        let now = chrono::Utc::now().timestamp();
+
+        let member1 = VaultMember {
+            vault_id,
+            user_id: user1,
+            role: VaultRole::Owner,
+            joined_at: now,
+        };
+        let member2 = VaultMember {
+            vault_id,
+            user_id: user2,
+            role: VaultRole::Editor,
+            joined_at: now,
+        };
+
+        store.add_vault_member(&member1).await.unwrap();
+        store.add_vault_member(&member2).await.unwrap();
+
+        assert_eq!(store.count_vault_owners(vault_id).await.unwrap(), 1);
+        assert_eq!(store.list_vault_members(vault_id).await.unwrap().len(), 2);
+
+        store.remove_vault_member(vault_id, user2).await.unwrap();
+        assert_eq!(store.list_vault_members(vault_id).await.unwrap().len(), 1);
+        assert_eq!(store.count_vault_owners(vault_id).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_invite_lifecycle_and_lookup() {
+        let store = InMemoryStore::new();
+        let vault_id = Uuid::new_v4();
+        let inviter_id = Uuid::new_v4();
+        let invite_id = Uuid::new_v4();
+        let now = chrono::Utc::now().timestamp();
+        let token_hash = "hash-12345".to_string();
+
+        let invite = VaultInvite {
+            id: invite_id,
+            vault_id,
+            inviter_user_id: inviter_id,
+            role: VaultRole::Administrator,
+            invite_token_hash: token_hash.clone(),
+            recipient_email: Some("alice@example.com".to_string()),
+            expires_at: now + 3600,
+            accepted_at: None,
+            accepted_by_user_id: None,
+            revoked_at: None,
+            created_at: now,
+        };
+
+        store.create_invite(&invite).await.unwrap();
+
+        // Find by hash
+        let found = store
+            .find_invite_by_hash(&token_hash)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.id, invite_id);
+        assert_eq!(found.role, VaultRole::Administrator);
+
+        // List active
+        let active = store.list_active_invites(vault_id).await.unwrap();
+        assert_eq!(active.len(), 1);
+
+        // Accept invite
+        let accepted_by = Uuid::new_v4();
+        store
+            .accept_invite(invite_id, accepted_by, now + 10)
+            .await
+            .unwrap();
+
+        let updated = store.find_invite_by_id(invite_id).await.unwrap().unwrap();
+        assert_eq!(updated.accepted_by_user_id, Some(accepted_by));
+
+        // Now not in active invites
+        let active_after = store.list_active_invites(vault_id).await.unwrap();
+        assert_eq!(active_after.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_key_envelope_device_filtering() {
+        let store = InMemoryStore::new();
+        let vault_id = Uuid::new_v4();
+        let device1 = Uuid::new_v4();
+        let device2 = Uuid::new_v4();
+        let sender = Uuid::new_v4();
+        let now = chrono::Utc::now().timestamp();
+
+        let env1 = VaultKeyEnvelope {
+            vault_id,
+            epoch: 1,
+            recipient_device_id: device1,
+            sender_device_id: sender,
+            wrapped_dek: "wrapped-for-d1".to_string(),
+            key_agreement_ephemeral_pk: None,
+            created_at: now,
+        };
+        let env2 = VaultKeyEnvelope {
+            vault_id,
+            epoch: 1,
+            recipient_device_id: device2,
+            sender_device_id: sender,
+            wrapped_dek: "wrapped-for-d2".to_string(),
+            key_agreement_ephemeral_pk: None,
+            created_at: now,
+        };
+
+        store.save_envelopes(&[env1, env2]).await.unwrap();
+
+        // Device 1 fetches only its own
+        let d1_envelopes = store
+            .get_envelopes_for_device(vault_id, device1, None)
+            .await
+            .unwrap();
+        assert_eq!(d1_envelopes.len(), 1);
+        assert_eq!(d1_envelopes[0].wrapped_dek, "wrapped-for-d1");
+
+        // Device 2 fetches only its own
+        let d2_envelopes = store
+            .get_envelopes_for_device(vault_id, device2, None)
+            .await
+            .unwrap();
+        assert_eq!(d2_envelopes.len(), 1);
+        assert_eq!(d2_envelopes[0].wrapped_dek, "wrapped-for-d2");
+    }
+
+    #[tokio::test]
+    async fn test_audit_repository_hash_chaining() {
+        let store = InMemoryStore::new();
+        let vault_id = Uuid::new_v4();
+        let tenant_id = Uuid::new_v4();
+        let actor_id = Uuid::new_v4();
+        let now = chrono::Utc::now().timestamp();
+
+        let mut event1 = AuditEvent {
+            id: 0,
+            vault_id,
+            tenant_id,
+            actor_user_id: actor_id,
+            actor_device_id: None,
+            action: "vault.create".to_string(),
+            target_type: "vault".to_string(),
+            target_id: vault_id.to_string(),
+            details: None,
+            predecessor_hash: String::new(),
+            event_hash: String::new(),
+            created_at: now,
+        };
+
+        store.append_audit_event(&mut event1).await.unwrap();
+        assert_eq!(event1.id, 1);
+        assert_eq!(event1.predecessor_hash, GENESIS_AUDIT_HASH);
+        assert!(!event1.event_hash.is_empty());
+
+        let mut event2 = AuditEvent {
+            id: 0,
+            vault_id,
+            tenant_id,
+            actor_user_id: actor_id,
+            actor_device_id: None,
+            action: "member.add".to_string(),
+            target_type: "user".to_string(),
+            target_id: Uuid::new_v4().to_string(),
+            details: None,
+            predecessor_hash: String::new(),
+            event_hash: String::new(),
+            created_at: now + 5,
+        };
+
+        store.append_audit_event(&mut event2).await.unwrap();
+        assert_eq!(event2.id, 2);
+        assert_eq!(event2.predecessor_hash, event1.event_hash);
+        assert!(!event2.event_hash.is_empty());
+
+        let events = store.list_audit_events(vault_id, 10, 0).await.unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].id, 1);
+        assert_eq!(events[1].id, 2);
     }
 }

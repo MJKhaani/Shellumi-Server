@@ -385,6 +385,276 @@ paths:
               schema:
                 $ref: '#/components/schemas/SnapshotResponse'
 
+  /api/v1/vaults/{id}/members:
+    get:
+      summary: List vault members
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: List of members
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VaultMemberListResponse'
+    post:
+      summary: Add or update vault member
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddVaultMemberRequest'
+      responses:
+        '200':
+          description: Member added or updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VaultMemberResponse'
+
+  /api/v1/vaults/{id}/members/{user_id}:
+    delete:
+      summary: Remove vault member
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: user_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '204':
+          description: Member removed
+
+  /api/v1/vaults/{id}/invites:
+    get:
+      summary: List active invitations
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Active invitations
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InviteListResponse'
+    post:
+      summary: Create scoped invitation
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateInviteRequest'
+      responses:
+        '201':
+          description: Invitation created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InviteResponse'
+
+  /api/v1/vaults/{id}/invites/{invite_id}:
+    delete:
+      summary: Revoke invitation
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: invite_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '204':
+          description: Invitation revoked
+
+  /api/v1/invites/accept:
+    post:
+      summary: Accept invitation
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AcceptInviteRequest'
+      responses:
+        '200':
+          description: Invitation accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AcceptInviteResponse'
+
+  /api/v1/vaults/{id}/keys/envelopes:
+    get:
+      summary: Get recipient-wrapped key envelopes for calling device
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: X-Device-Id
+          in: header
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: epoch
+          in: query
+          required: false
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Wrapped envelopes for calling device
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KeyEnvelopeListResponse'
+    post:
+      summary: Publish recipient-wrapped key envelopes
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: X-Device-Id
+          in: header
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PublishKeyEnvelopesRequest'
+      responses:
+        '201':
+          description: Envelopes stored
+
+  /api/v1/vaults/{id}/keys/epochs:
+    post:
+      summary: Rotate vault key epoch
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: X-Device-Id
+          in: header
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RotateKeyEpochRequest'
+      responses:
+        '200':
+          description: Epoch rotated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RotateKeyEpochResponse'
+
+  /api/v1/vaults/{id}/audit:
+    get:
+      summary: Fetch cryptographic audit log
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Audit events
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditLogResponse'
+
 components:
   securitySchemes:
     BearerAuth:
@@ -911,3 +1181,272 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/SyncChangeItem'
+
+    VaultMemberResponse:
+      type: object
+      required:
+        - vault_id
+        - user_id
+        - username
+        - role
+        - joined_at
+      properties:
+        vault_id:
+          type: string
+          format: uuid
+        user_id:
+          type: string
+          format: uuid
+        username:
+          type: string
+        role:
+          type: string
+          enum: [owner, administrator, editor, viewer]
+        joined_at:
+          type: integer
+
+    VaultMemberListResponse:
+      type: object
+      required:
+        - members
+      properties:
+        members:
+          type: array
+          items:
+            $ref: '#/components/schemas/VaultMemberResponse'
+
+    AddVaultMemberRequest:
+      type: object
+      required:
+        - user_id
+        - role
+      properties:
+        user_id:
+          type: string
+          format: uuid
+        role:
+          type: string
+          enum: [owner, administrator, editor, viewer]
+
+    CreateInviteRequest:
+      type: object
+      required:
+        - role
+      properties:
+        role:
+          type: string
+          enum: [owner, administrator, editor, viewer]
+        recipient_email:
+          type: string
+          nullable: true
+        ttl_secs:
+          type: integer
+          nullable: true
+
+    InviteResponse:
+      type: object
+      required:
+        - invite_id
+        - vault_id
+        - role
+        - expires_at
+        - created_at
+      properties:
+        invite_id:
+          type: string
+          format: uuid
+        vault_id:
+          type: string
+          format: uuid
+        role:
+          type: string
+        invite_token:
+          type: string
+          nullable: true
+        recipient_email:
+          type: string
+          nullable: true
+        expires_at:
+          type: integer
+        created_at:
+          type: integer
+
+    InviteListResponse:
+      type: object
+      required:
+        - invites
+      properties:
+        invites:
+          type: array
+          items:
+            $ref: '#/components/schemas/InviteResponse'
+
+    AcceptInviteRequest:
+      type: object
+      required:
+        - invite_token
+      properties:
+        invite_token:
+          type: string
+
+    AcceptInviteResponse:
+      type: object
+      required:
+        - vault_id
+        - role
+      properties:
+        vault_id:
+          type: string
+          format: uuid
+        role:
+          type: string
+
+    KeyEnvelopeItem:
+      type: object
+      required:
+        - recipient_device_id
+        - wrapped_dek
+      properties:
+        recipient_device_id:
+          type: string
+          format: uuid
+        wrapped_dek:
+          type: string
+        key_agreement_ephemeral_pk:
+          type: string
+          nullable: true
+
+    PublishKeyEnvelopesRequest:
+      type: object
+      required:
+        - epoch
+        - envelopes
+      properties:
+        epoch:
+          type: integer
+        envelopes:
+          type: array
+          items:
+            $ref: '#/components/schemas/KeyEnvelopeItem'
+
+    KeyEnvelopeResponse:
+      type: object
+      required:
+        - vault_id
+        - epoch
+        - recipient_device_id
+        - sender_device_id
+        - wrapped_dek
+        - created_at
+      properties:
+        vault_id:
+          type: string
+          format: uuid
+        epoch:
+          type: integer
+        recipient_device_id:
+          type: string
+          format: uuid
+        sender_device_id:
+          type: string
+          format: uuid
+        wrapped_dek:
+          type: string
+        key_agreement_ephemeral_pk:
+          type: string
+          nullable: true
+        created_at:
+          type: integer
+
+    KeyEnvelopeListResponse:
+      type: object
+      required:
+        - envelopes
+      properties:
+        envelopes:
+          type: array
+          items:
+            $ref: '#/components/schemas/KeyEnvelopeResponse'
+
+    RotateKeyEpochRequest:
+      type: object
+      required:
+        - new_epoch
+        - envelopes
+      properties:
+        new_epoch:
+          type: integer
+        envelopes:
+          type: array
+          items:
+            $ref: '#/components/schemas/KeyEnvelopeItem'
+
+    RotateKeyEpochResponse:
+      type: object
+      required:
+        - vault_id
+        - active_key_epoch
+        - enrolled_envelopes
+      properties:
+        vault_id:
+          type: string
+          format: uuid
+        active_key_epoch:
+          type: integer
+        enrolled_envelopes:
+          type: integer
+
+    AuditEventResponse:
+      type: object
+      required:
+        - id
+        - vault_id
+        - actor_user_id
+        - action
+        - target_type
+        - target_id
+        - predecessor_hash
+        - event_hash
+        - created_at
+      properties:
+        id:
+          type: integer
+        vault_id:
+          type: string
+          format: uuid
+        actor_user_id:
+          type: string
+          format: uuid
+        actor_device_id:
+          type: string
+          format: uuid
+          nullable: true
+        action:
+          type: string
+        target_type:
+          type: string
+        target_id:
+          type: string
+        details:
+          type: string
+          nullable: true
+        predecessor_hash:
+          type: string
+        event_hash:
+          type: string
+        created_at:
+          type: integer
+
+    AuditLogResponse:
+      type: object
+      required:
+        - vault_id
+        - events
+      properties:
+        vault_id:
+          type: string
+          format: uuid
+        events:
+          type: array
+          items:
+            $ref: '#/components/schemas/AuditEventResponse'

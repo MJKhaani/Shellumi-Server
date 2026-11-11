@@ -9,8 +9,8 @@ This document outlines the milestones and progress of Shellumi Server.
 | **M0** | Repository Foundations & Hygiene | **Complete** | Workspace skeleton, configuration parser, `/health/live`, `/health/ready`, `/api/v1/capabilities`, strict config validation, unit/integration tests, CI workflow, docs. |
 | **M1** | Storage, Migrations, Tenants & Auth | **Complete** | PostgreSQL schema, admin bootstrap, accounts, sessions, device key registration, organizations, token revocation, cross-tenant isolation tests. |
 | **M2** | Encrypted Private Vault & Sync v1 | **Complete** | Stable UUIDs, opaque ciphertext envelopes, device signatures, transactional change feed, conditional `expected_revision` writes, conflict resolution (409), tombstones. |
-| **M3** | Team Vaults, Invites, RBAC & E2EE Keys | **In Progress** | Owner/Admin/Editor/Viewer permission matrix, one-time invitations, per-device recipient-wrapped DEKs, epoch rotation, audit trail. |
-| **M4** | Resilience, Operations & Releases | Planned | CLI admin commands, backup/restore verification, metrics, rate limits, multi-arch Docker image, reproducible release automation. |
+| **M3** | Team Vaults, Invites, RBAC & E2EE Keys | **Complete** | Owner/Admin/Editor/Viewer permission matrix, one-time invitations, per-device recipient-wrapped DEKs, epoch rotation, audit trail. |
+| **M4** | Resilience, Operations & Releases | Current | CLI admin commands, backup/restore verification, metrics, rate limits, multi-arch Docker image, reproducible release automation. |
 | **M5** | Optional Live Terminal Collaboration | Planned | WSS relay, ephemeral E2EE session keys, single-writer fencing token, owner emergency revocation, bounded queues. Relay disabled until gates pass. |
 | **M6** | Advanced Self-Hosting & Integrations | Planned | OIDC/SSO, optional SMTP, large encrypted attachments, horizontal PostgreSQL coordination. |
 
@@ -55,7 +55,7 @@ This document outlines the milestones and progress of Shellumi Server.
 - **Tombstones:** Soft deletions with durable tombstones propagating across devices.
 - **Verification:** Two-device sync convergence, concurrent edits race test, tombstone handling, signature validation.
 
-### M3 — Team Vaults, Invites, RBAC & E2EE Keys (Current)
+### M3 — Team Vaults, Invites, RBAC & E2EE Keys (Complete)
 - **RBAC Matrix:** Strict permission enforcement for Owner, Administrator, Editor, and Viewer across all vault actions.
 - **Recipient-Wrapped DEKs:** Client-wrapped data encryption keys per authorized recipient device (zero plaintext DEK on server).
 - **Invitations:** Single-use cryptographically random token invitations with expiry and role scoping.
