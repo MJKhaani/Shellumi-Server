@@ -1,0 +1,133 @@
+openapi: 3.1.0
+info:
+  title: Shellumi Server API
+  description: Self-hosted, encrypted synchronization server for Shellumi.
+  version: 0.1.0
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+
+paths:
+  /health/live:
+    get:
+      summary: Liveness probe
+      description: Returns process liveness status without leaking secrets or system details.
+      responses:
+        '200':
+          description: Service is alive
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /health/ready:
+    get:
+      summary: Readiness probe
+      description: Returns system readiness for handling requests.
+      responses:
+        '200':
+          description: Service is ready
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /api/v1/capabilities:
+    get:
+      summary: Server capabilities
+      description: Advertises supported protocol versions, features, cryptographic suites, and bounds.
+      responses:
+        '200':
+          description: Supported capabilities
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CapabilitiesResponse'
+
+components:
+  schemas:
+    HealthResponse:
+      type: object
+      required:
+        - status
+        - service
+        - version
+      properties:
+        status:
+          type: string
+          example: ok
+        service:
+          type: string
+          example: shellumi-server
+        version:
+          type: string
+          example: 0.1.0
+        details:
+          type: string
+          nullable: true
+          example: System ready
+
+    CapabilitiesResponse:
+      type: object
+      required:
+        - server_version
+        - protocol_version
+        - min_protocol_version
+        - supported_features
+        - supported_e2ee_suites
+        - limits
+      properties:
+        server_version:
+          type: string
+          example: 0.1.0
+        protocol_version:
+          type: integer
+          example: 1
+        min_protocol_version:
+          type: integer
+          example: 1
+        supported_features:
+          type: array
+          items:
+            type: string
+          example: ["vault_sync_v1", "device_auth", "team_sharing"]
+        supported_e2ee_suites:
+          type: array
+          items:
+            type: string
+          example: ["x25519_hkdf_aes256gcm", "argon2id_aes256gcm_legacy"]
+        limits:
+          $ref: '#/components/schemas/ServerLimits'
+
+    ServerLimits:
+      type: object
+      required:
+        - max_request_bytes
+        - max_record_bytes
+        - max_mutations_per_commit
+      properties:
+        max_request_bytes:
+          type: integer
+          example: 10485760
+        max_record_bytes:
+          type: integer
+          example: 1048576
+        max_mutations_per_commit:
+          type: integer
+          example: 100
+
+    ErrorResponse:
+      type: object
+      required:
+        - error_code
+        - message
+      properties:
+        error_code:
+          type: string
+          example: NOT_FOUND
+        message:
+          type: string
+          example: The requested resource was not found
+        request_id:
+          type: string
+          nullable: true

@@ -1,0 +1,66 @@
+# Shellumi Server — Engineering Progress Journal
+
+This journal records every increment, decision, test execution, and verification evidence in append-only chronological order.
+
+---
+
+## 2026-11-11T08:10:00Z — TASK-001 — M0: Repository foundations, workspace skeleton, and configuration parser
+- Status: complete
+- Baseline / commit: repository init
+- Objective and acceptance criteria:
+  - Establish Rust workspace layout per PROJECT.md §3.1 (`shellumi-server`, `shellumi-server-protocol`, `shellumi-server-domain`).
+  - Implement pinned rust toolchain, MIT license, and build hygiene.
+  - Implement configuration parser with precedence (CLI flags > environment variables > config file > secure defaults).
+  - Enforce strict rejection of unsafe defaults (e.g. non-loopback plaintext HTTP outside containers).
+  - Implement liveness (`/health/live`) and readiness (`/health/ready`) endpoints.
+  - Implement typed errors and API capabilities endpoint (`/api/v1/capabilities`).
+  - Unit and integration tests covering valid/invalid config, health checks, and capabilities.
+- Implementation / files changed:
+  - `rust-toolchain.toml`: pinned Rust stable toolchain with rustfmt and clippy components.
+  - `LICENSE`: MIT License.
+  - `.gitignore`: ignored targets, editor files, environment and local data files; tracked Cargo.lock.
+  - `Cargo.toml`: workspace definition and pinned dependencies.
+  - `Cargo.lock`: generated locked dependency manifest.
+  - `crates/shellumi-server-protocol/Cargo.toml`, `crates/shellumi-server-protocol/src/lib.rs`: DTOs for health, capabilities, errors, protocol constants.
+  - `crates/shellumi-server-domain/Cargo.toml`, `crates/shellumi-server-domain/src/lib.rs`: domain error models.
+  - `crates/shellumi-server/Cargo.toml`, `crates/shellumi-server/src/lib.rs`, `crates/shellumi-server/src/config.rs`, `crates/shellumi-server/src/server.rs`, `crates/shellumi-server/src/main.rs`: configuration loading and validation, Axum router, health and capabilities handlers, graceful shutdown on SIGINT/SIGTERM.
+  - `crates/shellumi-server/tests/health_and_capabilities.rs`: integration tests for `/health/live`, `/health/ready`, `/api/v1/capabilities`, and 404 fallback.
+  - `deploy/docker-compose.yml`, `deploy/.env.example`: Compose orchestration with PostgreSQL 16.
+  - `Dockerfile`, `.dockerignore`: multi-stage non-root container with liveness healthcheck.
+  - `.github/workflows/ci.yml`: CI workflow checking fmt, clippy, unit/integration tests, doc-tests, and build.
+  - `openapi/shellumi-server-v1.yaml`: OpenAPI 3.1 specification for initial routes.
+  - `docs/ROADMAP.md`, `docs/ARCHITECTURE.md`, `docs/CONFIGURATION.md`, `docs/API.md`, `docs/COMPATIBILITY.md`, `docs/security/THREAT_MODEL.md`, `docs/security/KEY_MANAGEMENT.md`, `docs/DEPLOYMENT.md`, `docs/BACKUP_RESTORE.md`, `docs/development/TESTING.md`, `docs/development/RELEASES.md`, `docs/adr/0001-m0-workspace-and-runtime-architecture.md`, `README.md`, `CHANGELOG.md`, `SECURITY.md`, `CONTRIBUTING.md`.
+- Data migration or API compatibility:
+  - Initial baseline establishing v1 protocol negotiation and capabilities structure.
+- Security / privacy review:
+  - Binding to non-loopback addresses (`!ip.is_loopback()`) without HTTPS public URL or explicit trusted proxies is strictly rejected in default configuration.
+  - Health endpoints do not leak internal database credentials or sensitive details.
+  - Default body limit enforced on all incoming HTTP requests (`10 MiB` default).
+  - Open registration prohibited (`invite_only` default).
+- Tests added (file + test names):
+  - `crates/shellumi-server/src/config.rs`:
+    - `test_default_config_validates_successfully`
+    - `test_rejects_unsafe_non_loopback_without_https`
+    - `test_allows_non_loopback_with_https`
+    - `test_allows_non_loopback_with_trusted_proxies`
+    - `test_rejects_invalid_token_ttls`
+    - `test_rejects_record_size_greater_than_request_size`
+    - `test_cli_overrides_file_and_defaults`
+  - `crates/shellumi-server/tests/health_and_capabilities.rs`:
+    - `test_health_live_endpoint_returns_ok`
+    - `test_health_ready_endpoint_returns_ready`
+    - `test_capabilities_endpoint_returns_protocol_and_limits`
+    - `test_unknown_route_returns_404_json_error`
+- Verification executed (exact commands, OS, counts, pass/fail/skip):
+  - `cargo fmt --all -- --check` (macOS Darwin arm64, 0 errors, pass)
+  - `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings` (macOS Darwin arm64, 0 warnings, pass)
+  - `cargo test --locked --workspace --all-features` (macOS Darwin arm64, 11 tests: 11 passed, 0 failed, 0 skipped, pass)
+  - `cargo test --locked --doc --workspace` (macOS Darwin arm64, 0 doc-tests, pass)
+  - `cargo build --locked --workspace --all-features` (macOS Darwin arm64, 0 errors, pass)
+- Known limitations / failed attempts:
+  - Fixed initial `clippy::field-reassign-with-default` linter errors in test configuration initializers.
+  - Replaced deprecated `tower_http::timeout::TimeoutLayer::new` with `TimeoutLayer::with_status_code`.
+- Next precise step:
+  - Milestone M1: Design and implement PostgreSQL schema, SQLx migrations, admin bootstrap token mechanism, user accounts, sessions, and device cryptographic key registration.
+- Issue / PR / CI evidence:
+  - Local workspace implementation and verification passing all gates.

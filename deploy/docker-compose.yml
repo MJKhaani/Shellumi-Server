@@ -1,0 +1,38 @@
+services:
+  server:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: ghcr.io/mjkhaani/shellumi-server:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      SHELLUMI_SERVER_LISTEN_ADDR: "0.0.0.0:8080"
+      SHELLUMI_SERVER_PUBLIC_URL: "${SHELLUMI_SERVER_PUBLIC_URL:-http://127.0.0.1:8080}"
+      SHELLUMI_SERVER_DATABASE_URL: "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable"
+      SHELLUMI_SERVER_LOG_LEVEL: "${SHELLUMI_SERVER_LOG_LEVEL:-info}"
+      SHELLUMI_SERVER_LOG_FORMAT: "${SHELLUMI_SERVER_LOG_FORMAT:-json}"
+      SHELLUMI_SERVER_REGISTRATION: "${SHELLUMI_SERVER_REGISTRATION:-invite_only}"
+      SHELLUMI_SERVER_TRUSTED_PROXIES: "127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-shellumi}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me_to_a_strong_secret}
+      POSTGRES_DB: ${POSTGRES_DB:-shellumi_server}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-shellumi} -d ${POSTGRES_DB:-shellumi_server}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:

@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/shellumi-server-protocol",
+    "crates/shellumi-server-domain",
+    "crates/shellumi-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80.0"
+license = "MIT"
+authors = ["Shellumi Server Contributors"]
+repository = "https://github.com/MJKhaani/Shellumi-Server"
+
+[workspace.dependencies]
+shellumi-server-protocol = { path = "crates/shellumi-server-protocol", version = "0.1.0" }
+shellumi-server-domain = { path = "crates/shellumi-server-domain", version = "0.1.0" }
+
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "signal", "net", "io-util"] }
+axum = { version = "0.7", features = ["json"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["trace", "cors", "timeout"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+clap = { version = "4.5", features = ["derive", "env"] }
+thiserror = "2.0"
+uuid = { version = "1.10", features = ["v4", "v7", "serde"] }
