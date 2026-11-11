@@ -44,7 +44,159 @@ paths:
               schema:
                 $ref: '#/components/schemas/CapabilitiesResponse'
 
+  /api/v1/bootstrap:
+    post:
+      summary: One-time administrator bootstrap
+      description: Consumes the one-time initial bootstrap to create the first organization and administrator.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BootstrapRequest'
+      responses:
+        '201':
+          description: Bootstrap completed successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BootstrapResponse'
+        '409':
+          description: Bootstrap has already been consumed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/auth/login:
+    post:
+      summary: Authenticate user
+      description: Verifies user credentials and optional device identity, returning access and refresh tokens.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Authentication successful
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginResponse'
+        '401':
+          description: Invalid credentials
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/auth/refresh:
+    post:
+      summary: Rotate refresh token
+      description: Validates and rotates a refresh token, detecting token reuse and issuing a fresh token pair.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshTokenRequest'
+      responses:
+        '200':
+          description: Token rotated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RefreshTokenResponse'
+        '403':
+          description: Token reuse detected or token revoked
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/auth/logout:
+    post:
+      summary: User logout
+      description: Revokes the specified session or all active sessions for the calling user.
+      responses:
+        '200':
+          description: Session terminated
+
+  /api/v1/me:
+    get:
+      summary: Current user info
+      description: Returns profile and organization memberships of the authenticated user.
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: User profile
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MeResponse'
+        '401':
+          description: Unauthenticated
+
+  /api/v1/devices:
+    get:
+      summary: List registered devices
+      description: Returns all devices registered to the calling user.
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: List of devices
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/DeviceResponse'
+    post:
+      summary: Register a client device
+      description: Registers a new device identity with dedicated signing and agreement keys.
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterDeviceRequest'
+      responses:
+        '201':
+          description: Device registered
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeviceResponse'
+
+  /api/v1/devices/{id}:
+    delete:
+      summary: Revoke a device
+      description: Deauthorizes a device and terminates all its active sessions immediately.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '204':
+          description: Device revoked
+
 components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+
   schemas:
     HealthResponse:
       type: object
@@ -65,7 +217,6 @@ components:
         details:
           type: string
           nullable: true
-          example: System ready
 
     CapabilitiesResponse:
       type: object
@@ -90,12 +241,10 @@ components:
           type: array
           items:
             type: string
-          example: ["vault_sync_v1", "device_auth", "team_sharing"]
         supported_e2ee_suites:
           type: array
           items:
             type: string
-          example: ["x25519_hkdf_aes256gcm", "argon2id_aes256gcm_legacy"]
         limits:
           $ref: '#/components/schemas/ServerLimits'
 
@@ -108,13 +257,199 @@ components:
       properties:
         max_request_bytes:
           type: integer
-          example: 10485760
         max_record_bytes:
           type: integer
-          example: 1048576
         max_mutations_per_commit:
           type: integer
-          example: 100
+
+    BootstrapRequest:
+      type: object
+      required:
+        - admin_username
+        - admin_email
+        - admin_password
+        - org_name
+      properties:
+        admin_username:
+          type: string
+        admin_email:
+          type: string
+        admin_password:
+          type: string
+        org_name:
+          type: string
+        bootstrap_token:
+          type: string
+          nullable: true
+
+    BootstrapResponse:
+      type: object
+      required:
+        - org_id
+        - user_id
+        - username
+        - email
+        - access_token
+        - refresh_token
+        - expires_in_secs
+      properties:
+        org_id:
+          type: string
+          format: uuid
+        user_id:
+          type: string
+          format: uuid
+        username:
+          type: string
+        email:
+          type: string
+        access_token:
+          type: string
+        refresh_token:
+          type: string
+        expires_in_secs:
+          type: integer
+
+    LoginRequest:
+      type: object
+      required:
+        - identifier
+        - password
+      properties:
+        identifier:
+          type: string
+        password:
+          type: string
+        device_id:
+          type: string
+          format: uuid
+          nullable: true
+
+    LoginResponse:
+      type: object
+      required:
+        - user_id
+        - username
+        - email
+        - access_token
+        - refresh_token
+        - expires_in_secs
+      properties:
+        user_id:
+          type: string
+          format: uuid
+        username:
+          type: string
+        email:
+          type: string
+        access_token:
+          type: string
+        refresh_token:
+          type: string
+        expires_in_secs:
+          type: integer
+
+    RefreshTokenRequest:
+      type: object
+      required:
+        - refresh_token
+      properties:
+        refresh_token:
+          type: string
+
+    RefreshTokenResponse:
+      type: object
+      required:
+        - access_token
+        - refresh_token
+        - expires_in_secs
+      properties:
+        access_token:
+          type: string
+        refresh_token:
+          type: string
+        expires_in_secs:
+          type: integer
+
+    RegisterDeviceRequest:
+      type: object
+      required:
+        - device_name
+        - signing_public_key
+        - agreement_public_key
+      properties:
+        device_name:
+          type: string
+        signing_public_key:
+          type: string
+        agreement_public_key:
+          type: string
+
+    DeviceResponse:
+      type: object
+      required:
+        - device_id
+        - user_id
+        - device_name
+        - signing_public_key
+        - agreement_public_key
+        - created_at
+      properties:
+        device_id:
+          type: string
+          format: uuid
+        user_id:
+          type: string
+          format: uuid
+        device_name:
+          type: string
+        signing_public_key:
+          type: string
+        agreement_public_key:
+          type: string
+        created_at:
+          type: integer
+        last_seen_at:
+          type: integer
+          nullable: true
+        revoked_at:
+          type: integer
+          nullable: true
+
+    MeResponse:
+      type: object
+      required:
+        - user_id
+        - username
+        - email
+        - organizations
+      properties:
+        user_id:
+          type: string
+          format: uuid
+        username:
+          type: string
+        email:
+          type: string
+        organizations:
+          type: array
+          items:
+            $ref: '#/components/schemas/UserOrgSummary'
+
+    UserOrgSummary:
+      type: object
+      required:
+        - org_id
+        - org_name
+        - role
+      properties:
+        org_id:
+          type: string
+          format: uuid
+        org_name:
+          type: string
+        role:
+          type: string
 
     ErrorResponse:
       type: object
@@ -124,10 +459,8 @@ components:
       properties:
         error_code:
           type: string
-          example: NOT_FOUND
         message:
           type: string
-          example: The requested resource was not found
         request_id:
           type: string
           nullable: true

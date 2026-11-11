@@ -64,3 +64,66 @@ This journal records every increment, decision, test execution, and verification
   - Milestone M1: Design and implement PostgreSQL schema, SQLx migrations, admin bootstrap token mechanism, user accounts, sessions, and device cryptographic key registration.
 - Issue / PR / CI evidence:
   - Local workspace implementation and verification passing all gates.
+
+---
+
+## 2026-11-11T08:21:00Z — TASK-002 — M1: Storage, migrations, tenants, and authentication
+- Status: complete
+- Baseline / commit: 0b53dd4
+- Objective and acceptance criteria:
+  - Create `crates/shellumi-server-store` for database migrations and repository access.
+  - Create `crates/shellumi-server-auth` for password verification (Argon2id), bearer tokens, and session management.
+  - Write forward-only PostgreSQL migrations: `server_settings`, `users`, `organizations`, `organization_memberships`, `devices`, `sessions`.
+  - Implement one-time interactive bootstrap (`POST /api/v1/bootstrap`) creating initial organization and admin account.
+  - Reject duplicate bootstrap attempts with a stable error code (`BOOTSTRAP_ALREADY_CONSUMED`).
+  - Implement authentication endpoints: `POST /api/v1/auth/login`, `POST /api/v1/auth/refresh`, `POST /api/v1/auth/logout`.
+  - Implement token rotation, theft/reuse detection, and immediate session termination.
+  - Implement user info endpoint (`GET /api/v1/me`) and device management (`GET /api/v1/devices`, `POST /api/v1/devices`, `DELETE /api/v1/devices/{id}`).
+  - Provide automated unit and integration tests for all auth, token rotation, and device registration flows.
+- Implementation / files changed:
+  - `Cargo.toml`, `Cargo.lock`
+  - `crates/shellumi-server-domain/src/lib.rs`: added `User`, `Organization`, `Device`, `Session`, `Role`, `DomainError` variants for auth/bootstrap.
+  - `crates/shellumi-server-protocol/src/lib.rs`: added DTOs for `BootstrapRequest`, `BootstrapResponse`, `LoginRequest`, `LoginResponse`, `RefreshRequest`, `TokenResponse`, `UserResponse`, `DeviceRegistrationRequest`, `DeviceResponse`.
+  - `crates/shellumi-server-store/Cargo.toml`, `crates/shellumi-server-store/src/lib.rs`: repository traits (`SettingsRepository`, `UserRepository`, `OrgRepository`, `DeviceRepository`, `SessionRepository`, `Store`), thread-safe `InMemoryStore`, unit tests.
+  - `crates/shellumi-server-auth/Cargo.toml`, `crates/shellumi-server-auth/src/lib.rs`: Argon2id password hashing, constant-time verification, HMAC-SHA256 access tokens, 256-bit refresh tokens with SHA-256 digest hashing, session rotation and reuse detection, `AuthService`, unit tests.
+  - `migrations/20261111000001_initial_schema.sql`: forward-only PostgreSQL schema for server settings, users, orgs, memberships, devices, and sessions with indexes and foreign keys.
+  - `crates/shellumi-server/Cargo.toml`, `crates/shellumi-server/src/server.rs`: integrated routes for bootstrap, login, refresh, logout, me, and device endpoints with bearer extraction.
+  - `crates/shellumi-server/tests/auth_and_devices.rs`: integration tests for bootstrap, auth, token reuse detection, device registration, and revocation.
+  - `docs/adr/0002-m1-authentication-and-session-model.md`: architectural decision record for authentication and session lifecycle.
+  - `docs/API.md`, `openapi/shellumi-server-v1.yaml`: documented all M1 endpoints, request/response models, and error responses.
+- Data migration or API compatibility:
+  - Added forward-only migration `20261111000001_initial_schema.sql`.
+  - Added routes: `POST /api/v1/bootstrap`, `POST /api/v1/auth/login`, `POST /api/v1/auth/refresh`, `POST /api/v1/auth/logout`, `GET /api/v1/me`, `GET /api/v1/devices`, `POST /api/v1/devices`, `DELETE /api/v1/devices/{id}`.
+- Security / privacy review:
+  - Passwords hashed using Argon2id with memory-hard parameters.
+  - Refresh tokens are never stored in plaintext — only cryptographically hashed (SHA-256) in storage.
+  - Token rotation detects reuse: attempting to refresh with an already-rotated token immediately revokes all sessions for that user/device chain and returns 403 Forbidden.
+  - Device keys validated: base64-encoded 32-byte Ed25519 signing key and 32-byte X25519 agreement key.
+  - One-time bootstrap cannot be replayed or re-invoked (rejects with 409 `BOOTSTRAP_ALREADY_CONSUMED`).
+- Tests added (file + test names):
+  - `crates/shellumi-server-auth/src/lib.rs`:
+    - `test_argon2id_hash_and_verification`
+    - `test_access_token_creation_and_verification`
+    - `test_auth_service_bootstrap_and_login`
+    - `test_device_registration_and_revocation`
+  - `crates/shellumi-server-store/src/lib.rs`:
+    - `test_in_memory_store_user_and_org_lifecycle`
+    - `test_device_lifecycle_and_revocation`
+    - `test_session_rotation_and_theft_detection`
+  - `crates/shellumi-server/tests/auth_and_devices.rs`:
+    - `test_bootstrap_flow_and_duplicate_rejection`
+    - `test_auth_login_refresh_and_theft_detection`
+    - `test_device_registration_listing_and_revocation`
+- Verification executed (exact commands, OS, counts, pass/fail/skip):
+  - `cargo fmt --all -- --check` (macOS Darwin arm64, 0 errors, pass)
+  - `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings` (macOS Darwin arm64, 0 warnings, pass)
+  - `cargo test --locked --workspace --all-features` (macOS Darwin arm64, 21 tests: 21 passed, 0 failed, 0 skipped, pass)
+  - `cargo test --locked --doc --workspace` (macOS Darwin arm64, 0 doc-tests, pass)
+  - `cargo build --locked --workspace --all-features` (macOS Darwin arm64, 0 errors, pass)
+- Known limitations / failed attempts:
+  - Ambiguous `find_by_id` across traits resolved by namespace-qualifying trait methods (`find_user_by_id`, `find_org_by_id`, `find_device_by_id`).
+  - Refresh rotation logic refactored so revoked token detection occurs cleanly before lookup rejection.
+- Next precise step:
+  - Milestone M2: Encrypted Private Vault & Sync v1 (vault schema, commit CAS, change feed pagination, tombstone tracking, and conflict tests).
+- Issue / PR / CI evidence:
+  - Local workspace passes all 21 automated tests, formatting, Clippy, and doc tests.

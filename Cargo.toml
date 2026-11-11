@@ -3,6 +3,8 @@ resolver = "2"
 members = [
     "crates/shellumi-server-protocol",
     "crates/shellumi-server-domain",
+    "crates/shellumi-server-store",
+    "crates/shellumi-server-auth",
     "crates/shellumi-server",
 ]
 
@@ -17,6 +19,8 @@ repository = "https://github.com/MJKhaani/Shellumi-Server"
 [workspace.dependencies]
 shellumi-server-protocol = { path = "crates/shellumi-server-protocol", version = "0.1.0" }
 shellumi-server-domain = { path = "crates/shellumi-server-domain", version = "0.1.0" }
+shellumi-server-store = { path = "crates/shellumi-server-store", version = "0.1.0" }
+shellumi-server-auth = { path = "crates/shellumi-server-auth", version = "0.1.0" }
 
 tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "signal", "net", "io-util"] }
 axum = { version = "0.7", features = ["json"] }
@@ -30,3 +34,9 @@ toml = "0.8"
 clap = { version = "4.5", features = ["derive", "env"] }
 thiserror = "2.0"
 uuid = { version = "1.10", features = ["v4", "v7", "serde"] }
+argon2 = { version = "0.5", features = ["std"] }
+chrono = { version = "0.4", features = ["serde"] }
+sha2 = "0.10"
+subtle = "2.6"
+rand = "0.9"
+async-trait = "0.1"
