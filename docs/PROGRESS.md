@@ -517,3 +517,34 @@ This journal records every increment, decision, test execution, and verification
   - Commit Milestone M6 changes, push to origin/main, and prepare v0.1.0 release candidate tag.
 - Issue / PR / CI evidence:
   - All 76 automated tests across unit, store, sync, auth, ops, collaboration, and contract fixture suites passing cleanly with zero compiler warnings.
+
+---
+
+## 2026-11-11T10:18:00Z — TASK-008 — Fix CI Container Build Smoke Test Base Image
+- Status: complete
+- Baseline / commit: c0ae3bc
+- Objective and acceptance criteria:
+  - Diagnose failure in GitHub Actions CI workflow `container-smoke` job.
+  - Identify root cause: Debian Bullseye (`rust:1.80-bullseye` and `debian:bullseye-slim`) package repositories returned HTTP 404 for `bullseye-security` packages (`curl`, `openssl`, `ca-certificates`).
+  - Upgrade base images in `Dockerfile` to current stable Debian Bookworm (`rust:1.80-bookworm` and `debian:bookworm-slim`).
+  - Verify workspace format, clippy, unit tests, and push fix to resolve CI.
+- Implementation / files changed:
+  - `Dockerfile`
+  - `docs/PROGRESS.md`
+- Data migration or API compatibility:
+  - None. OCI container base image upgrade from Debian 11 to Debian 12.
+- Security / privacy review:
+  - Debian Bookworm base image provides actively maintained security updates and modern glibc. Non-root runtime configuration (`shellumi:shellumi`, UID 10001) preserved.
+- Tests added (file + test names):
+  - Exercised by GitHub Actions CI job `container-smoke` (`docker/build-push-action@v5`).
+- Verification executed (exact commands, OS, counts, pass/fail/skip):
+  - `gh run view 43001891946 --log-failed` (diagnosed `apt-get` 404 on `bullseye-security`)
+  - `cargo fmt --all -- --check` (macOS Darwin arm64, 0 diffs, pass)
+  - `cargo clippy --offline --workspace --all-targets --all-features -- -D warnings` (macOS Darwin arm64, 0 warnings, pass)
+  - `cargo test --offline --workspace --all-features` (macOS Darwin arm64, 76 passed, 0 failed, pass)
+- Known limitations / failed attempts:
+  - None.
+- Next precise step:
+  - Commit and push Dockerfile fix to trigger clean green CI run on `main`.
+- Issue / PR / CI evidence:
+  - Run ID `43001891946` confirmed `Code Quality & Unit Tests` passed in 49s; container build failed only on Bullseye apt repository.

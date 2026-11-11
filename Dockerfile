@@ -1,5 +1,5 @@
 # Stage 1: Build
-FROM rust:1.80-bullseye AS builder
+FROM rust:1.80-bookworm AS builder
 
 WORKDIR /usr/src/shellumi-server
 
@@ -10,7 +10,7 @@ COPY migrations ./migrations
 RUN cargo build --release --locked -p shellumi-server
 
 # Stage 2: Runtime
-FROM debian:bullseye-slim
+FROM debian:bookworm-slim
 
 LABEL org.opencontainers.image.title="Shellumi Server" \
       org.opencontainers.image.description="Self-hostable, zero-knowledge encrypted synchronization server for Shellumi" \
