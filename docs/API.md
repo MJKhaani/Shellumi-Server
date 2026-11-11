@@ -529,6 +529,55 @@ All JSON error responses use standard status codes and the following body struct
 }
 ```
 
+---
+
+## 5. Telemetry, Observability & Rate Limiting
+
+### Prometheus Metrics
+- **Path:** `GET /metrics`
+- **Auth:** None (Operator/Scraper endpoint)
+- **Content-Type:** `text/plain; version=0.0.4; charset=utf-8`
+- **Configuration:** Enabled when `metrics_enabled = true` (`SHELLUMI_SERVER_METRICS_ENABLED=true`). Returns `404 Not Found` if disabled.
+- **Label Cardinality Guarantee:** Metric labels record only HTTP method, normalized route template (e.g. `/api/v1/vaults/:id/commits`), and status code. High-cardinality values (UUIDs, user IDs, device IDs) are strictly excluded.
+- **Example Exposition:**
+```prometheus
+# HELP shellumi_http_requests_total Total number of HTTP requests processed.
+# TYPE shellumi_http_requests_total counter
+shellumi_http_requests_total{method="GET",path="/health/live",status="200"} 42
+shellumi_http_requests_total{method="POST",path="/api/v1/vaults/:id/commits",status="200"} 15
+
+# HELP shellumi_http_request_duration_seconds_total Total duration of HTTP requests in seconds.
+# TYPE shellumi_http_request_duration_seconds_total counter
+shellumi_http_request_duration_seconds_total{method="GET",path="/health/live"} 0.084120
+
+# HELP shellumi_rate_limit_exceeded_total Total number of rate-limited requests rejected with HTTP 429.
+# TYPE shellumi_rate_limit_exceeded_total counter
+shellumi_rate_limit_exceeded_total{category="auth_login"} 3
+
+# HELP shellumi_active_sessions_total Current number of active authenticated user sessions.
+# TYPE shellumi_active_sessions_total gauge
+shellumi_active_sessions_total 5
+```
+
+### Rate Limiting & Abuse Prevention
+Sensitive endpoints are protected by in-memory sliding-window rate limiters:
+- **Protected Routes:**
+  - `POST /api/v1/auth/login` (brute-force password guessing)
+  - `POST /api/v1/bootstrap` (bootstrap replay/spamming)
+  - `POST /api/v1/invites/accept` (invitation token guessing)
+- **Default Limit:** 10 requests per minute per client IP (configurable via `SHELLUMI_SERVER_RATE_LIMIT_PER_MINUTE`).
+- **HTTP 429 Response:**
+  - Header: `Retry-After: <seconds>`
+  - Body:
+```json
+{
+  "error_code": "RATE_LIMIT_EXCEEDED",
+  "message": "Too many requests. Please wait 45 seconds before retrying.",
+  "request_id": "019abcde-..."
+}
+```
+
+
 ### Rotate Key Epoch
 - **Path:** `POST /api/v1/vaults/{id}/keys/epochs`
 - **Auth:** Bearer Token + `X-Device-Id` header (Owner or Administrator)
@@ -579,5 +628,54 @@ All JSON error responses use standard status codes and the following body struct
   ]
 }
 ```
+
+---
+
+## 5. Telemetry, Observability & Rate Limiting
+
+### Prometheus Metrics
+- **Path:** `GET /metrics`
+- **Auth:** None (Operator/Scraper endpoint)
+- **Content-Type:** `text/plain; version=0.0.4; charset=utf-8`
+- **Configuration:** Enabled when `metrics_enabled = true` (`SHELLUMI_SERVER_METRICS_ENABLED=true`). Returns `404 Not Found` if disabled.
+- **Label Cardinality Guarantee:** Metric labels record only HTTP method, normalized route template (e.g. `/api/v1/vaults/:id/commits`), and status code. High-cardinality values (UUIDs, user IDs, device IDs) are strictly excluded.
+- **Example Exposition:**
+```prometheus
+# HELP shellumi_http_requests_total Total number of HTTP requests processed.
+# TYPE shellumi_http_requests_total counter
+shellumi_http_requests_total{method="GET",path="/health/live",status="200"} 42
+shellumi_http_requests_total{method="POST",path="/api/v1/vaults/:id/commits",status="200"} 15
+
+# HELP shellumi_http_request_duration_seconds_total Total duration of HTTP requests in seconds.
+# TYPE shellumi_http_request_duration_seconds_total counter
+shellumi_http_request_duration_seconds_total{method="GET",path="/health/live"} 0.084120
+
+# HELP shellumi_rate_limit_exceeded_total Total number of rate-limited requests rejected with HTTP 429.
+# TYPE shellumi_rate_limit_exceeded_total counter
+shellumi_rate_limit_exceeded_total{category="auth_login"} 3
+
+# HELP shellumi_active_sessions_total Current number of active authenticated user sessions.
+# TYPE shellumi_active_sessions_total gauge
+shellumi_active_sessions_total 5
+```
+
+### Rate Limiting & Abuse Prevention
+Sensitive endpoints are protected by in-memory sliding-window rate limiters:
+- **Protected Routes:**
+  - `POST /api/v1/auth/login` (brute-force password guessing)
+  - `POST /api/v1/bootstrap` (bootstrap replay/spamming)
+  - `POST /api/v1/invites/accept` (invitation token guessing)
+- **Default Limit:** 10 requests per minute per client IP (configurable via `SHELLUMI_SERVER_RATE_LIMIT_PER_MINUTE`).
+- **HTTP 429 Response:**
+  - Header: `Retry-After: <seconds>`
+  - Body:
+```json
+{
+  "error_code": "RATE_LIMIT_EXCEEDED",
+  "message": "Too many requests. Please wait 45 seconds before retrying.",
+  "request_id": "019abcde-..."
+}
+```
+
 
 

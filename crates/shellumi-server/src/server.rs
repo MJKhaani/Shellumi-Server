@@ -1,10 +1,12 @@
 //! HTTP server routing, handlers, middleware, and lifecycle.
 
 use crate::config::ServerConfig;
+use crate::metrics::MetricsRegistry;
+use crate::rate_limit::{extract_client_ip, rate_limit_response, RateLimitCategory, RateLimiter};
 use axum::{
     extract::{DefaultBodyLimit, Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
-    response::{IntoResponse, Json},
+    response::{IntoResponse, Json, Response},
     routing::{delete, get, post},
     Router,
 };
@@ -17,7 +19,7 @@ use shellumi_server_protocol::{
     RegisterDeviceRequest, RotateKeyEpochRequest, ServerLimits, UpdateVaultRequest,
     CURRENT_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION,
 };
-use shellumi_server_store::InMemoryStore;
+use shellumi_server_store::{InMemoryStore, UserRepository};
 use shellumi_server_sync::SyncEngine;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -33,6 +35,8 @@ pub struct AppState {
     pub config: Arc<ServerConfig>,
     pub auth: Arc<AuthService<InMemoryStore>>,
     pub sync: Arc<SyncEngine<InMemoryStore>>,
+    pub rate_limiter: Arc<RateLimiter>,
+    pub metrics: Arc<MetricsRegistry>,
 }
 
 pub fn create_router(config: ServerConfig) -> Router {
@@ -67,10 +71,18 @@ pub fn create_router_with_auth_and_sync(
 ) -> Router {
     let limits_max_request = config.max_request_bytes;
     let allowed_origins = config.allowed_origins.clone();
+    let rate_limiter = Arc::new(RateLimiter::new(
+        config.rate_limit_per_minute,
+        Duration::from_secs(60),
+    ));
+    let metrics = Arc::new(MetricsRegistry::new());
+
     let state = AppState {
         config: Arc::new(config),
         auth,
         sync,
+        rate_limiter,
+        metrics,
     };
 
     let mut router = Router::new()
@@ -78,6 +90,7 @@ pub fn create_router_with_auth_and_sync(
         .route("/health/live", get(health_live_handler))
         .route("/health/ready", get(health_ready_handler))
         .route("/api/v1/capabilities", get(capabilities_handler))
+        .route("/metrics", get(metrics_route_handler))
         // Authentication & bootstrap
         .route("/api/v1/bootstrap", post(bootstrap_handler))
         .route("/api/v1/auth/login", post(login_handler))
@@ -153,6 +166,10 @@ pub fn create_router_with_auth_and_sync(
     }
 
     router
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            record_metrics_middleware,
+        ))
         .layer(TraceLayer::new_for_http())
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
@@ -160,6 +177,66 @@ pub fn create_router_with_auth_and_sync(
         ))
         .layer(DefaultBodyLimit::max(limits_max_request))
         .with_state(state)
+}
+
+async fn record_metrics_middleware(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let start = std::time::Instant::now();
+    let method = req.method().to_string();
+    let path = req.uri().path().to_string();
+
+    let response = next.run(req).await;
+
+    let duration = start.elapsed();
+    let status = response.status().as_u16();
+
+    state
+        .metrics
+        .record_http_request(&method, &path, status, duration);
+
+    response
+}
+
+fn check_rate_limit(
+    state: &AppState,
+    headers: &HeaderMap,
+    category: RateLimitCategory,
+) -> Option<Response> {
+    let client_ip = extract_client_ip(headers, &state.config.trusted_proxies);
+    if let Err(retry_after) = state.rate_limiter.check(client_ip, category) {
+        state.metrics.record_rate_limit_exceeded(category.as_str());
+        return Some(rate_limit_response(retry_after));
+    }
+    None
+}
+
+async fn metrics_route_handler(State(state): State<AppState>) -> Response {
+    if !state.config.metrics_enabled {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error_code: "NOT_FOUND".to_string(),
+                message: "Metrics endpoint is disabled".to_string(),
+                request_id: Some(Uuid::now_v7().to_string()),
+            }),
+        )
+            .into_response();
+    }
+
+    // Update active counters from store
+    let user_count = state
+        .auth
+        .store()
+        .list_users()
+        .await
+        .map(|u| u.len())
+        .unwrap_or(0);
+    state.metrics.update_gauges(user_count as u64, 0, 0);
+
+    crate::metrics::metrics_handler(state.metrics.clone()).await
 }
 
 // ---------------------------------------------------------------------------
@@ -222,29 +299,38 @@ async fn capabilities_handler(State(state): State<AppState>) -> impl IntoRespons
 
 async fn bootstrap_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<BootstrapRequest>,
-) -> impl IntoResponse {
+) -> Response {
+    if let Some(resp) = check_rate_limit(&state, &headers, RateLimitCategory::Bootstrap) {
+        return resp;
+    }
     match state.auth.bootstrap(req).await {
         Ok(resp) => (
             StatusCode::CREATED,
             Json(serde_json::to_value(resp).unwrap()),
-        ),
+        )
+            .into_response(),
         Err(err) => {
             let (status, err_resp) = map_domain_error(err);
-            (status, Json(serde_json::to_value(err_resp.0).unwrap()))
+            (status, Json(serde_json::to_value(err_resp.0).unwrap())).into_response()
         }
     }
 }
 
 async fn login_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<LoginRequest>,
-) -> impl IntoResponse {
+) -> Response {
+    if let Some(resp) = check_rate_limit(&state, &headers, RateLimitCategory::AuthLogin) {
+        return resp;
+    }
     match state.auth.login(req).await {
-        Ok(resp) => (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())),
+        Ok(resp) => (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())).into_response(),
         Err(err) => {
             let (status, err_resp) = map_domain_error(err);
-            (status, Json(serde_json::to_value(err_resp.0).unwrap()))
+            (status, Json(serde_json::to_value(err_resp.0).unwrap())).into_response()
         }
     }
 }
@@ -792,20 +878,23 @@ async fn accept_invite_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(req): Json<AcceptInviteRequest>,
-) -> impl IntoResponse {
+) -> Response {
+    if let Some(resp) = check_rate_limit(&state, &headers, RateLimitCategory::InviteAccept) {
+        return resp;
+    }
     let claims = match extract_auth_claims(&state.auth, &headers) {
         Ok(c) => c,
         Err(err) => {
             let (status, err_resp) = map_domain_error(err);
-            return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
+            return (status, Json(serde_json::to_value(err_resp.0).unwrap())).into_response();
         }
     };
 
     match state.sync.accept_invite(claims.sub, req).await {
-        Ok(resp) => (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())),
+        Ok(resp) => (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())).into_response(),
         Err(err) => {
             let (status, err_resp) = map_domain_error(err);
-            (status, Json(serde_json::to_value(err_resp.0).unwrap()))
+            (status, Json(serde_json::to_value(err_resp.0).unwrap())).into_response()
         }
     }
 }

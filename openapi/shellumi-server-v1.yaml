@@ -32,6 +32,24 @@ paths:
               schema:
                 $ref: '#/components/schemas/HealthResponse'
 
+  /metrics:
+    get:
+      summary: Prometheus metrics exposition endpoint
+      description: Returns internal runtime metrics formatted in Prometheus text format (version 0.0.4). Enabled when metrics_enabled is true.
+      responses:
+        '200':
+          description: Prometheus metrics text exposition
+          content:
+            text/plain:
+              schema:
+                type: string
+        '404':
+          description: Metrics endpoint is disabled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
   /api/v1/capabilities:
     get:
       summary: Server capabilities

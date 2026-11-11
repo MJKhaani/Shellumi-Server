@@ -10,8 +10,8 @@ This document outlines the milestones and progress of Shellumi Server.
 | **M1** | Storage, Migrations, Tenants & Auth | **Complete** | PostgreSQL schema, admin bootstrap, accounts, sessions, device key registration, organizations, token revocation, cross-tenant isolation tests. |
 | **M2** | Encrypted Private Vault & Sync v1 | **Complete** | Stable UUIDs, opaque ciphertext envelopes, device signatures, transactional change feed, conditional `expected_revision` writes, conflict resolution (409), tombstones. |
 | **M3** | Team Vaults, Invites, RBAC & E2EE Keys | **Complete** | Owner/Admin/Editor/Viewer permission matrix, one-time invitations, per-device recipient-wrapped DEKs, epoch rotation, audit trail. |
-| **M4** | Resilience, Operations & Releases | Current | CLI admin commands, backup/restore verification, metrics, rate limits, multi-arch Docker image, reproducible release automation. |
-| **M5** | Optional Live Terminal Collaboration | Planned | WSS relay, ephemeral E2EE session keys, single-writer fencing token, owner emergency revocation, bounded queues. Relay disabled until gates pass. |
+| **M4** | Resilience, Operations & Releases | **Complete** | CLI admin commands, backup/restore verification, metrics, rate limits, multi-arch Docker image, reproducible release automation. |
+| **M5** | Optional Live Terminal Collaboration | Current | WSS relay, ephemeral E2EE session keys, single-writer fencing token, owner emergency revocation, bounded queues. Relay disabled until gates pass. |
 | **M6** | Advanced Self-Hosting & Integrations | Planned | OIDC/SSO, optional SMTP, large encrypted attachments, horizontal PostgreSQL coordination. |
 
 ---
@@ -61,3 +61,10 @@ This document outlines the milestones and progress of Shellumi Server.
 - **Invitations:** Single-use cryptographically random token invitations with expiry and role scoping.
 - **Key Epoch Rotation:** Re-keying on member revocation with validation that only surviving trusted devices obtain wraps.
 - **Audit Logging:** Append-only cryptographic audit trail with hash-chain linkage.
+
+### M4 — Resilience, Operations & Releases (Complete)
+- **CLI Subcommands:** Headless administration commands (`serve`, `doctor`, `admin user`, `admin session`, `migrate`, `backup verify`).
+- **Rate Limiting:** Sliding-window IP rate limiter on sensitive endpoints (`/api/v1/auth/login`, `/api/v1/bootstrap`, `/api/v1/invites/accept`) returning HTTP 429 with `Retry-After`.
+- **Prometheus Telemetry:** Standard Prometheus text exposition at `/metrics` with strictly bounded label cardinality (no UUID leaks).
+- **Disaster Recovery:** Comprehensive guide and verification utility in `docs/BACKUP_RESTORE.md` and `shellumi-server backup verify <file>`.
+- **Containers & Releases:** Multi-arch Docker container (`linux/amd64`, `linux/arm64`) with non-root security, CI smoke testing, and tag-triggered release workflow in `.github/workflows/release.yml`.

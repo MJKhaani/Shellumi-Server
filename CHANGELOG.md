@@ -39,3 +39,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Recipient-wrapped Data Encryption Key (DEK) envelopes isolated strictly by calling device (`X-Device-Id`).
   - Monotonic key epoch rotation (`/api/v1/vaults/:id/keys/epochs`) rejecting mutations encrypted with stale epochs (`409 STALE_KEY_EPOCH`).
   - Tamper-evident, hash-chained cryptographic audit trail (`/api/v1/vaults/:id/audit`).
+- **Milestone M4: Resilience, operations & release engineering**
+  - CLI subcommands in `shellumi-server` binary (`serve`, `doctor`, `admin user`, `admin session`, `migrate`, `backup verify`).
+  - In-memory sliding-window IP rate limiter on sensitive endpoints (`/api/v1/auth/login`, `/api/v1/bootstrap`, `/api/v1/invites/accept`) returning HTTP 429 Too Many Requests with standard `Retry-After` header.
+  - Opt-in Prometheus metrics exposition endpoint `/metrics` (`SHELLUMI_SERVER_METRICS_ENABLED`) adhering to Prometheus 0.0.4 text format with normalized route templates ensuring bounded label cardinality.
+  - Comprehensive PostgreSQL backup, restoration, and disaster recovery guide in `docs/BACKUP_RESTORE.md`.
+  - Cryptographic database dump verifier (`shellumi-server backup verify <file>`) verifying archive headers, schema signatures, and absence of leaked plaintext private keys.
+  - Multi-architecture container build (`Dockerfile`) for `linux/amd64` and `linux/arm64` with non-root security.
+  - Tag-triggered release automation workflow (`.github/workflows/release.yml`) with strict SemVer validation, binary matrix compilation, SHA256 checksums, and GHCR publishing.

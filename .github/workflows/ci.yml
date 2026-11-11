@@ -47,3 +47,20 @@ jobs:
 
       - name: Build Workspace
         run: cargo build --locked --workspace --all-features
+
+  container-smoke:
+    name: Container Build Smoke Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Container Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          tags: shellumi-server:test

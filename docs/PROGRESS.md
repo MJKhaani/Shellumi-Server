@@ -293,3 +293,95 @@ This journal records every increment, decision, test execution, and verification
   - Milestone M4: Resilience, Operations & Releases (CLI admin commands, backup/restore verification, health metrics, rate limits, multi-arch Docker image, reproducible release automation).
 - Issue / PR / CI evidence:
   - All 46 automated tests pass across unit and integration suites with strict compiler warnings denied.
+
+---
+
+## 2026-11-11T09:35:00Z — TASK-005 — M4: Resilience, Operations & Releases
+- Status: complete
+- Baseline / commit: 1307d3e
+- Objective and acceptance criteria:
+  - Implement CLI subcommands in `shellumi-server` binary:
+    - `serve`: run API server (default if no subcommand specified).
+    - `doctor`: run automated environment, configuration, and storage diagnostics.
+    - `admin`: user management (`create`, `disable`, `enable`, `reset-password`, `list`) and session management (`list`, `revoke`, `revoke-all`).
+    - `migrate`: database migration status (`status`) and execution (`run`).
+    - `backup verify <file>`: inspect and cryptographically verify database backup dump integrity.
+  - Implement IP-based sliding window rate limiting on sensitive routes (`/api/v1/auth/login`, `/api/v1/bootstrap`, `/api/v1/invites/accept`), returning HTTP 429 Too Many Requests with JSON error and `Retry-After` header.
+  - Implement opt-in Prometheus metrics exposition endpoint `/metrics` (`SHELLUMI_SERVER_METRICS_ENABLED`) with strictly bounded label cardinality (method, route template, status code; zero user/vault/device IDs).
+  - Author comprehensive PostgreSQL disaster recovery and verification documentation in `docs/BACKUP_RESTORE.md`.
+  - Update `Dockerfile` for multi-architecture compatibility (`linux/amd64` and `linux/arm64`) and include migrations in container.
+  - Add tag-triggered multi-architecture release workflow in `.github/workflows/release.yml` with strict SemVer validation, binary matrix builds, checksums, SBOM, and GHCR publishing.
+  - Update `docs/CONFIGURATION.md`, `docs/API.md`, `openapi/shellumi-server-v1.yaml`, `docs/ROADMAP.md`, and `CHANGELOG.md`.
+  - Comprehensive test suite covering CLI subcommands, rate limiting, metrics, and backup verification.
+- Implementation / files changed:
+  - `docs/adr/0005-m4-resilience-operations-and-releases.md`: ADR documenting resilience, operations, and release design.
+  - `crates/shellumi-server/src/config.rs`: added `command` subcommand parsing, `rate_limit_per_minute` configuration, validation, and tests.
+  - `crates/shellumi-server/src/cli/mod.rs`: CLI subcommand routing and argument definitions.
+  - `crates/shellumi-server/src/cli/admin.rs`: offline/interactive admin utilities for user and session management.
+  - `crates/shellumi-server/src/cli/doctor.rs`: system diagnostics and self-check engine.
+  - `crates/shellumi-server/src/cli/migrate.rs`: forward-only migration status and execution utility.
+  - `crates/shellumi-server/src/cli/backup.rs`: database dump header, schema signature, and zero-knowledge invariant verifier.
+  - `crates/shellumi-server/src/rate_limit.rs`: in-memory sliding-window rate limiter with client IP extraction and `Retry-After` headers.
+  - `crates/shellumi-server/src/metrics.rs`: Prometheus 0.0.4 metrics collector with route path template normalizer ensuring bounded label cardinality.
+  - `crates/shellumi-server/src/server.rs`: mounted `/metrics`, integrated telemetry middleware, and wired rate-limit checks on auth/bootstrap/invite endpoints.
+  - `crates/shellumi-server/src/main.rs`: CLI subcommand dispatcher and server runner.
+  - `crates/shellumi-server-store/src/lib.rs`: added `list_users`, `update_user` on `UserRepository`, and `list_sessions_for_user` on `SessionRepository` for `InMemoryStore`.
+  - `crates/shellumi-server/tests/ops_and_resilience.rs`: end-to-end integration tests for rate limiting, Prometheus metrics, doctor diagnostics, admin user lifecycle, backup verification, and migration status.
+  - `docs/BACKUP_RESTORE.md`: operator guide for PostgreSQL backups, verification, point-in-time recovery, client reconnect continuity, and disaster recovery.
+  - `docs/CONFIGURATION.md`: configuration reference updated for metrics, rate limiting, and CLI subcommands.
+  - `docs/API.md`: API documentation updated for Section 5 (Prometheus Metrics & Rate Limiting).
+  - `openapi/shellumi-server-v1.yaml`: OpenAPI 3.1 schema updated with `/metrics` and 429 Too Many Requests response.
+  - `Dockerfile`: multi-stage non-root container packaging migrations and standard OCI labels.
+  - `.github/workflows/ci.yml`: added container build smoke test job.
+  - `.github/workflows/release.yml`: tag-triggered release workflow for multi-arch binary matrix and GHCR OCI images.
+  - `docs/ROADMAP.md`: marked Milestone M4 Complete and M5 Current/Planned.
+  - `CHANGELOG.md`: documented Milestone M4 additions.
+- Data migration or API compatibility:
+  - Added opt-in endpoint `GET /metrics`.
+  - Added HTTP 429 Too Many Requests response semantics to `/api/v1/auth/login`, `/api/v1/bootstrap`, `/api/v1/invites/accept`.
+  - Backwards-compatible CLI: `shellumi-server` with no subcommand retains identical behavior to `shellumi-server serve`.
+- Security / privacy review:
+  - Rate limiting mitigates brute-force attacks against user credentials, bootstrap replay, and invite token enumeration.
+  - Prometheus metrics strictly enforce bounded label cardinality: route paths are normalized to route templates (e.g. `/api/v1/vaults/:id/commits`), completely preventing UUID or sensitive header leaks.
+  - Offline admin commands hash passwords with Argon2id using the same memory-hard parameters as online auth.
+  - Backup verification operates on encrypted database dumps without requiring decryption keys, and checks that no unencrypted SSH or RSA private keys were accidentally dumped.
+- Tests added (file + test names):
+  - `crates/shellumi-server-store/src/lib.rs`:
+    - `test_user_list_update_and_session_listing`
+  - `crates/shellumi-server/src/rate_limit.rs`:
+    - `test_rate_limiter_allows_under_limit_and_blocks_over_limit`
+    - `test_extract_client_ip_with_trusted_proxies`
+  - `crates/shellumi-server/src/metrics.rs`:
+    - `test_normalize_metric_path_replaces_uuids_and_revisions`
+    - `test_metrics_registry_render_format`
+  - `crates/shellumi-server/src/cli/doctor.rs`:
+    - `test_diagnostics_on_default_config_passes`
+  - `crates/shellumi-server/src/cli/admin.rs`:
+    - `test_admin_user_lifecycle`
+  - `crates/shellumi-server/src/cli/backup.rs`:
+    - `test_verify_valid_sql_backup`
+    - `test_verify_detects_corrupt_or_leaked_key_material`
+  - `crates/shellumi-server/src/cli/migrate.rs`:
+    - `test_migration_status_reports_migrations`
+  - `crates/shellumi-server/tests/ops_and_resilience.rs`:
+    - `test_rate_limiting_enforces_limit_and_returns_429`
+    - `test_prometheus_metrics_endpoint_exposition`
+    - `test_cli_doctor_diagnostics_report`
+    - `test_cli_admin_user_lifecycle_management`
+    - `test_cli_backup_verification_on_valid_and_corrupt_dumps`
+    - `test_cli_migration_status_reports_migrations`
+- Verification executed (exact commands, OS, counts, pass/fail/skip):
+  - `cargo fmt --all -- --check` (macOS Darwin arm64, 0 formatting errors, pass)
+  - `cargo clippy --offline --workspace --all-targets --all-features -- -D warnings` (macOS Darwin arm64, 0 warnings, pass)
+  - `cargo test --offline --workspace --all-features` (macOS Darwin arm64, 62 tests: 62 passed, 0 failed, 0 skipped, pass)
+  - `cargo test --offline --doc --workspace` (macOS Darwin arm64, 0 doc-tests, pass)
+  - `cargo build --offline --workspace --all-features` (macOS Darwin arm64, 0 errors, pass)
+- Known limitations / failed attempts:
+  - Addressed `clippy::type_complexity` on rate limiter map by defining `RateLimitMap` type alias.
+  - Addressed `clippy::manual_range_contains` by refactoring range checks in rate limiter tests.
+  - Addressed `clippy::result_large_err` by refactoring `check_rate_limit` to return `Option<Response>`.
+  - Replaced external test dependency `tempfile` with standard library temp path creation and cleanup.
+- Next precise step:
+  - Milestone M5: Optional Live Terminal Collaboration (WSS signaling/relay, ephemeral E2EE session keys, single-writer lease fencing token, owner emergency revocation).
+- Issue / PR / CI evidence:
+  - All 62 automated tests pass across unit and integration suites with strict compiler warnings denied.

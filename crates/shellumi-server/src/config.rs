@@ -78,6 +78,7 @@ pub struct ServerConfig {
     pub max_record_bytes: usize,
     pub collab_enabled: bool,
     pub metrics_enabled: bool,
+    pub rate_limit_per_minute: usize,
     pub trusted_proxies: Vec<IpAddr>,
     pub allowed_origins: Vec<String>,
     pub dev_mode: bool,
@@ -98,6 +99,7 @@ impl Default for ServerConfig {
             max_record_bytes: 1024 * 1024,       // 1 MiB
             collab_enabled: false,
             metrics_enabled: false,
+            rate_limit_per_minute: 10,
             trusted_proxies: Vec::new(),
             allowed_origins: Vec::new(),
             dev_mode: false,
@@ -151,6 +153,12 @@ impl ServerConfig {
             ));
         }
 
+        if self.rate_limit_per_minute == 0 {
+            return Err(ConfigError::Validation(
+                "rate_limit_per_minute must be greater than 0".to_string(),
+            ));
+        }
+
         Ok(())
     }
 }
@@ -170,6 +178,7 @@ pub struct ConfigFile {
     pub max_record_bytes: Option<usize>,
     pub collab_enabled: Option<bool>,
     pub metrics_enabled: Option<bool>,
+    pub rate_limit_per_minute: Option<usize>,
     pub trusted_proxies: Option<Vec<IpAddr>>,
     pub allowed_origins: Option<Vec<String>>,
     pub dev_mode: Option<bool>,
@@ -196,6 +205,10 @@ impl ConfigFile {
     version
 )]
 pub struct CliArgs {
+    /// Subcommand to execute (defaults to `serve` if omitted)
+    #[command(subcommand)]
+    pub command: Option<crate::cli::Commands>,
+
     /// Path to TOML configuration file
     #[arg(short, long, env = "SHELLUMI_SERVER_CONFIG")]
     pub config: Option<PathBuf>,
@@ -251,6 +264,10 @@ pub struct CliArgs {
     /// Enable metrics endpoint
     #[arg(long, env = "SHELLUMI_SERVER_METRICS_ENABLED")]
     pub metrics_enabled: Option<bool>,
+
+    /// Maximum requests per minute on sensitive endpoints (login, bootstrap, invites)
+    #[arg(long, env = "SHELLUMI_SERVER_RATE_LIMIT_PER_MINUTE")]
+    pub rate_limit_per_minute: Option<usize>,
 
     /// Developer mode bypasses certain non-loopback security checks (for tests only)
     #[arg(long, env = "SHELLUMI_SERVER_DEV_MODE")]
@@ -327,6 +344,10 @@ impl ServerConfig {
                 .metrics_enabled
                 .or(file_cfg.metrics_enabled)
                 .unwrap_or(defaults.metrics_enabled),
+            rate_limit_per_minute: cli
+                .rate_limit_per_minute
+                .or(file_cfg.rate_limit_per_minute)
+                .unwrap_or(defaults.rate_limit_per_minute),
             trusted_proxies: file_cfg.trusted_proxies.unwrap_or(defaults.trusted_proxies),
             allowed_origins: file_cfg.allowed_origins.unwrap_or(defaults.allowed_origins),
             dev_mode: cli
@@ -423,6 +444,7 @@ mod tests {
     #[test]
     fn test_cli_overrides_file_and_defaults() {
         let cli = CliArgs {
+            command: None,
             config: None,
             listen_addr: Some("127.0.0.1:9090".parse().unwrap()),
             public_url: Some("http://127.0.0.1:9090".to_string()),
@@ -437,6 +459,7 @@ mod tests {
             max_record_bytes: Some(500_000),
             collab_enabled: Some(true),
             metrics_enabled: Some(true),
+            rate_limit_per_minute: Some(25),
             dev_mode: Some(false),
         };
 
@@ -449,5 +472,6 @@ mod tests {
         assert_eq!(config.refresh_token_ttl_secs, 600);
         assert!(config.collab_enabled);
         assert!(config.metrics_enabled);
+        assert_eq!(config.rate_limit_per_minute, 25);
     }
 }

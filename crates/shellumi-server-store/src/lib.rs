@@ -27,6 +27,8 @@ pub trait UserRepository: Send + Sync {
     async fn create_user(&self, user: &User) -> Result<(), DomainError>;
     async fn find_user_by_id(&self, id: Uuid) -> Result<Option<User>, DomainError>;
     async fn find_by_identifier(&self, identifier: &str) -> Result<Option<User>, DomainError>;
+    async fn list_users(&self) -> Result<Vec<User>, DomainError>;
+    async fn update_user(&self, user: &User) -> Result<(), DomainError>;
     async fn list_orgs_for_user(
         &self,
         user_id: Uuid,
@@ -68,6 +70,7 @@ pub trait SessionRepository: Send + Sync {
         old_hash: &str,
         new_session: &mut Session,
     ) -> Result<Uuid, DomainError>;
+    async fn list_sessions_for_user(&self, user_id: Uuid) -> Result<Vec<Session>, DomainError>;
     async fn revoke_session(&self, session_id: Uuid) -> Result<(), DomainError>;
     async fn revoke_all_for_device(&self, device_id: Uuid) -> Result<(), DomainError>;
     async fn revoke_all_for_user(&self, user_id: Uuid) -> Result<(), DomainError>;
@@ -387,6 +390,22 @@ impl UserRepository for InMemoryStore {
         Ok(None)
     }
 
+    async fn list_users(&self) -> Result<Vec<User>, DomainError> {
+        let lock = self.state.read().await;
+        let mut users: Vec<User> = lock.users.values().cloned().collect();
+        users.sort_by_key(|u| u.created_at);
+        Ok(users)
+    }
+
+    async fn update_user(&self, user: &User) -> Result<(), DomainError> {
+        let mut lock = self.state.write().await;
+        if !lock.users.contains_key(&user.id) {
+            return Err(DomainError::NotFound);
+        }
+        lock.users.insert(user.id, user.clone());
+        Ok(())
+    }
+
     async fn list_orgs_for_user(
         &self,
         user_id: Uuid,
@@ -605,6 +624,18 @@ impl SessionRepository for InMemoryStore {
         lock.sessions.insert(new_session.id, new_session.clone());
 
         Ok(user_id)
+    }
+
+    async fn list_sessions_for_user(&self, user_id: Uuid) -> Result<Vec<Session>, DomainError> {
+        let lock = self.state.read().await;
+        let mut list: Vec<Session> = lock
+            .sessions
+            .values()
+            .filter(|s| s.user_id == user_id)
+            .cloned()
+            .collect();
+        list.sort_by_key(|s| s.created_at);
+        Ok(list)
     }
 
     async fn revoke_session(&self, session_id: Uuid) -> Result<(), DomainError> {
@@ -1534,5 +1565,47 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].id, 1);
         assert_eq!(events[1].id, 2);
+    }
+
+    #[tokio::test]
+    async fn test_user_list_update_and_session_listing() {
+        let store = InMemoryStore::new();
+        let user = User {
+            id: Uuid::new_v4(),
+            username: "admin_user".to_string(),
+            email: "admin@example.com".to_string(),
+            password_hash: "hash".to_string(),
+            created_at: 100,
+            updated_at: 100,
+            is_active: true,
+        };
+
+        store.create_user(&user).await.unwrap();
+
+        let users = store.list_users().await.unwrap();
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].username, "admin_user");
+
+        let mut updated = user.clone();
+        updated.is_active = false;
+        store.update_user(&updated).await.unwrap();
+
+        let fetched = store.find_user_by_id(user.id).await.unwrap().unwrap();
+        assert!(!fetched.is_active);
+
+        let session = Session {
+            id: Uuid::new_v4(),
+            user_id: user.id,
+            device_id: None,
+            refresh_token_hash: "session_hash".to_string(),
+            created_at: 110,
+            expires_at: 1000,
+            revoked_at: None,
+        };
+        store.create_session(&session).await.unwrap();
+
+        let sessions = store.list_sessions_for_user(user.id).await.unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, session.id);
     }
 }
