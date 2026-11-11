@@ -2,7 +2,7 @@
 
 use crate::config::ServerConfig;
 use axum::{
-    extract::{DefaultBodyLimit, Path, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Json},
     routing::{delete, get, post},
@@ -11,11 +11,12 @@ use axum::{
 use shellumi_server_auth::{AccessTokenClaims, AuthService};
 use shellumi_server_domain::DomainError;
 use shellumi_server_protocol::{
-    BootstrapRequest, CapabilitiesResponse, ErrorResponse, HealthResponse, LoginRequest,
-    LogoutRequest, RefreshTokenRequest, RegisterDeviceRequest, ServerLimits,
-    CURRENT_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION,
+    BootstrapRequest, CapabilitiesResponse, CommitBatchRequest, CreateVaultRequest, ErrorResponse,
+    HealthResponse, LoginRequest, LogoutRequest, RefreshTokenRequest, RegisterDeviceRequest,
+    ServerLimits, UpdateVaultRequest, CURRENT_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION,
 };
 use shellumi_server_store::InMemoryStore;
+use shellumi_server_sync::SyncEngine;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,30 +30,45 @@ use uuid::Uuid;
 pub struct AppState {
     pub config: Arc<ServerConfig>,
     pub auth: Arc<AuthService<InMemoryStore>>,
+    pub sync: Arc<SyncEngine<InMemoryStore>>,
 }
 
 pub fn create_router(config: ServerConfig) -> Router {
     let store = Arc::new(InMemoryStore::new());
     let token_secret = b"shellumi_server_hmac_secret_key_32bytes!!".to_vec();
     let auth = Arc::new(AuthService::new(
-        store,
+        store.clone(),
         token_secret,
         config.access_token_ttl_secs,
         config.refresh_token_ttl_secs,
     ));
+    let sync = Arc::new(SyncEngine::new(store, config.max_record_bytes));
 
-    create_router_with_auth(config, auth)
+    create_router_with_auth_and_sync(config, auth, sync)
 }
 
 pub fn create_router_with_auth(
     config: ServerConfig,
     auth: Arc<AuthService<InMemoryStore>>,
 ) -> Router {
+    let sync = Arc::new(SyncEngine::new(
+        auth.store().clone(),
+        config.max_record_bytes,
+    ));
+    create_router_with_auth_and_sync(config, auth, sync)
+}
+
+pub fn create_router_with_auth_and_sync(
+    config: ServerConfig,
+    auth: Arc<AuthService<InMemoryStore>>,
+    sync: Arc<SyncEngine<InMemoryStore>>,
+) -> Router {
     let limits_max_request = config.max_request_bytes;
     let allowed_origins = config.allowed_origins.clone();
     let state = AppState {
         config: Arc::new(config),
         auth,
+        sync,
     };
 
     let mut router = Router::new()
@@ -72,6 +88,23 @@ pub fn create_router_with_auth(
             get(list_devices_handler).post(register_device_handler),
         )
         .route("/api/v1/devices/:id", delete(revoke_device_handler))
+        // Vaults & Synchronization
+        .route(
+            "/api/v1/vaults",
+            get(list_vaults_handler).post(create_vault_handler),
+        )
+        .route(
+            "/api/v1/vaults/:id",
+            get(get_vault_handler)
+                .patch(update_vault_handler)
+                .delete(delete_vault_handler),
+        )
+        .route("/api/v1/vaults/:id/commits", post(commit_batch_handler))
+        .route("/api/v1/vaults/:id/changes", get(get_changes_handler))
+        .route(
+            "/api/v1/vaults/:id/snapshots/:revision",
+            get(get_snapshot_handler),
+        )
         .fallback(not_found_handler);
 
     // Apply CORS
@@ -312,6 +345,260 @@ async fn revoke_device_handler(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Vault & Sync Handlers
+// ---------------------------------------------------------------------------
+
+async fn list_vaults_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let claims = match extract_auth_claims(&state.auth, &headers) {
+        Ok(c) => c,
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
+        }
+    };
+
+    match state.sync.list_vaults(claims.sub).await {
+        Ok(resp) => (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())),
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            (status, Json(serde_json::to_value(err_resp.0).unwrap()))
+        }
+    }
+}
+
+async fn create_vault_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<CreateVaultRequest>,
+) -> impl IntoResponse {
+    let claims = match extract_auth_claims(&state.auth, &headers) {
+        Ok(c) => c,
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
+        }
+    };
+
+    let me = match state.auth.get_me(claims.sub).await {
+        Ok(m) => m,
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
+        }
+    };
+
+    let tenant_id = match me.organizations.first() {
+        Some(o) => o.org_id,
+        None => {
+            let (status, err_resp) = map_domain_error(DomainError::PermissionDenied(
+                "User is not a member of any organization".to_string(),
+            ));
+            return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
+        }
+    };
+
+    match state.sync.create_vault(claims.sub, tenant_id, req).await {
+        Ok(resp) => (
+            StatusCode::CREATED,
+            Json(serde_json::to_value(resp).unwrap()),
+        ),
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            (status, Json(serde_json::to_value(err_resp.0).unwrap()))
+        }
+    }
+}
+
+async fn get_vault_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(vault_id): Path<Uuid>,
+) -> impl IntoResponse {
+    let claims = match extract_auth_claims(&state.auth, &headers) {
+        Ok(c) => c,
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
+        }
+    };
+
+    match state.sync.get_vault(claims.sub, vault_id).await {
+        Ok(resp) => (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())),
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            (status, Json(serde_json::to_value(err_resp.0).unwrap()))
+        }
+    }
+}
+
+async fn update_vault_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(vault_id): Path<Uuid>,
+    Json(req): Json<UpdateVaultRequest>,
+) -> impl IntoResponse {
+    let claims = match extract_auth_claims(&state.auth, &headers) {
+        Ok(c) => c,
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
+        }
+    };
+
+    match state.sync.update_vault(claims.sub, vault_id, req).await {
+        Ok(resp) => (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())),
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            (status, Json(serde_json::to_value(err_resp.0).unwrap()))
+        }
+    }
+}
+
+async fn delete_vault_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(vault_id): Path<Uuid>,
+) -> impl IntoResponse {
+    let claims = match extract_auth_claims(&state.auth, &headers) {
+        Ok(c) => c,
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
+        }
+    };
+
+    match state.sync.delete_vault(claims.sub, vault_id).await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "status": "deleted" })),
+        ),
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            (status, Json(serde_json::to_value(err_resp.0).unwrap()))
+        }
+    }
+}
+
+async fn commit_batch_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(path_vault_id): Path<Uuid>,
+    Json(req): Json<CommitBatchRequest>,
+) -> impl IntoResponse {
+    let claims = match extract_auth_claims(&state.auth, &headers) {
+        Ok(c) => c,
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
+        }
+    };
+
+    if req.vault_id != path_vault_id {
+        let (status, err_resp) = map_domain_error(DomainError::InvalidInput(
+            "Path vault ID does not match body vault ID".to_string(),
+        ));
+        return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
+    }
+
+    let device_id = match headers.get("X-Device-Id") {
+        Some(v) => match v.to_str().ok().and_then(|s| s.parse::<Uuid>().ok()) {
+            Some(id) => id,
+            None => {
+                let (status, err_resp) = map_domain_error(DomainError::InvalidInput(
+                    "Invalid X-Device-Id header: must be a valid UUID".to_string(),
+                ));
+                return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
+            }
+        },
+        None => {
+            let (status, err_resp) = map_domain_error(DomainError::InvalidInput(
+                "Missing required X-Device-Id header".to_string(),
+            ));
+            return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
+        }
+    };
+
+    match state.sync.commit_batch(claims.sub, device_id, req).await {
+        Ok(resp) => (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())),
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            (status, Json(serde_json::to_value(err_resp.0).unwrap()))
+        }
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ChangesQuery {
+    pub since: Option<u64>,
+    pub cursor: Option<String>,
+    pub limit: Option<usize>,
+}
+
+async fn get_changes_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(vault_id): Path<Uuid>,
+    Query(query): Query<ChangesQuery>,
+) -> impl IntoResponse {
+    let claims = match extract_auth_claims(&state.auth, &headers) {
+        Ok(c) => c,
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
+        }
+    };
+
+    let since_seq = if let Some(cursor_str) = query.cursor {
+        if let Some(seq_part) = cursor_str.strip_prefix("seq:") {
+            seq_part.parse::<u64>().unwrap_or(0)
+        } else {
+            0
+        }
+    } else {
+        query.since.unwrap_or(0)
+    };
+
+    let limit = query.limit.unwrap_or(100);
+
+    match state
+        .sync
+        .get_changes(claims.sub, vault_id, since_seq, limit)
+        .await
+    {
+        Ok(resp) => (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())),
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            (status, Json(serde_json::to_value(err_resp.0).unwrap()))
+        }
+    }
+}
+
+async fn get_snapshot_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((vault_id, _revision)): Path<(Uuid, String)>,
+) -> impl IntoResponse {
+    let claims = match extract_auth_claims(&state.auth, &headers) {
+        Ok(c) => c,
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
+        }
+    };
+
+    match state.sync.get_snapshot(claims.sub, vault_id).await {
+        Ok(resp) => (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())),
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            (status, Json(serde_json::to_value(err_resp.0).unwrap()))
+        }
+    }
+}
+
 async fn not_found_handler() -> impl IntoResponse {
     (
         StatusCode::NOT_FOUND,
@@ -355,6 +642,10 @@ fn map_domain_error(err: DomainError) -> (StatusCode, Json<ErrorResponse>) {
         DomainError::NotFound => (StatusCode::NOT_FOUND, "NOT_FOUND"),
         DomainError::PermissionDenied(_) => (StatusCode::FORBIDDEN, "PERMISSION_DENIED"),
         DomainError::Conflict(_) => (StatusCode::CONFLICT, "CONFLICT"),
+        DomainError::RevisionConflict { .. } => (StatusCode::CONFLICT, "REVISION_CONFLICT"),
+        DomainError::IdempotencyConflict { .. } => (StatusCode::CONFLICT, "IDEMPOTENCY_CONFLICT"),
+        DomainError::InvalidSignature(_) => (StatusCode::FORBIDDEN, "INVALID_SIGNATURE"),
+        DomainError::VaultNotFound(_) => (StatusCode::NOT_FOUND, "NOT_FOUND"),
         DomainError::InvalidInput(_) | DomainError::InvalidPublicKey(_) => {
             (StatusCode::UNPROCESSABLE_ENTITY, "INVALID_INPUT")
         }

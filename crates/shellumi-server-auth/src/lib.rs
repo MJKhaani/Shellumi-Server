@@ -261,6 +261,10 @@ impl<S: Store> AuthService<S> {
         }
     }
 
+    pub fn store(&self) -> &Arc<S> {
+        &self.store
+    }
+
     pub fn verify_token(&self, token: &str) -> Result<AccessTokenClaims, DomainError> {
         verify_access_token(token, &self.token_secret)
     }

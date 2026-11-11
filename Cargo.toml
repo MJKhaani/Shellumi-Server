@@ -5,6 +5,8 @@ members = [
     "crates/shellumi-server-domain",
     "crates/shellumi-server-store",
     "crates/shellumi-server-auth",
+    "crates/shellumi-server-crypto",
+    "crates/shellumi-server-sync",
     "crates/shellumi-server",
 ]
 
@@ -21,8 +23,10 @@ shellumi-server-protocol = { path = "crates/shellumi-server-protocol", version =
 shellumi-server-domain = { path = "crates/shellumi-server-domain", version = "0.1.0" }
 shellumi-server-store = { path = "crates/shellumi-server-store", version = "0.1.0" }
 shellumi-server-auth = { path = "crates/shellumi-server-auth", version = "0.1.0" }
+shellumi-server-crypto = { path = "crates/shellumi-server-crypto", version = "0.1.0" }
+shellumi-server-sync = { path = "crates/shellumi-server-sync", version = "0.1.0" }
 
-tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "signal", "net", "io-util"] }
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "signal", "net", "io-util", "sync"] }
 axum = { version = "0.7", features = ["json"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["trace", "cors", "timeout"] }
@@ -40,3 +44,6 @@ sha2 = "0.10"
 subtle = "2.6"
 rand = "0.9"
 async-trait = "0.1"
+ring = "0.17"
+hex = "0.4"
+base64 = "0.22"

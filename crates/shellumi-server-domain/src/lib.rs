@@ -49,6 +49,24 @@ pub enum DomainError {
     #[error("Conflict: {0}")]
     Conflict(String),
 
+    #[error("Revision conflict for object '{object_id}': expected revision {expected}, current revision {actual}")]
+    RevisionConflict {
+        object_id: String,
+        expected: u64,
+        actual: u64,
+    },
+
+    #[error(
+        "Idempotency conflict for key '{key}': request payload does not match previous commit"
+    )]
+    IdempotencyConflict { key: String },
+
+    #[error("Invalid signature: {0}")]
+    InvalidSignature(String),
+
+    #[error("Vault not found: {0}")]
+    VaultNotFound(Uuid),
+
     #[error("Payload too large: limit {limit} bytes, actual {actual} bytes")]
     PayloadTooLarge { limit: usize, actual: usize },
 
@@ -142,4 +160,126 @@ pub struct ServerSettings {
     pub bootstrap_token_hash: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+// ---------------------------------------------------------------------------
+// Vault & Sync Domain Entities
+// ---------------------------------------------------------------------------
+
+/// Role within a vault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VaultRole {
+    Viewer = 0,
+    Editor = 1,
+    Administrator = 2,
+    Owner = 3,
+}
+
+impl VaultRole {
+    pub fn can_write(&self) -> bool {
+        matches!(self, Self::Owner | Self::Administrator | Self::Editor)
+    }
+
+    pub fn can_admin(&self) -> bool {
+        matches!(self, Self::Owner | Self::Administrator)
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Viewer => "viewer",
+            Self::Editor => "editor",
+            Self::Administrator => "administrator",
+            Self::Owner => "owner",
+        }
+    }
+}
+
+impl fmt::Display for VaultRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// Vault type: personal or shared team vault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VaultType {
+    Personal,
+    Team,
+}
+
+impl VaultType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Personal => "personal",
+            Self::Team => "team",
+        }
+    }
+}
+
+/// Vault domain entity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Vault {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub owner_id: Uuid,
+    pub vault_type: VaultType,
+    pub encrypted_name: Option<String>,
+    pub active_key_epoch: u32,
+    pub server_sequence: u64,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub deleted_at: Option<i64>,
+}
+
+/// Membership of a user in a vault.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VaultMember {
+    pub vault_id: Uuid,
+    pub user_id: Uuid,
+    pub role: VaultRole,
+    pub joined_at: i64,
+}
+
+/// Authoritative current state of a synced entity record in a vault.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Record {
+    pub vault_id: Uuid,
+    pub object_id: String,
+    pub entity_type: String,
+    pub current_revision: u64,
+    pub key_epoch: u32,
+    pub author_device_id: Uuid,
+    pub deleted: bool,
+    pub encrypted_envelope: Option<String>,
+    pub ciphertext_digest: String,
+    pub last_server_sequence: u64,
+    pub updated_at: i64,
+}
+
+/// Append-only entry in a vault's monotonic change feed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangeLogEntry {
+    pub vault_id: Uuid,
+    pub sequence: u64,
+    pub object_id: String,
+    pub entity_type: String,
+    pub revision: u64,
+    pub deleted: bool,
+    pub author_device_id: Uuid,
+    pub encrypted_envelope: Option<String>,
+    pub ciphertext_digest: String,
+    pub created_at: i64,
+}
+
+/// Mutation idempotency record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MutationIdempotency {
+    pub vault_id: Uuid,
+    pub idempotency_key: String,
+    pub device_id: Uuid,
+    pub request_hash: String,
+    pub response_payload: String,
+    pub created_at: i64,
 }

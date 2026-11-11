@@ -16,6 +16,8 @@ shellumi-server-protocol.workspace = true
 shellumi-server-domain.workspace = true
 shellumi-server-store.workspace = true
 shellumi-server-auth.workspace = true
+shellumi-server-crypto.workspace = true
+shellumi-server-sync.workspace = true
 
 tokio.workspace = true
 axum.workspace = true
@@ -34,3 +36,5 @@ rand.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+ring = { workspace = true }
+base64 = { workspace = true }

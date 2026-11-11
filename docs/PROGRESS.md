@@ -127,3 +127,90 @@ This journal records every increment, decision, test execution, and verification
   - Milestone M2: Encrypted Private Vault & Sync v1 (vault schema, commit CAS, change feed pagination, tombstone tracking, and conflict tests).
 - Issue / PR / CI evidence:
   - Local workspace passes all 21 automated tests, formatting, Clippy, and doc tests.
+
+---
+
+## 2026-11-11T08:50:00Z — TASK-003 — M2: Encrypted Private Vault, Canonical Signatures, and Sync Engine v1
+- Status: complete
+- Baseline / commit: 7f288fd
+- Objective and acceptance criteria:
+  - Create forward-only PostgreSQL migration `20261111000002_vaults_and_sync.sql` covering `vaults`, `vault_members`, `records`, `change_log`, `mutation_idempotency`, and `sync_cursors`.
+  - Create `crates/shellumi-server-crypto` implementing:
+    - Normative canonical mutation preimage encoding per ADR 0003.
+    - Ed25519 signature generation and verification via `ring`.
+    - `EncryptedEnvelope` structural validation and SHA-256 digest computation.
+  - Create `crates/shellumi-server-sync` implementing:
+    - Atomic batch CAS mutation processing with `expected_revision` check.
+    - Monotonically increasing sequence number assignment per vault.
+    - Idempotency key replay and mismatch detection.
+    - Durable deletion tombstone persistence.
+    - Delta change feed with cursor pagination and snapshot generation.
+  - Implement `VaultRepository` and `SyncRepository` in `crates/shellumi-server-store` for `InMemoryStore` and persistence.
+  - Implement Axum HTTP routes in `crates/shellumi-server`:
+    - `POST /api/v1/vaults`, `GET /api/v1/vaults`, `GET /api/v1/vaults/{id}`, `PATCH /api/v1/vaults/{id}`, `DELETE /api/v1/vaults/{id}`.
+    - `POST /api/v1/vaults/{id}/commits` (atomic CAS mutations + signature checks).
+    - `GET /api/v1/vaults/{id}/changes` (paginated delta feed).
+    - `GET /api/v1/vaults/{id}/snapshots/{revision}` (recovery snapshots).
+  - Update `openapi/shellumi-server-v1.yaml` and `docs/API.md`.
+  - Add comprehensive automated tests:
+    - Canonical signature verification and tampering rejection.
+    - Two clients offline convergence without data loss.
+    - Concurrent same-object edit yielding 409 Conflict.
+    - Idempotent commit retries (success) vs payload mutation on reused key (409).
+    - Tombstone propagation across devices.
+    - Multi-tenant / cross-user unauthorized vault access rejection.
+- Implementation / files changed:
+  - `Cargo.toml`, `Cargo.lock`
+  - `crates/shellumi-server-crypto/Cargo.toml`, `crates/shellumi-server-crypto/src/lib.rs`
+  - `crates/shellumi-server-sync/Cargo.toml`, `crates/shellumi-server-sync/src/lib.rs`
+  - `crates/shellumi-server-domain/src/lib.rs`: added `Vault`, `VaultMember`, `VaultRole`, `VaultType`, `Record`, `ChangeLogEntry`, `MutationIdempotency`, domain conflict/signature errors.
+  - `crates/shellumi-server-protocol/src/lib.rs`: added `EncryptedEnvelope`, `CreateVaultRequest`, `UpdateVaultRequest`, `VaultResponse`, `VaultListResponse`, `MutationItem`, `CommitBatchRequest`, `CommitBatchResponse`, `MutationAck`, `SyncChangeItem`, `ChangeFeedResponse`, `SnapshotResponse`.
+  - `crates/shellumi-server-store/src/lib.rs`: added `VaultRepository` and `SyncRepository` traits, implemented on `InMemoryStore` with unit tests.
+  - `crates/shellumi-server-auth/src/lib.rs`: added `store()` accessor to `AuthService`.
+  - `crates/shellumi-server/Cargo.toml`, `crates/shellumi-server/src/server.rs`: integrated routes for vaults, commits, changes, and snapshots.
+  - `migrations/20261111000002_vaults_and_sync.sql`: forward-only SQL migration for vaults, members, records, change log, idempotency, and cursors.
+  - `docs/adr/0003-m2-encrypted-vault-and-sync-engine.md`: architectural decision record for M2.
+  - `docs/API.md`, `openapi/shellumi-server-v1.yaml`: documented all M2 vault and sync endpoints, models, and error responses.
+  - `crates/shellumi-server/tests/sync_and_vaults.rs`: integration test suite verifying 5 scenarios.
+- Data migration or API compatibility:
+  - Added migration `20261111000002_vaults_and_sync.sql`.
+  - Added routes: `POST /api/v1/vaults`, `GET /api/v1/vaults`, `GET /api/v1/vaults/{id}`, `PATCH /api/v1/vaults/{id}`, `DELETE /api/v1/vaults/{id}`, `POST /api/v1/vaults/{id}/commits`, `GET /api/v1/vaults/{id}/changes`, `GET /api/v1/vaults/{id}/snapshots/{revision}`.
+- Security / privacy review:
+  - Zero plaintext server storage: only opaque client-sealed `EncryptedEnvelope` payloads stored.
+  - Every mutation is cryptographically signed by originating device's registered Ed25519 key over canonical UTF-8 preimage; tampered signatures are rejected with 403 Forbidden.
+  - Tenant isolation and vault membership verified for every read/write/feed operation; inaccessible vaults return 404 Not Found to prevent ID enumeration.
+  - Viewers are prohibited from committing mutations (403 Forbidden).
+  - Idempotency key tracking prevents double execution or replay.
+- Tests added (file + test names):
+  - `crates/shellumi-server-crypto/src/lib.rs`:
+    - `test_canonical_preimage_formatting`
+    - `test_signature_verification_success_and_tamper_rejection`
+    - `test_envelope_validation`
+  - `crates/shellumi-server-store/src/lib.rs`:
+    - `test_vault_lifecycle_and_rbac`
+    - `test_sync_repository_commit_batch_and_feed`
+  - `crates/shellumi-server-sync/src/lib.rs`:
+    - `test_vault_lifecycle`
+    - `test_commit_batch_and_feed`
+    - `test_cas_revision_conflict`
+    - `test_idempotent_retry_and_conflict`
+    - `test_tombstone_propagation_and_tampered_signature`
+  - `crates/shellumi-server/tests/sync_and_vaults.rs`:
+    - `test_vault_crud_lifecycle`
+    - `test_two_clients_offline_convergence_without_conflict`
+    - `test_concurrent_same_object_cas_409_conflict`
+    - `test_idempotent_retries_and_payload_tamper_rejection`
+    - `test_tombstone_propagation_and_tampered_signature`
+- Verification executed (exact commands, OS, counts, pass/fail/skip):
+  - `cargo fmt --all -- --check` (macOS Darwin arm64, 0 errors, pass)
+  - `cargo clippy --offline --workspace --all-targets --all-features -- -D warnings` (macOS Darwin arm64, 0 warnings, pass)
+  - `cargo test --offline --workspace --all-features` (macOS Darwin arm64, 36 tests: 36 passed, 0 failed, 0 skipped, pass)
+  - `cargo test --offline --doc --workspace` (macOS Darwin arm64, 0 doc-tests, pass)
+  - `cargo build --locked --workspace --all-features` (macOS Darwin arm64, 0 errors, pass)
+- Known limitations / failed attempts:
+  - Fixed `clippy::too_many_arguments` warnings on canonical signature preimage and batch commit store functions by explicitly allowing with documented justifications.
+  - Fixed `clippy::field_reassign_with_default` in integration test configuration initializer.
+- Next precise step:
+  - Milestone M3: Team Vaults, Invites, RBAC matrix, and recipient-wrapped key envelopes (wrapping DEK to recipient devices, one-time invitation links, epoch key rotation).
+- Issue / PR / CI evidence:
+  - Local workspace passes all 36 automated tests, formatting, Clippy, and doc tests.

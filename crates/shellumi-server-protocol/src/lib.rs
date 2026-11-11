@@ -158,3 +158,135 @@ pub struct DeviceResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub revoked_at: Option<i64>,
 }
+
+// ---------------------------------------------------------------------------
+// Vault & Synchronization DTOs
+// ---------------------------------------------------------------------------
+
+/// Client-sealed authenticated ciphertext envelope.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EncryptedEnvelope {
+    pub salt: String,
+    pub nonce: String,
+    pub ciphertext: String,
+    pub associated_data: String,
+    pub kdf_iterations: u32,
+}
+
+fn default_vault_type() -> String {
+    "personal".to_string()
+}
+
+/// Request payload for creating a new vault (`POST /api/v1/vaults`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateVaultRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encrypted_name: Option<String>,
+    #[serde(default = "default_vault_type")]
+    pub vault_type: String,
+}
+
+/// Request payload for updating vault metadata (`PATCH /api/v1/vaults/{id}`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateVaultRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encrypted_name: Option<String>,
+}
+
+/// Representation of a vault returned by API endpoints.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VaultResponse {
+    pub vault_id: Uuid,
+    pub tenant_id: Uuid,
+    pub owner_id: Uuid,
+    pub vault_type: String,
+    pub encrypted_name: Option<String>,
+    pub active_key_epoch: u32,
+    pub server_sequence: u64,
+    pub role: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// List of vaults accessible to the authenticated user (`GET /api/v1/vaults`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VaultListResponse {
+    pub vaults: Vec<VaultResponse>,
+}
+
+/// A single mutation item in a commit batch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MutationItem {
+    pub object_id: String,
+    pub entity_type: String,
+    pub expected_revision: u64,
+    pub deleted: bool,
+    pub key_epoch: u32,
+    pub device_counter: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encrypted_envelope: Option<EncryptedEnvelope>,
+    pub device_signature: String,
+}
+
+/// Batch commit request (`POST /api/v1/vaults/{id}/commits`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitBatchRequest {
+    pub protocol_version: u32,
+    pub vault_id: Uuid,
+    pub idempotency_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_cursor: Option<String>,
+    pub mutations: Vec<MutationItem>,
+}
+
+/// Acknowledged mutation result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MutationAck {
+    pub object_id: String,
+    pub assigned_revision: u64,
+    pub server_sequence: u64,
+    pub deleted: bool,
+}
+
+/// Response payload for a committed mutation batch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitBatchResponse {
+    pub vault_id: Uuid,
+    pub commit_sequence: u64,
+    pub next_cursor: String,
+    pub applied: Vec<MutationAck>,
+}
+
+/// An entry in a change feed or snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncChangeItem {
+    pub sequence: u64,
+    pub object_id: String,
+    pub entity_type: String,
+    pub revision: u64,
+    pub deleted: bool,
+    pub author_device_id: Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encrypted_envelope: Option<EncryptedEnvelope>,
+    pub updated_at: i64,
+}
+
+/// Paginated delta feed response (`GET /api/v1/vaults/{id}/changes`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangeFeedResponse {
+    pub vault_id: Uuid,
+    pub latest_sequence: u64,
+    pub next_cursor: String,
+    pub has_more: bool,
+    pub records: Vec<SyncChangeItem>,
+}
+
+/// Full vault recovery snapshot (`GET /api/v1/vaults/{id}/snapshots/{revision}`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotResponse {
+    pub vault_id: Uuid,
+    pub server_sequence: u64,
+    pub records: Vec<SyncChangeItem>,
+}

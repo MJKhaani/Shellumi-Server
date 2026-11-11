@@ -191,6 +191,200 @@ paths:
         '204':
           description: Device revoked
 
+  /api/v1/vaults:
+    get:
+      summary: List vaults
+      description: Returns all vaults accessible to the authenticated user.
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: List of vaults
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VaultListResponse'
+    post:
+      summary: Create a vault
+      description: Creates a new encrypted personal or team vault.
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateVaultRequest'
+      responses:
+        '201':
+          description: Vault created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VaultResponse'
+
+  /api/v1/vaults/{id}:
+    get:
+      summary: Get vault details
+      description: Fetches metadata for a specific vault.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Vault details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VaultResponse'
+        '404':
+          description: Vault not found
+    patch:
+      summary: Update vault metadata
+      description: Updates vault encrypted display name or policies.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateVaultRequest'
+      responses:
+        '200':
+          description: Vault updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VaultResponse'
+    delete:
+      summary: Delete a vault
+      description: Soft-deletes a vault (owner only).
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Vault deleted
+
+  /api/v1/vaults/{id}/commits:
+    post:
+      summary: Commit a batch of mutations
+      description: Atomically processes signed conditional mutations with CAS revision checking.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: X-Device-Id
+          in: header
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CommitBatchRequest'
+      responses:
+        '200':
+          description: Batch successfully applied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommitBatchResponse'
+        '403':
+          description: Forbidden or invalid device signature
+        '409':
+          description: CAS revision conflict or idempotency conflict
+
+  /api/v1/vaults/{id}/changes:
+    get:
+      summary: Get delta changes feed
+      description: Paginated feed of encrypted record changes and tombstones in strictly increasing sequence.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: since
+          in: query
+          required: false
+          schema:
+            type: integer
+        - name: cursor
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Changes feed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChangeFeedResponse'
+
+  /api/v1/vaults/{id}/snapshots/{revision}:
+    get:
+      summary: Get full recovery snapshot
+      description: Returns active encrypted records for full resynchronization.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: revision
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Recovery snapshot
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SnapshotResponse'
+
 components:
   securitySchemes:
     BearerAuth:
@@ -464,3 +658,256 @@ components:
         request_id:
           type: string
           nullable: true
+
+    EncryptedEnvelope:
+      type: object
+      required:
+        - salt
+        - nonce
+        - ciphertext
+        - associated_data
+        - kdf_iterations
+      properties:
+        salt:
+          type: string
+          description: Base64-encoded KDF salt (16 bytes)
+        nonce:
+          type: string
+          description: Base64-encoded AEAD nonce (12 bytes)
+        ciphertext:
+          type: string
+          description: Base64-encoded ciphertext with authentication tag
+        associated_data:
+          type: string
+          description: Authenticated associated data (e.g. host:uuid)
+        kdf_iterations:
+          type: integer
+          description: PBKDF2 iteration count
+
+    CreateVaultRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          nullable: true
+        encrypted_name:
+          type: string
+          nullable: true
+        vault_type:
+          type: string
+          enum: [personal, team]
+          default: personal
+
+    UpdateVaultRequest:
+      type: object
+      properties:
+        encrypted_name:
+          type: string
+          nullable: true
+
+    VaultResponse:
+      type: object
+      required:
+        - vault_id
+        - tenant_id
+        - owner_id
+        - vault_type
+        - active_key_epoch
+        - server_sequence
+        - role
+        - created_at
+        - updated_at
+      properties:
+        vault_id:
+          type: string
+          format: uuid
+        tenant_id:
+          type: string
+          format: uuid
+        owner_id:
+          type: string
+          format: uuid
+        vault_type:
+          type: string
+        encrypted_name:
+          type: string
+          nullable: true
+        active_key_epoch:
+          type: integer
+        server_sequence:
+          type: integer
+        role:
+          type: string
+        created_at:
+          type: integer
+        updated_at:
+          type: integer
+
+    VaultListResponse:
+      type: object
+      required:
+        - vaults
+      properties:
+        vaults:
+          type: array
+          items:
+            $ref: '#/components/schemas/VaultResponse'
+
+    MutationItem:
+      type: object
+      required:
+        - object_id
+        - entity_type
+        - expected_revision
+        - deleted
+        - key_epoch
+        - device_counter
+        - device_signature
+      properties:
+        object_id:
+          type: string
+        entity_type:
+          type: string
+        expected_revision:
+          type: integer
+        deleted:
+          type: boolean
+        key_epoch:
+          type: integer
+        device_counter:
+          type: integer
+        encrypted_envelope:
+          $ref: '#/components/schemas/EncryptedEnvelope'
+          nullable: true
+        device_signature:
+          type: string
+
+    CommitBatchRequest:
+      type: object
+      required:
+        - protocol_version
+        - vault_id
+        - idempotency_key
+        - mutations
+      properties:
+        protocol_version:
+          type: integer
+        vault_id:
+          type: string
+          format: uuid
+        idempotency_key:
+          type: string
+        base_cursor:
+          type: string
+          nullable: true
+        mutations:
+          type: array
+          items:
+            $ref: '#/components/schemas/MutationItem'
+
+    MutationAck:
+      type: object
+      required:
+        - object_id
+        - assigned_revision
+        - server_sequence
+        - deleted
+      properties:
+        object_id:
+          type: string
+        assigned_revision:
+          type: integer
+        server_sequence:
+          type: integer
+        deleted:
+          type: boolean
+
+    CommitBatchResponse:
+      type: object
+      required:
+        - vault_id
+        - commit_sequence
+        - next_cursor
+        - applied
+      properties:
+        vault_id:
+          type: string
+          format: uuid
+        commit_sequence:
+          type: integer
+        next_cursor:
+          type: string
+        applied:
+          type: array
+          items:
+            $ref: '#/components/schemas/MutationAck'
+
+    SyncChangeItem:
+      type: object
+      required:
+        - sequence
+        - object_id
+        - entity_type
+        - revision
+        - deleted
+        - author_device_id
+        - updated_at
+      properties:
+        sequence:
+          type: integer
+        object_id:
+          type: string
+        entity_type:
+          type: string
+        revision:
+          type: integer
+        deleted:
+          type: boolean
+        author_device_id:
+          type: string
+          format: uuid
+        encrypted_envelope:
+          $ref: '#/components/schemas/EncryptedEnvelope'
+          nullable: true
+        updated_at:
+          type: integer
+
+    ChangeFeedResponse:
+      type: object
+      required:
+        - vault_id
+        - latest_sequence
+        - next_cursor
+        - has_more
+        - records
+      properties:
+        vault_id:
+          type: string
+          format: uuid
+        latest_sequence:
+          type: integer
+        next_cursor:
+          type: string
+        has_more:
+          type: boolean
+        records:
+          type: array
+          items:
+            $ref: '#/components/schemas/SyncChangeItem'
+
+    SnapshotResponse:
+      type: object
+      required:
+        - vault_id
+        - server_sequence
+        - records
+      properties:
+        vault_id:
+          type: string
+          format: uuid
+        server_sequence:
+          type: integer
+        records:
+          type: array
+          items:
+            $ref: '#/components/schemas/SyncChangeItem'
