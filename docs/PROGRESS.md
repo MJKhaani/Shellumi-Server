@@ -525,26 +525,29 @@ This journal records every increment, decision, test execution, and verification
 - Baseline / commit: c0ae3bc
 - Objective and acceptance criteria:
   - Diagnose failure in GitHub Actions CI workflow `container-smoke` job.
-  - Identify root cause: Debian Bullseye (`rust:1.80-bullseye` and `debian:bullseye-slim`) package repositories returned HTTP 404 for `bullseye-security` packages (`curl`, `openssl`, `ca-certificates`).
-  - Upgrade base images in `Dockerfile` to current stable Debian Bookworm (`rust:1.80-bookworm` and `debian:bookworm-slim`).
+  - Identify root causes:
+    1. Debian Bullseye package repositories returned HTTP 404 for `bullseye-security` packages (`curl`, `openssl`, `ca-certificates`).
+    2. Outdated Rust 1.80 builder image failed to parse Cargo manifests requiring Cargo `edition2024` (e.g. `clap v4.6.7`).
+  - Upgrade base images in `Dockerfile` to current stable Debian Bookworm with stable Rust (`rust:1-bookworm` and `debian:bookworm-slim`).
   - Verify workspace format, clippy, unit tests, and push fix to resolve CI.
 - Implementation / files changed:
   - `Dockerfile`
   - `docs/PROGRESS.md`
 - Data migration or API compatibility:
-  - None. OCI container base image upgrade from Debian 11 to Debian 12.
+  - None. OCI container base image upgrade from Debian 11 / Rust 1.80 to Debian 12 / Rust 1.x stable.
 - Security / privacy review:
   - Debian Bookworm base image provides actively maintained security updates and modern glibc. Non-root runtime configuration (`shellumi:shellumi`, UID 10001) preserved.
 - Tests added (file + test names):
   - Exercised by GitHub Actions CI job `container-smoke` (`docker/build-push-action@v5`).
 - Verification executed (exact commands, OS, counts, pass/fail/skip):
   - `gh run view 43001891946 --log-failed` (diagnosed `apt-get` 404 on `bullseye-security`)
+  - `gh run view 43002473434 --log-failed` (diagnosed Cargo `edition2024` requirement on Rust 1.80 builder)
   - `cargo fmt --all -- --check` (macOS Darwin arm64, 0 diffs, pass)
   - `cargo clippy --offline --workspace --all-targets --all-features -- -D warnings` (macOS Darwin arm64, 0 warnings, pass)
   - `cargo test --offline --workspace --all-features` (macOS Darwin arm64, 76 passed, 0 failed, pass)
 - Known limitations / failed attempts:
-  - None.
+  - `rust:1.80-bookworm` pinned to Rust 1.80, which predated Rust 2024 edition stabilization; updated to `rust:1-bookworm`.
 - Next precise step:
   - Commit and push Dockerfile fix to trigger clean green CI run on `main`.
 - Issue / PR / CI evidence:
-  - Run ID `43001891946` confirmed `Code Quality & Unit Tests` passed in 49s; container build failed only on Bullseye apt repository.
+  - Run ID `43002473434` confirmed `Code Quality & Unit Tests` passed in 41s. Container build builder image upgraded.
