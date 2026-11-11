@@ -470,27 +470,50 @@ This journal records every increment, decision, test execution, and verification
 ---
 
 ## 2026-11-11T10:45:00Z — TASK-007 — M6: Advanced Self-Hosting & Client Integration Polish
-- Status: planned
-- Baseline / commit: HEAD (after M5)
+- Status: complete
+- Baseline / commit: fbf78c8
 - Objective and acceptance criteria:
-  - Review end-to-end protocol compatibility against Shellumi desktop client contracts.
-  - Ensure all database migrations, OpenAPI 3.1 definitions, and documentation deliverables from AGENTS.md §8 are complete, synchronized, and verified.
-  - Run all release validation quality gates.
+  - Add comprehensive contract fixtures and wire serialization validation tests in `crates/shellumi-server/tests/contract_fixtures.rs` matching Shellumi desktop client types.
+  - Author Architectural Decision Record `docs/adr/0007-m6-self-hosting-and-client-compatibility.md` covering self-hosting guarantees, client provider boundaries, and zero-knowledge invariants.
+  - Expand `docs/COMPATIBILITY.md` with wire protocol v1 details, client entity mapping, legacy AES-256-GCM client snapshot migration, and Google Drive isolation.
+  - Update `docs/ARCHITECTURE.md`, `docs/security/THREAT_MODEL.md`, `docs/security/KEY_MANAGEMENT.md`, `docs/development/TESTING.md`, `docs/ROADMAP.md`, `README.md`, and `CHANGELOG.md`.
+  - Execute all mandatory quality gates: format, clippy with denied warnings, unit/integration/doc tests, and workspace build.
 - Implementation / files changed:
+  - `crates/shellumi-server/tests/contract_fixtures.rs`
+  - `docs/adr/0007-m6-self-hosting-and-client-compatibility.md`
   - `docs/COMPATIBILITY.md`
   - `docs/ARCHITECTURE.md`
+  - `docs/security/THREAT_MODEL.md`
+  - `docs/security/KEY_MANAGEMENT.md`
+  - `docs/development/TESTING.md`
+  - `docs/ROADMAP.md`
+  - `README.md`
+  - `CHANGELOG.md`
   - `docs/PROGRESS.md`
 - Data migration or API compatibility:
-  - Full compatibility table audit.
+  - Full wire protocol v1 contract fixture coverage and golden JSON tests.
+  - Formalized client migration from legacy AES-256-GCM PBKDF2 snapshots to versioned envelopes and UUIDs.
 - Security / privacy review:
-  - Final threat model review against `docs/security/THREAT_MODEL.md`.
+  - Validated that wire contracts and documentation enforce zero server-side plaintext, dedicated device keys, monotonic sequence allocation, single-writer lease fencing, and complete tenant/vault isolation.
 - Tests added (file + test names):
-  - Contract validation and end-to-end checks.
+  - `crates/shellumi-server/tests/contract_fixtures.rs`:
+    - `test_capabilities_and_health_contract_fixture`
+    - `test_auth_and_bootstrap_contract_fixtures`
+    - `test_device_registration_contract_fixtures`
+    - `test_encrypted_envelope_and_vault_contract_fixtures`
+    - `test_commit_batch_and_change_feed_contract_fixtures`
+    - `test_team_invites_and_key_envelopes_contract_fixtures`
+    - `test_collab_session_and_frame_contract_fixtures`
+    - `test_error_response_contract_fixture`
 - Verification executed (exact commands, OS, counts, pass/fail/skip):
-  - Planned: fmt, clippy, test, doc, build.
+  - `cargo fmt --all -- --check` (macOS Darwin arm64, 0 diffs, pass)
+  - `cargo clippy --offline --workspace --all-targets --all-features -- -D warnings` (macOS Darwin arm64, 0 warnings, pass)
+  - `cargo test --offline --workspace --all-features` (macOS Darwin arm64, 76 tests: 76 passed, 0 failed, 0 skipped, pass)
+  - `cargo test --offline --doc --workspace` (macOS Darwin arm64, 0 doc-tests, pass)
+  - `cargo build --offline --workspace --all-features` (macOS Darwin arm64, 0 errors, pass)
 - Known limitations / failed attempts:
-  - None yet.
+  - None.
 - Next precise step:
-  - Commit Milestone M5 and review M6 deliverables.
+  - Commit Milestone M6 changes, push to origin/main, and prepare v0.1.0 release candidate tag.
 - Issue / PR / CI evidence:
-  - Planned.
+  - All 76 automated tests across unit, store, sync, auth, ops, collaboration, and contract fixture suites passing cleanly with zero compiler warnings.

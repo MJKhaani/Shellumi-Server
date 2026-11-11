@@ -56,3 +56,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Real-time Server-Sent Events stream (`/api/v1/collab/sessions/:id/events`) and cursor-based ordered polling fallback (`/api/v1/collab/sessions/:id/poll`).
   - PostgreSQL schema migration `20261111000004_collab_sessions.sql` for session state and enrolled participants.
   - Comprehensive integration test suite in `tests/collab_relay.rs` validating gating, single-writer fencing, emergency termination, and ciphertext preservation.
+- **Milestone M6: Advanced self-hosting, integration & client compatibility hardening**
+  - Wire protocol v1 contract fixtures test suite (`crates/shellumi-server/tests/contract_fixtures.rs`) validating golden JSON serialization and deserialization for all protocol DTOs.
+  - Expanded client compatibility specification in `docs/COMPATIBILITY.md` detailing entity mappings (`SyncVault`, `SyncRecord`, `EncryptedEnvelope`, `TeamRole`, `SharedVault`, `TeamMember`), canonical AAD construction, and provider boundaries.
+  - Comprehensive migration strategy for upgrading legacy client AES-256-GCM + PBKDF2 local/Drive snapshots to versioned envelopes and UUID identifiers.
+  - Authored ADR `docs/adr/0007-m6-self-hosting-and-client-compatibility.md` formalizing client provider boundaries, zero-knowledge constraints, and CAS conflict semantics.
+  - Synchronized and updated documentation deliverables across Architecture, Key Management, Threat Model, Testing, Releases, and Roadmap.

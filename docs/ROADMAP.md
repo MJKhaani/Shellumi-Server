@@ -12,7 +12,8 @@ This document outlines the milestones and progress of Shellumi Server.
 | **M3** | Team Vaults, Invites, RBAC & E2EE Keys | **Complete** | Owner/Admin/Editor/Viewer permission matrix, one-time invitations, per-device recipient-wrapped DEKs, epoch rotation, audit trail. |
 | **M4** | Resilience, Operations & Releases | **Complete** | CLI admin commands, backup/restore verification, metrics, rate limits, multi-arch Docker image, reproducible release automation. |
 | **M5** | Optional Live Terminal Collaboration | **Complete** | Signaling relay, ephemeral E2EE session keys, single-writer fencing token, owner emergency revocation, bounded queues, SSE & polling. |
-| **M6** | Advanced Self-Hosting & Integrations | Planned | OIDC/SSO, optional SMTP, large encrypted attachments, horizontal PostgreSQL coordination. |
+| **M6** | Advanced Self-Hosting & Client Polish | **Complete** | Contract fixtures, client compatibility matrix, legacy migration paths, disaster recovery, ADRs, zero-knowledge threat validation. |
+| **M7** | Enterprise Integrations (Post-v1) | Planned | OIDC/SSO, optional SMTP notification delivery, S3-compatible large encrypted attachment storage, horizontal PostgreSQL cluster coordination. |
 
 ---
 
@@ -76,4 +77,18 @@ This document outlines the milestones and progress of Shellumi Server.
 - **Role Enforcement:** Viewers are strictly prohibited from transmitting `TerminalInput` frames; non-hosts cannot emit `TerminalOutput` frames. Read-only sessions prohibit all input and control grants.
 - **Host Emergency Override:** Immediate unilateral lease revocation and session termination (`POST /api/v1/collab/sessions/:id/terminate`). Closes active subscriber channels immediately; subsequent frame sends return HTTP 410 `COLLAB_SESSION_TERMINATED`.
 - **Transports:** Real-time Server-Sent Events stream (`GET /api/v1/collab/sessions/:id/events`) and cursor-based ordered frame polling (`GET /api/v1/collab/sessions/:id/poll?since_sequence=...`).
+
+### M6 — Advanced Self-Hosting & Client Integration Polish (Complete)
+- **Wire Contract Fixtures:** Full golden JSON contract fixtures and deserialization test suite in `crates/shellumi-server/tests/contract_fixtures.rs`.
+- **Client Compatibility Matrix:** Complete specification in `docs/COMPATIBILITY.md` mapping client entities (`SyncVault`, `SyncRecord`, `EncryptedEnvelope`, `TeamRole`, `SharedVault`, `TeamMember`) to server endpoints and wire payloads.
+- **Migration Paths:** Formalized migration pathway for upgrading legacy client AES-256-GCM + PBKDF2 local/Drive backups to versioned envelopes and stable UUIDs.
+- **Architecture & Threat Model:** Synchronized `docs/ARCHITECTURE.md`, `docs/security/THREAT_MODEL.md`, `docs/security/KEY_MANAGEMENT.md`, and `docs/development/TESTING.md`.
+- **ADRs:** Authored `docs/adr/0007-m6-self-hosting-and-client-compatibility.md` formalizing self-hosting boundaries and zero-knowledge invariants.
+
+### M7 — Enterprise Integrations (Post-v1 Planning)
+- **OIDC/SSO:** Optional enterprise OpenID Connect identity provider integration alongside local Argon2id credentials.
+- **Transactional Email:** Optional SMTP provider for asynchronous delivery of invitation links and security notices.
+- **Large Encrypted Attachments:** S3-compatible object storage integration for bounded encrypted session recordings and file transfers.
+- **Clustered High Availability:** Multi-node horizontal scaling coordinated via PostgreSQL `LISTEN`/`NOTIFY` and advisory locks.
+
 
