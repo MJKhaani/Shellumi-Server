@@ -1,141 +1,60 @@
 # Shellumi Server
 
+**An optional, self-hosted sync and collaboration server for [Shellumi](https://github.com/MJKhaani/Shellumi).**
+
 [![CI](https://github.com/MJKhaani/Shellumi-Server/actions/workflows/ci.yml/badge.svg)](https://github.com/MJKhaani/Shellumi-Server/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Rust: 2021](https://img.shields.io/badge/Rust-2021_Stable-blue.svg)](https://www.rust-lang.org/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/built%20with-Rust-orange.svg)](https://www.rust-lang.org/)
 
-An open-source, MIT-licensed, headless, self-hostable synchronization and collaboration backend for [Shellumi](https://github.com/MJKhaani/Shellumi) desktop and CLI clients.
+Shellumi works locally without an account or server. Shellumi Server is an opt-in Rust service for encrypted vault synchronization, team access, and collaboration. The existing direct Google Drive provider remains separate; the server does not proxy Google OAuth.
 
-Shellumi Server enables multi-device synchronization of encrypted personal and team vaults, cryptographic device registration, user invitations, role-based access control (RBAC), hash-chained audit trails, and optional real-time terminal collaboration signaling.
+> **Development status:** The runtime currently uses an in-memory store. Data and notification state do not survive a restart, and the PostgreSQL configuration and migration files do not provide a wired persistence backend. Sync notifications are experimental; cross-tenant isolation, reconnect, timeout, and backpressure need further testing. Do not rely on this version for production data. See [the progress journal](docs/PROGRESS.md) for evidence and open work.
 
----
+## What is here
 
-## Key Principles & Security Guarantees
+- **Encrypted vault sync** — REST endpoints for encrypted records, conditional writes, change feeds, tombstones, and idempotent retries.
+- **Teams and devices** — device registration, vault membership, role checks, invitations, and recipient-wrapped key envelopes.
+- **Live sync hints** — a WebSocket and long-poll endpoint notify connected clients of team-vault changes. Clients still fetch authoritative data through REST.
+- **Optional terminal collaboration** — session signaling and encrypted frame relay with single-writer controls.
+- **Self-hosted by design** — MIT-licensed Rust workspace with no required hosted identity or subscription.
 
-- **Zero Server-Side Plaintext:** The server never holds or decrypts user vault data, SSH private keys, passphrases, credentials, or terminal keystrokes. It operates solely on client-sealed authenticated ciphertext envelopes (`EncryptedEnvelope`) and recipient-wrapped key envelopes.
-- **Client Autonomy:** Shellumi desktop/CLI clients are completely functional offline. Connecting to Shellumi Server is strictly opt-in and self-hosted; neither the desktop application nor its direct Google Drive synchronization depends on Shellumi Server.
-- **Self-Hosted Simplicity:** Single native Rust binary or minimal non-root Docker container with PostgreSQL. No Kubernetes, Redis, or proprietary cloud dependencies required.
-- **Deterministic Concurrency & Conflict Safety:** Monotonically increasing revision sequence numbers, conditional writes with conflict detection (`409 Conflict`), durable tombstones, and mutation idempotency.
-- **Single-Writer Collaboration:** Real-time terminal collaboration signaling enforces a monotonic write lease fencing token, blocking stale keystrokes and providing instant host emergency revocation.
+The server is designed to handle encrypted envelopes rather than decrypt vault contents. This is a design goal, not a claim of an independent security audit. Review the [threat model](docs/security/THREAT_MODEL.md) and [key management design](docs/security/KEY_MANAGEMENT.md) before evaluating a deployment.
 
----
+## Try it locally
 
-## Architecture Overview
-
-```text
-+-------------------------------------------------------------+
-|                      Shellumi Client                        |
-|        (GPUI Desktop / CLI / Future Mobile Client)          |
-+------------------------------+------------------------------+
-                               | HTTPS / Server-Sent Events
-                               v
-+-------------------------------------------------------------+
-|                      Shellumi Server                        |
-|                                                             |
-|  +--------------------+  +--------------------+             |
-|  |   Health & Ops     |  |   Auth & Devices   |             |
-|  |  /health, /metrics |  |  Argon2id, Tokens  |             |
-|  |  CLI Admin, Doctor |  |  Ed25519 / X25519  |             |
-|  +--------------------+  +--------------------+             |
-|                                                             |
-|  +--------------------+  +--------------------+             |
-|  |     Sync & CAS     |  |   Vault & Invites  |             |
-|  | Delta Feed, Cursor |  | Wrapped Envelopes  |             |
-|  | 409 Conflict, Idem |  | RBAC Matrix, Audit |             |
-|  +--------------------+  +--------------------+             |
-|                                                             |
-|  +--------------------------------------------+             |
-|  |          Terminal Collab Relay Hub         |             |
-|  |   SSE Streaming, Single-Writer Fencing     |             |
-|  +--------------------------------------------+             |
-|                                                             |
-|  +--------------------------------------------+             |
-|  |            PostgreSQL Persistence          |             |
-|  |  Migrations: 001(core), 002(sync),         |             |
-|  |              003(teams), 004(collab)       |             |
-|  +--------------------------------------------+             |
-+-------------------------------------------------------------+
-```
-
----
-
-## Quickstart
-
-### Running locally with Cargo
+Install the Rust toolchain specified in [`rust-toolchain.toml`](rust-toolchain.toml), then run:
 
 ```bash
-# Clone the repository
 git clone https://github.com/MJKhaani/Shellumi-Server.git
 cd Shellumi-Server
-
-# Run the server with default configuration (listens on 127.0.0.1:8080)
-cargo run -p shellumi-server
+cargo run --locked -p shellumi-server
 ```
 
-Verify the server is running:
+In another terminal:
 
 ```bash
-# Check liveness
 curl http://127.0.0.1:8080/health/live
-
-# Check capabilities and protocol version
 curl http://127.0.0.1:8080/api/v1/capabilities
 ```
 
-### Running with Docker Compose
+The default address is loopback. Local data is temporary: restarting the process clears the in-memory store. The [configuration reference](docs/CONFIGURATION.md) and [deployment guide](docs/DEPLOYMENT.md) describe available settings and deployment artifacts; the included Compose PostgreSQL service is not currently connected to the runtime store.
 
-```bash
-cd deploy
-cp .env.example .env
-docker compose up -d
-```
+## Connecting a client
 
----
+The versioned REST API remains the source of truth. An experimental client can connect to `GET /api/v1/sync/events` with a session-bound bearer token and `X-Device-Id`, or use `GET /api/v1/sync/poll` for long polling. A `vault_changed` or `vault_deleted` event is a **hint**, not a durable update.
 
-## CLI Administration & Operations
+Reconcile the vault list, metadata, and change feeds through authenticated REST calls on startup and after a disconnect, polling gap, timeout, or overflow. Hints can be duplicated or missed and are confined to one server process. Shellumi client integration has not yet been implemented or verified. See the [API reference](docs/API.md) and [compatibility notes](docs/COMPATIBILITY.md) for the current wire contract and limitations.
 
-The `shellumi-server` binary provides headless operational subcommands:
+## Explore the project
 
-```bash
-# Run automated system, network, and configuration diagnostics
-shellumi-server doctor
-
-# Manage user accounts offline
-shellumi-server admin user list
-shellumi-server admin user create --username alice --email alice@example.com --password "SecurePass123!"
-shellumi-server admin user disable <user-id>
-
-# Inspect and revoke user sessions
-shellumi-server admin session list --user-id <user-id>
-shellumi-server admin session revoke-all --user-id <user-id>
-
-# Check database schema migration status
-shellumi-server migrate status
-
-# Cryptographically verify database backups against corruption and plaintext leaks
-shellumi-server backup verify /backups/shellumi_backup_20261111.sql
-```
-
----
-
-## Documentation
-
-- [Roadmap & Milestone Status](docs/ROADMAP.md)
-- [Architecture & System Design](docs/ARCHITECTURE.md)
-- [Client Compatibility Matrix & Wire Protocol](docs/COMPATIBILITY.md)
-- [Configuration Reference](docs/CONFIGURATION.md)
-- [Deployment Guide](docs/DEPLOYMENT.md)
-- [Disaster Recovery & Backup/Restore](docs/BACKUP_RESTORE.md)
-- [API Reference & OpenAPI 3.1](docs/API.md)
-- [Threat Model & Security Architecture](docs/security/THREAT_MODEL.md)
-- [Key Management Specification](docs/security/KEY_MANAGEMENT.md)
-- [Testing Guide & Quality Gates](docs/development/TESTING.md)
-- [Release Engineering](docs/development/RELEASES.md)
-- [Engineering Progress Journal](docs/PROGRESS.md)
-- [Mandatory Contributor Rules](AGENT.md)
-
----
+| Topic | Guide |
+| --- | --- |
+| Design and current work | [Architecture](docs/ARCHITECTURE.md) · [Roadmap](docs/ROADMAP.md) · [Progress](docs/PROGRESS.md) |
+| Protocol and client integration | [API](docs/API.md) · [OpenAPI](openapi/shellumi-server-v1.yaml) · [Compatibility](docs/COMPATIBILITY.md) |
+| Operations | [Configuration](docs/CONFIGURATION.md) · [Deployment](docs/DEPLOYMENT.md) · [Backup and restore](docs/BACKUP_RESTORE.md) |
+| Security | [Threat model](docs/security/THREAT_MODEL.md) · [Key management](docs/security/KEY_MANAGEMENT.md) · [Security policy](SECURITY.md) |
+| Contributing | [Testing](docs/development/TESTING.md) · [Releases](docs/development/RELEASES.md) · [Contributor instructions](AGENT.md) |
 
 ## License
 
-MIT License. See [LICENSE](LICENSE) for details.
+[MIT](LICENSE). Contributions are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md).

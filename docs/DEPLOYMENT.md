@@ -1,5 +1,7 @@
 # Shellumi Server — Deployment Guide
 
+> **Development only:** The running server uses an in-memory store, even when the Compose PostgreSQL service is configured. Restarting loses server data. The procedures below describe deployment artifacts, not a verified persistent production deployment.
+
 Shellumi Server is an open-source, MIT-licensed, self-hostable synchronization backend designed to run on any modern Linux host using Docker Compose, native binaries, or systemd services.
 
 ---
@@ -17,7 +19,7 @@ Shellumi Server is an open-source, MIT-licensed, self-hostable synchronization b
 
 ## 2. Docker Compose Deployment (Recommended)
 
-The `deploy/` directory provides production-ready Compose configurations with PostgreSQL and optional automatic TLS via Caddy.
+The `deploy/` directory provides Compose configurations with PostgreSQL and optional automatic TLS via Caddy.
 
 ### Step 1: Clone Repository & Setup Environment
 

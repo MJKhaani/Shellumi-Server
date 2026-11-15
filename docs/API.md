@@ -1041,3 +1041,30 @@ Sensitive endpoints are protected by in-memory sliding-window rate limiters:
 
 
 
+
+### Experimental sync notification WebSocket
+
+`GET /api/v1/sync/events` upgrades to a WebSocket. Send the existing
+`Authorization: Bearer <access token>` and `X-Device-Id: <device UUID>` headers.
+For an accessible team vault, a successful REST commit or metadata, membership,
+or key-epoch change can produce `{"type":"vault_changed","vault_id":"...","latest_sequence":42}`.
+This is an advisory hint: clients must pull the REST change feed and refresh
+vault metadata. Reconnect and pull all accessible vaults after any disconnect;
+notifications are volatile, may be duplicated, and are not a durable feed.
+The server closes lagging connections and limits concurrent connections to 1024.
+The connection checks current session, device status and membership before delivering a
+hint and closes when the access token expires. Logout signals all sockets for the
+user to close; a revoked session cannot reconnect. Vault deletion emits a
+`vault_deleted` hint. Access tokens issued before session binding cannot open a
+socket; clients must log in or refresh. Use TLS/WSS for
+non-loopback deployments. Client integration is not implemented.
+
+### Sync notification long poll
+
+`GET /api/v1/sync/poll` accepts the same bearer and `X-Device-Id` headers as
+the WebSocket endpoint. It returns one `vault_changed` or `vault_deleted` JSON
+hint with 200, 204 after 20 seconds without an authorized hint, 401 if the
+session or device is invalid, 429 when the shared connection limit is reached,
+and 409 with `RESYNC_REQUIRED` if its broadcast receiver falls behind. Hints are
+volatile and polling has gaps: reconcile through REST before beginning or
+resuming polling and after every 204, disconnect, error, or overflow.

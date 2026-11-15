@@ -27,7 +27,7 @@ shellumi-server-crypto = { path = "crates/shellumi-server-crypto", version = "0.
 shellumi-server-sync = { path = "crates/shellumi-server-sync", version = "0.1.0" }
 
 tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "signal", "net", "io-util", "sync"] }
-axum = { version = "0.7", features = ["json"] }
+axum = { version = "0.7", features = ["json", "ws"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["trace", "cors", "timeout"] }
 tracing = "0.1"

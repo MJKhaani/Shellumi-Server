@@ -5,7 +5,10 @@ use crate::config::ServerConfig;
 use crate::metrics::MetricsRegistry;
 use crate::rate_limit::{extract_client_ip, rate_limit_response, RateLimitCategory, RateLimiter};
 use axum::{
-    extract::{DefaultBodyLimit, Path, Query, State},
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        DefaultBodyLimit, Path, Query, State,
+    },
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Json, Response},
     routing::{delete, get, post},
@@ -22,16 +25,26 @@ use shellumi_server_protocol::{
     RotateKeyEpochRequest, SendCollabFrameRequest, ServerLimits, UpdateVaultRequest,
     CURRENT_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION,
 };
-use shellumi_server_store::{InMemoryStore, UserRepository};
+use shellumi_server_store::{
+    DeviceRepository, InMemoryStore, SessionRepository, UserRepository, VaultRepository,
+};
 use shellumi_server_sync::SyncEngine;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::{broadcast, Semaphore};
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 use uuid::Uuid;
+
+#[derive(Clone, Debug)]
+enum SyncEvent {
+    Vault(Uuid),
+    Deleted(Uuid),
+    Logout(Uuid),
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -41,6 +54,8 @@ pub struct AppState {
     pub collab: Arc<CollabHub<InMemoryStore>>,
     pub rate_limiter: Arc<RateLimiter>,
     pub metrics: Arc<MetricsRegistry>,
+    notifications: broadcast::Sender<SyncEvent>,
+    notification_connections: Arc<Semaphore>,
 }
 
 pub fn create_router(config: ServerConfig) -> Router {
@@ -81,6 +96,7 @@ pub fn create_router_with_auth_and_sync(
     ));
     let metrics = Arc::new(MetricsRegistry::new());
     let collab = Arc::new(CollabHub::new(auth.store().clone()));
+    let (notifications, _) = broadcast::channel(256);
 
     let state = AppState {
         config: Arc::new(config),
@@ -89,6 +105,8 @@ pub fn create_router_with_auth_and_sync(
         collab,
         rate_limiter,
         metrics,
+        notifications,
+        notification_connections: Arc::new(Semaphore::new(1024)),
     };
 
     let mut router = Router::new()
@@ -103,6 +121,8 @@ pub fn create_router_with_auth_and_sync(
         .route("/api/v1/auth/refresh", post(refresh_handler))
         .route("/api/v1/auth/logout", post(logout_handler))
         .route("/api/v1/me", get(me_handler))
+        .route("/api/v1/sync/events", get(sync_events_handler))
+        .route("/api/v1/sync/poll", get(sync_poll_handler))
         // Devices
         .route(
             "/api/v1/devices",
@@ -410,10 +430,13 @@ async fn logout_handler(
     };
 
     match state.auth.logout(claims.sub, req).await {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "status": "logged_out" })),
-        ),
+        Ok(()) => {
+            let _ = state.notifications.send(SyncEvent::Logout(claims.sub));
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "status": "logged_out" })),
+            )
+        }
         Err(err) => {
             let (status, err_resp) = map_domain_error(err);
             (status, Json(serde_json::to_value(err_resp.0).unwrap()))
@@ -514,6 +537,172 @@ async fn revoke_device_handler(
 // ---------------------------------------------------------------------------
 // Vault & Sync Handlers
 // ---------------------------------------------------------------------------
+
+async fn sync_events_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let claims = match extract_auth_claims(&state.auth, &headers) {
+        Ok(claims) => claims,
+        Err(err) => return map_domain_error(err).into_response(),
+    };
+    let device_id = match extract_device_id(&headers) {
+        Ok(id) => id,
+        Err(err) => return map_domain_error(err).into_response(),
+    };
+    if !sync_session_valid(&state, &claims, device_id).await {
+        return map_domain_error(DomainError::Unauthenticated).into_response();
+    }
+    match state.auth.store().find_device_by_id(device_id).await {
+        Ok(Some(device)) if device.user_id == claims.sub && device.revoked_at.is_none() => {}
+        _ => return map_domain_error(DomainError::Unauthenticated).into_response(),
+    }
+    let permit = match state.notification_connections.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => return StatusCode::TOO_MANY_REQUESTS.into_response(),
+    };
+    let rx = state.notifications.subscribe();
+    ws.max_message_size(1024)
+        .on_upgrade(move |socket| async move {
+            let _permit = permit;
+            sync_events_socket(socket, state, claims, device_id, rx).await;
+        })
+}
+
+async fn sync_session_valid(state: &AppState, claims: &AccessTokenClaims, device_id: Uuid) -> bool {
+    let Some(id) = claims.session_id else {
+        return false;
+    };
+    matches!(state.auth.store().list_sessions_for_user(claims.sub).await,
+        Ok(sessions) if sessions.iter().any(|session| session.id == id && session.revoked_at.is_none() && session.expires_at > chrono::Utc::now().timestamp() && session.device_id.map_or(true, |bound| bound == device_id)))
+}
+
+async fn sync_poll_handler(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let claims = match extract_auth_claims(&state.auth, &headers) {
+        Ok(claims) => claims,
+        Err(err) => return map_domain_error(err).into_response(),
+    };
+    let device_id = match extract_device_id(&headers) {
+        Ok(id) => id,
+        Err(err) => return map_domain_error(err).into_response(),
+    };
+    if !notification_access_valid(&state, &claims, device_id).await {
+        return map_domain_error(DomainError::Unauthenticated).into_response();
+    }
+    let _permit = match state.notification_connections.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => return StatusCode::TOO_MANY_REQUESTS.into_response(),
+    };
+    let mut rx = state.notifications.subscribe();
+    let result = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            match rx.recv().await {
+                Ok(SyncEvent::Logout(user)) if user == claims.sub => return StatusCode::UNAUTHORIZED.into_response(),
+                Ok(SyncEvent::Logout(_)) => continue,
+                Err(_) => return (StatusCode::CONFLICT, Json(serde_json::json!({"code":"RESYNC_REQUIRED"}))).into_response(),
+                Ok(event) => {
+                    if !notification_access_valid(&state, &claims, device_id).await {
+                        return StatusCode::UNAUTHORIZED.into_response();
+                    }
+                    let (vault_id, deleted) = match event {
+                        SyncEvent::Vault(id) => (id, false),
+                        SyncEvent::Deleted(id) => (id, true),
+                        SyncEvent::Logout(_) => continue,
+                    };
+                    if deleted {
+                        let vault = state.auth.store().find_vault_by_id(vault_id).await;
+                        let role = state.auth.store().get_vault_member_role(vault_id, claims.sub).await;
+                        if let (Ok(Some(vault)), Ok(Some(_))) = (vault, role) {
+                            if vault.vault_type.as_str() == "team" {
+                                return Json(serde_json::json!({"type":"vault_deleted", "vault_id":vault_id})).into_response();
+                            }
+                        }
+                    } else if let Ok(vault) = state.sync.get_vault(claims.sub, vault_id).await {
+                        if vault.vault_type == "team" {
+                            return Json(serde_json::json!({"type":"vault_changed", "vault_id":vault_id, "latest_sequence":vault.server_sequence})).into_response();
+                        }
+                    }
+                }
+            }
+        }
+    }).await;
+    match result {
+        Ok(response) => response,
+        Err(_) if notification_access_valid(&state, &claims, device_id).await => {
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(_) => StatusCode::UNAUTHORIZED.into_response(),
+    }
+}
+
+async fn notification_access_valid(
+    state: &AppState,
+    claims: &AccessTokenClaims,
+    device_id: Uuid,
+) -> bool {
+    chrono::Utc::now().timestamp() < claims.exp
+        && sync_session_valid(state, claims, device_id).await
+        && matches!(state.auth.store().find_device_by_id(device_id).await, Ok(Some(device)) if device.user_id == claims.sub && device.revoked_at.is_none())
+}
+
+async fn sync_events_socket(
+    mut socket: WebSocket,
+    state: AppState,
+    claims: AccessTokenClaims,
+    device_id: Uuid,
+    mut rx: broadcast::Receiver<SyncEvent>,
+) {
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
+    loop {
+        tokio::select! {
+            _ = heartbeat.tick() => {
+                let device = state.auth.store().find_device_by_id(device_id).await;
+                if chrono::Utc::now().timestamp() >= claims.exp || !sync_session_valid(&state, &claims, device_id).await ||
+                    !matches!(device, Ok(Some(d)) if d.user_id == claims.sub && d.revoked_at.is_none()) {
+                    break;
+                }
+                if socket.send(Message::Ping(Vec::new())).await.is_err() { break; }
+            }
+            event = rx.recv() => {
+                let (vault_id, deleted) = match event {
+                    Ok(SyncEvent::Vault(id)) => (id, false),
+                    Ok(SyncEvent::Deleted(id)) => (id, true),
+                    Ok(SyncEvent::Logout(user)) if user == claims.sub => break,
+                    Ok(SyncEvent::Logout(_)) => continue,
+                    // A lagging client must reconnect and pull its changes.
+                    Err(_) => break,
+                };
+                let device = state.auth.store().find_device_by_id(device_id).await;
+                if chrono::Utc::now().timestamp() >= claims.exp || !sync_session_valid(&state, &claims, device_id).await ||
+                    !matches!(device, Ok(Some(d)) if d.user_id == claims.sub && d.revoked_at.is_none()) { break; }
+                if deleted {
+                    let vault = state.auth.store().find_vault_by_id(vault_id).await;
+                    let role = state.auth.store().get_vault_member_role(vault_id, claims.sub).await;
+                    if let (Ok(Some(vault)), Ok(Some(_))) = (vault, role) {
+                        if vault.vault_type.as_str() == "team" {
+                            let event = serde_json::json!({"type":"vault_deleted", "vault_id":vault_id});
+                            if socket.send(Message::Text(event.to_string())).await.is_err() { break; }
+                        }
+                    }
+                    continue;
+                }
+                if let Ok(vault) = state.sync.get_vault(claims.sub, vault_id).await {
+                    if vault.vault_type == "team" {
+                        let event = serde_json::json!({"type":"vault_changed", "vault_id":vault_id, "latest_sequence":vault.server_sequence});
+                        if socket.send(Message::Text(event.to_string())).await.is_err() { break; }
+                    }
+                }
+            }
+            message = socket.recv() => match message {
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                Some(Ok(Message::Ping(data))) => if socket.send(Message::Pong(data)).await.is_err() { break; },
+                Some(Ok(Message::Pong(_))) => {},
+                Some(Ok(_)) => break,
+            }
+        }
+    }
+}
 
 async fn list_vaults_handler(
     State(state): State<AppState>,
@@ -616,7 +805,10 @@ async fn update_vault_handler(
     };
 
     match state.sync.update_vault(claims.sub, vault_id, req).await {
-        Ok(resp) => (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())),
+        Ok(resp) => {
+            let _ = state.notifications.send(SyncEvent::Vault(vault_id));
+            (StatusCode::OK, Json(serde_json::to_value(resp).unwrap()))
+        }
         Err(err) => {
             let (status, err_resp) = map_domain_error(err);
             (status, Json(serde_json::to_value(err_resp.0).unwrap()))
@@ -638,10 +830,13 @@ async fn delete_vault_handler(
     };
 
     match state.sync.delete_vault(claims.sub, vault_id).await {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "status": "deleted" })),
-        ),
+        Ok(()) => {
+            let _ = state.notifications.send(SyncEvent::Deleted(vault_id));
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "status": "deleted" })),
+            )
+        }
         Err(err) => {
             let (status, err_resp) = map_domain_error(err);
             (status, Json(serde_json::to_value(err_resp.0).unwrap()))
@@ -689,7 +884,10 @@ async fn commit_batch_handler(
     };
 
     match state.sync.commit_batch(claims.sub, device_id, req).await {
-        Ok(resp) => (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())),
+        Ok(resp) => {
+            let _ = state.notifications.send(SyncEvent::Vault(path_vault_id));
+            (StatusCode::OK, Json(serde_json::to_value(resp).unwrap()))
+        }
         Err(err) => {
             let (status, err_resp) = map_domain_error(err);
             (status, Json(serde_json::to_value(err_resp.0).unwrap()))
@@ -810,7 +1008,10 @@ async fn add_member_handler(
         .add_or_update_member(claims.sub, vault_id, req)
         .await
     {
-        Ok(resp) => (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())),
+        Ok(resp) => {
+            let _ = state.notifications.send(SyncEvent::Vault(vault_id));
+            (StatusCode::OK, Json(serde_json::to_value(resp).unwrap()))
+        }
         Err(err) => {
             let (status, err_resp) = map_domain_error(err);
             (status, Json(serde_json::to_value(err_resp.0).unwrap()))
@@ -836,7 +1037,10 @@ async fn remove_member_handler(
         .remove_member(claims.sub, vault_id, target_user_id)
         .await
     {
-        Ok(()) => (StatusCode::NO_CONTENT, Json(serde_json::Value::Null)),
+        Ok(()) => {
+            let _ = state.notifications.send(SyncEvent::Vault(vault_id));
+            (StatusCode::NO_CONTENT, Json(serde_json::Value::Null))
+        }
         Err(err) => {
             let (status, err_resp) = map_domain_error(err);
             (status, Json(serde_json::to_value(err_resp.0).unwrap()))
@@ -939,7 +1143,10 @@ async fn accept_invite_handler(
     };
 
     match state.sync.accept_invite(claims.sub, req).await {
-        Ok(resp) => (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())).into_response(),
+        Ok(resp) => {
+            let _ = state.notifications.send(SyncEvent::Vault(resp.vault_id));
+            (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())).into_response()
+        }
         Err(err) => {
             let (status, err_resp) = map_domain_error(err);
             (status, Json(serde_json::to_value(err_resp.0).unwrap())).into_response()
@@ -983,10 +1190,13 @@ async fn publish_key_envelopes_handler(
         .publish_key_envelopes(claims.sub, device_id, vault_id, req)
         .await
     {
-        Ok(count) => (
-            StatusCode::CREATED,
-            Json(serde_json::json!({ "published": count })),
-        ),
+        Ok(count) => {
+            let _ = state.notifications.send(SyncEvent::Vault(vault_id));
+            (
+                StatusCode::CREATED,
+                Json(serde_json::json!({ "published": count })),
+            )
+        }
         Err(err) => {
             let (status, err_resp) = map_domain_error(err);
             (status, Json(serde_json::to_value(err_resp.0).unwrap()))
@@ -1056,7 +1266,10 @@ async fn rotate_key_epoch_handler(
         .rotate_key_epoch(claims.sub, device_id, vault_id, req)
         .await
     {
-        Ok(resp) => (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())),
+        Ok(resp) => {
+            let _ = state.notifications.send(SyncEvent::Vault(vault_id));
+            (StatusCode::OK, Json(serde_json::to_value(resp).unwrap()))
+        }
         Err(err) => {
             let (status, err_resp) = map_domain_error(err);
             (status, Json(serde_json::to_value(err_resp.0).unwrap()))

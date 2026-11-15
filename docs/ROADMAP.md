@@ -92,3 +92,7 @@ This document outlines the milestones and progress of Shellumi Server.
 - **Clustered High Availability:** Multi-node horizontal scaling coordinated via PostgreSQL `LISTEN`/`NOTIFY` and advisory locks.
 
 
+
+Experimental sync WebSocket hints are implemented in the server; client integration,
+durable multi-process fanout,
+and comprehensive network and authorization tests remain outstanding.

@@ -1,5 +1,7 @@
 # Shellumi Server — Configuration Reference
 
+> **Current limitation:** `database_url` can be configured, but the running server currently uses an in-memory store and does not persist data to PostgreSQL.
+
 Shellumi Server resolves configuration according to the following precedence hierarchy:
 
 1. **Command-Line Arguments** (highest priority)

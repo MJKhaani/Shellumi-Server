@@ -24,6 +24,8 @@ pub struct AccessTokenClaims {
     pub username: String,
     pub exp: i64,
     pub iat: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<Uuid>,
 }
 
 // ---------------------------------------------------------------------------
@@ -83,6 +85,16 @@ pub fn create_access_token(
     secret: &[u8],
     ttl_secs: u64,
 ) -> Result<String, DomainError> {
+    create_session_access_token(user_id, username, secret, ttl_secs, None)
+}
+
+fn create_session_access_token(
+    user_id: Uuid,
+    username: &str,
+    secret: &[u8],
+    ttl_secs: u64,
+    session_id: Option<Uuid>,
+) -> Result<String, DomainError> {
     let now = chrono::Utc::now().timestamp();
     let exp = now + (ttl_secs as i64);
 
@@ -91,6 +103,7 @@ pub fn create_access_token(
         username: username.to_string(),
         exp,
         iat: now,
+        session_id,
     };
 
     let claims_json = serde_json::to_string(&claims)
@@ -323,13 +336,6 @@ impl<S: Store> AuthService<S> {
         self.store.create_org(&org, user_id).await?;
 
         // Issue initial access and refresh tokens
-        let access_token = create_access_token(
-            user_id,
-            &user.username,
-            &self.token_secret,
-            self.access_token_ttl_secs,
-        )?;
-
         let refresh_token = generate_refresh_token();
         let refresh_hash = hash_refresh_token(&refresh_token);
 
@@ -343,6 +349,14 @@ impl<S: Store> AuthService<S> {
             revoked_at: None,
         };
         self.store.create_session(&session).await?;
+
+        let access_token = create_session_access_token(
+            user_id,
+            &user.username,
+            &self.token_secret,
+            self.access_token_ttl_secs,
+            Some(session.id),
+        )?;
 
         Ok(BootstrapResponse {
             org_id,
@@ -386,13 +400,6 @@ impl<S: Store> AuthService<S> {
         }
 
         let now = chrono::Utc::now().timestamp();
-        let access_token = create_access_token(
-            user.id,
-            &user.username,
-            &self.token_secret,
-            self.access_token_ttl_secs,
-        )?;
-
         let refresh_token = generate_refresh_token();
         let refresh_hash = hash_refresh_token(&refresh_token);
 
@@ -406,6 +413,14 @@ impl<S: Store> AuthService<S> {
             revoked_at: None,
         };
         self.store.create_session(&session).await?;
+
+        let access_token = create_session_access_token(
+            user.id,
+            &user.username,
+            &self.token_secret,
+            self.access_token_ttl_secs,
+            Some(session.id),
+        )?;
 
         Ok(LoginResponse {
             user_id: user.id,
@@ -453,11 +468,12 @@ impl<S: Store> AuthService<S> {
             return Err(DomainError::Unauthenticated);
         }
 
-        let access_token = create_access_token(
+        let access_token = create_session_access_token(
             user.id,
             &user.username,
             &self.token_secret,
             self.access_token_ttl_secs,
+            Some(new_session.id),
         )?;
 
         Ok(RefreshTokenResponse {

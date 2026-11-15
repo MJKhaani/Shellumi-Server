@@ -62,3 +62,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Comprehensive migration strategy for upgrading legacy client AES-256-GCM + PBKDF2 local/Drive snapshots to versioned envelopes and UUID identifiers.
   - Authored ADR `docs/adr/0007-m6-self-hosting-and-client-compatibility.md` formalizing client provider boundaries, zero-knowledge constraints, and CAS conflict semantics.
   - Synchronized and updated documentation deliverables across Architecture, Key Management, Threat Model, Testing, Releases, and Roadmap.
+
+- Experimental server WebSocket endpoint for advisory team vault change hints;
+  clients must reconcile via REST. WebSocket tokens are session-bound and logout
+  closes the user’s connections. Client integration remains outstanding.
+
+- Added an authenticated, bounded long-poll fallback for volatile team-vault hints.

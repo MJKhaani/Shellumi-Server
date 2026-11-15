@@ -737,3 +737,7 @@ The first production candidate is acceptable only when:
 - Every change and verification is recorded and current documentation reflects implemented vs planned status.
 
 **Implementation instruction to the coding agent:** Start with M0, inspect the current client source at the pinned commit, write the first `docs/PROGRESS.md` planned entry, implement a runnable minimal server with tests, run the tests, record the exact results, then proceed milestone by milestone. Do not skip test, security, migration or documentation work to make a feature appear finished.
+
+Implementation note: `/api/v1/sync/events` currently provides experimental,
+process-local team vault hints. Delivery is not durable; client integration remains outstanding. See
+`docs/API.md` and `docs/security/THREAT_MODEL.md` for current behavior.

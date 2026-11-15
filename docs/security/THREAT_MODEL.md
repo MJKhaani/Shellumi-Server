@@ -57,3 +57,12 @@ Shellumi Server is an **untrusted-for-plaintext** synchronization, key-envelope 
 - **Rate Limiting:** Sliding-window per-IP rate limiter (default: 10 req/min) on sensitive unauthenticated endpoints (`/api/v1/auth/login`, `/api/v1/bootstrap`, `/api/v1/invites/accept`).
 - **Access Token Lifetime:** 15 minutes (900 seconds).
 - **Refresh Token Lifetime:** 30 days (2,592,000 seconds) with atomic single-use rotation and theft detection.
+
+Experimental sync WebSocket hints disclose vault identifiers and sequence numbers
+only after a current membership check, and require a bearer token and an active
+owned device. WebSocket connections require a session-bound bearer token; logout
+signals sockets for that user to close and revoked sessions cannot reconnect. The process-local channel is
+volatile and cannot guarantee event delivery or cross-process propagation.
+
+Long polling uses the same session, device and vault checks as WebSocket delivery,
+a bounded connection pool and a 20-second timeout. Hints remain process-local.

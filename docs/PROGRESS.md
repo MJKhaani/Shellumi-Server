@@ -2,7 +2,202 @@
 
 This journal records every increment, decision, test execution, and verification evidence in append-only chronological order.
 
+## 2026-11-15T00:37:44Z — TASK-010 — Client-ready sync notification recovery
+- Status: planned
+- Baseline / commit: 40f3b4e plus uncommitted TASK-009 changes.
+- Objective and acceptance criteria: Add an authenticated bounded long-poll fallback, verify authorization and recovery, document the client contract, and run required checks.
+- Implementation / files changed: Planned server routing, tests, protocol and documentation updates.
+- Data migration or API compatibility: Additive endpoint; no migration planned.
+- Security / privacy review: Recheck session, device and vault access for every event, bound resources and signal overflow.
+- Tests added (file + test names): Planned long-poll success, timeout, unauthorized and isolation tests, plus reconnect and overflow tests.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): None yet.
+- Known limitations / failed attempts: Existing TASK-009 limitations apply.
+- Next precise step: Implement and test fallback and shared notification authorization.
+- Issue / PR / CI evidence: None.
+
+## 2026-11-15T00:38:50Z — TASK-010 — Long-poll fallback
+- Status: partial
+- Baseline / commit: 40f3b4e plus uncommitted TASK-009 and TASK-010 changes.
+- Objective and acceptance criteria: Add bounded authenticated long polling for advisory notifications and document recovery requirements.
+- Implementation / files changed: Added `/api/v1/sync/poll`, a 20-second timeout, session/device/membership checks, connection limit and overflow response. Updated OpenAPI, API, architecture, compatibility, project, roadmap, security, testing and changelog documentation.
+- Data migration or API compatibility: Additive endpoint; no schema migration. Polling is volatile and requires REST reconciliation between requests.
+- Security / privacy review: Session and device are checked before and during delivery; vault membership is checked before returning hints. Cross-tenant and backpressure tests are still required.
+- Tests added (file + test names): `sync_events.rs::poll_rejects_unauthenticated_requests`; `team_metadata_change_sends_hint` also verifies poll delivery.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): On macOS `cargo test --locked -p shellumi-server --test sync_events --offline` with loopback access passed 3/3; `cargo fmt --all -- --check` and `cargo clippy --locked --workspace --all-targets --all-features --offline -- -D warnings` passed. YAML validation with `python3 -c 'import yaml ...'` failed because PyYAML is unavailable. Workspace tests and build started; results pending.
+- Known limitations / failed attempts: Timeout, isolation, reconnect and backpressure paths lack required tests; multi-process fanout and client implementation remain absent.
+- Next precise step: Finish workspace verification, validate OpenAPI, and add authorization and recovery tests.
+- Issue / PR / CI evidence: None.
+
+## 2026-11-15T00:39:24Z — TASK-010 — Local verification
+- Status: partial
+- Baseline / commit: 40f3b4e plus uncommitted TASK-009 and TASK-010 changes.
+- Objective and acceptance criteria: Record workspace and OpenAPI validation results.
+- Implementation / files changed: No additional implementation changes.
+- Data migration or API compatibility: No changes beyond the preceding entry.
+- Security / privacy review: Isolation, timeout, reconnect and backpressure coverage remain outstanding.
+- Tests added (file + test names): None beyond preceding entry.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): On macOS `cargo test --locked --workspace --all-features --offline` with loopback access passed 79 tests, 0 failed, 0 ignored; `cargo test --locked --doc --workspace --offline` passed; `cargo build --locked --workspace --all-features --offline` passed. Ruby `YAML.load_file` parsed OpenAPI and verified the poll security scheme. CI and cargo audit not run.
+- Known limitations / failed attempts: Required isolation, reconnect, timeout and backpressure tests remain incomplete; poll hints are volatile and process-local.
+- Next precise step: Add multi-user authorization and recovery tests before treating the client contract as fully verified.
+- Issue / PR / CI evidence: None.
+
+## 2026-11-14T10:29:02Z — TASK-009 — Shared vault sync notifications
+- Status: partial
+- Baseline / commit: 40f3b4e
+- Objective and acceptance criteria: Add authenticated WebSocket notifications for shared vault changes while preserving REST synchronization, authorization, and local-first operation; cover reconnect, revocation, isolation, and backpressure.
+- Implementation / files changed: Initial inspection only; no runtime implementation yet.
+- Data migration or API compatibility: No changes yet; a versioned notification contract and client compatibility review are required.
+- Security / privacy review: Delivery must recheck access and device/session validity, avoid exposing cross-vault metadata, and handle missed events without implying durable delivery.
+- Tests added (file + test names): None yet.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): No tests executed; initial inspection used `rg --files`, `git status --short`, and targeted source reads on macOS.
+- Known limitations / failed attempts: Implementation, client review, tests, documentation and CI verification remain outstanding.
+- Next precise step: Inspect the client contract and server authorization and commit paths, then design and implement the notification lifecycle with tests.
+- Issue / PR / CI evidence: None.
+
+## 2026-11-14T11:22:30Z — TASK-009 — Loopback authentication test result
+- Status: partial
+- Baseline / commit: 40f3b4e plus uncommitted TASK-009 changes.
+- Objective and acceptance criteria: Verify unauthenticated WebSocket upgrade rejection over a real loopback connection.
+- Implementation / files changed: No additional runtime changes.
+- Data migration or API compatibility: No changes.
+- Security / privacy review: Unauthenticated upgrade rejection is covered; authorized delivery and revocation are not yet covered.
+- Tests added (file + test names): `sync_events.rs::websocket_rejects_unauthenticated_upgrade`.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): `cargo test --locked -p shellumi-server --test sync_events --offline` with loopback access on macOS passed 1/1. Full required gates and CI not run.
+- Known limitations / failed attempts: See preceding TASK-009 entries; complete delivery and lifecycle remain outstanding.
+- Next precise step: Add real-network delivery and authorization tests and finish missing event and revocation behavior.
+- Issue / PR / CI evidence: None.
+
+## 2026-11-14T11:40:05Z — TASK-009 — Real WebSocket delivery test
+- Status: partial
+- Baseline / commit: 40f3b4e plus uncommitted TASK-009 changes.
+- Objective and acceptance criteria: Verify an authenticated team vault metadata change produces a notification over a real network connection.
+- Implementation / files changed: Added `team_metadata_change_sends_hint` to `crates/shellumi-server/tests/sync_events.rs`.
+- Data migration or API compatibility: No changes.
+- Security / privacy review: Authentication rejection and successful delivery tested; isolation, revocation and recovery still need coverage.
+- Tests added (file + test names): `websocket_rejects_unauthenticated_upgrade`, `team_metadata_change_sends_hint`.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): On macOS, `cargo test --locked -p shellumi-server --test sync_events --offline` with loopback access passed 2/2; `cargo fmt --all -- --check` passed. Workspace test and clippy started; results pending.
+- Known limitations / failed attempts: Session-bound logout revocation, complete event coverage, client integration, long-poll and the full mandatory test matrix remain outstanding.
+- Next precise step: Finish workspace checks and add isolation, revocation, reconnect and backpressure tests and missing behavior.
+- Issue / PR / CI evidence: None.
+
+## 2026-11-14T11:41:00Z — TASK-009 — Workspace checks
+- Status: partial
+- Baseline / commit: 40f3b4e plus uncommitted TASK-009 changes.
+- Objective and acceptance criteria: Run workspace quality checks and record actual results.
+- Implementation / files changed: Updated `docs/development/TESTING.md` to describe the real-network test and its loopback requirement.
+- Data migration or API compatibility: No changes.
+- Security / privacy review: No changes; the gaps above remain.
+- Tests added (file + test names): None beyond the preceding entry.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): On macOS `cargo fmt --all -- --check` and `cargo clippy --locked --workspace --all-targets --all-features --offline -- -D warnings` passed. `cargo test --locked --workspace --all-features --offline` failed in the sandbox because both WebSocket tests could not bind localhost; an elevated rerun was started. Earlier individual tests passed 2/2 with loopback access.
+- Known limitations / failed attempts: Full test result pending; session-bound revocation, full mutation coverage, client integration and required security tests remain incomplete.
+- Next precise step: Inspect the elevated test result and complete the missing behavior and tests.
+- Issue / PR / CI evidence: None.
+
+## 2026-11-14T11:42:00Z — TASK-009 — Workspace test result
+- Status: partial
+- Baseline / commit: 40f3b4e plus uncommitted TASK-009 changes.
+- Objective and acceptance criteria: Rerun workspace tests with loopback access.
+- Implementation / files changed: No runtime changes.
+- Data migration or API compatibility: No changes.
+- Security / privacy review: Existing notification security gaps remain.
+- Tests added (file + test names): None beyond preceding entries.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): On macOS, `cargo test --locked --workspace --all-features --offline` with loopback access passed 78 tests, 0 failed, 0 ignored. CI not run.
+- Known limitations / failed attempts: Previous sandboxed run failed to bind localhost; feature and security coverage remain incomplete as recorded above.
+- Next precise step: Finish session revocation, mutation coverage, client integration and missing tests, then run remaining gates.
+- Issue / PR / CI evidence: None.
+
+## 2026-11-14T19:33:47Z — TASK-009 — Session binding and deletion hints
+- Status: partial
+- Baseline / commit: 40f3b4e plus uncommitted TASK-009 changes.
+- Objective and acceptance criteria: Bind WebSocket authentication to an active session; close sockets on logout and notify authorized members of vault deletion.
+- Implementation / files changed: Added optional session identifier to access token claims and issued bound tokens from bootstrap, login and refresh; WebSocket validates the session and device at connection and delivery, logout signals sockets, and deletion produces an authorized hint. Updated API, architecture, compatibility, security, roadmap, project and changelog documentation.
+- Data migration or API compatibility: No schema change. Existing tokens remain accepted by REST but WebSocket requires a newly issued session-bound token.
+- Security / privacy review: Revoked session cannot reconnect; logout closes all sockets of the user, including other active sessions. Membership and device are checked on delivery. Volatile single-process delivery and other recorded limitations remain.
+- Tests added (file + test names): `sync_events.rs::team_metadata_change_sends_hint` now covers deletion hint, logout closure and rejected reconnect.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): On macOS, `cargo test --locked -p shellumi-server --test sync_events --offline` with loopback access passed 2/2, `cargo fmt --all -- --check` passed, and `cargo clippy --locked --workspace --all-targets --all-features --offline -- -D warnings` passed. `cargo audit` failed because cargo-audit is not installed. Full workspace tests, doc tests and build started; results pending.
+- Known limitations / failed attempts: Client integration, long-poll fallback, isolation, backpressure, reconnect and comprehensive mutation tests remain incomplete. No CI evidence.
+- Next precise step: Record running check outcomes, complete the missing tests and fallback, and verify client compatibility.
+- Issue / PR / CI evidence: None.
+
+## 2026-11-14T19:34:10Z — TASK-009 — Verification results
+- Status: partial
+- Baseline / commit: 40f3b4e plus uncommitted TASK-009 changes.
+- Objective and acceptance criteria: Record completed local checks.
+- Implementation / files changed: Updated `docs/development/TESTING.md` with the logout and deletion test scope.
+- Data migration or API compatibility: No changes beyond the preceding entry.
+- Security / privacy review: The remaining isolation, recovery and backpressure test gaps are unchanged.
+- Tests added (file + test names): None beyond the preceding entry.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): On macOS `cargo test --locked --workspace --all-features --offline` with loopback access passed 78 tests, 0 failed, 0 ignored; `cargo test --locked --doc --workspace --offline` passed with 0 doctests; `cargo build --locked --workspace --all-features --offline` passed. `cargo audit` unavailable because cargo-audit is not installed; CI not run.
+- Known limitations / failed attempts: See preceding TASK-009 entries; client integration, long-poll fallback and required isolation and recovery tests remain incomplete.
+- Next precise step: Implement and test fallback and client behavior, then complete security and multi-client delivery tests.
+- Issue / PR / CI evidence: None.
+
+## 2026-11-14T10:31:00Z — TASK-009 — Authorization and commit inspection
+- Status: partial
+- Baseline / commit: 40f3b4e
+- Objective and acceptance criteria: Unchanged from the preceding TASK-009 entry.
+- Implementation / files changed: Inspected the REST commit handler, sync engine, vault access check, and access token claims; no runtime changes.
+- Data migration or API compatibility: No changes; the existing client sync models require further contract review.
+- Security / privacy review: Existing access tokens contain no session or device identifier, and logout revokes refresh sessions; a long-lived notification connection therefore cannot infer session revocation from token claims alone. Vault membership must be checked at delivery, not just connection time.
+- Tests added (file + test names): None.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): Source inspection with `rg` and `sed` on macOS; no test commands executed.
+- Known limitations / failed attempts: Notification implementation and security lifecycle remain incomplete.
+- Next precise step: Design session/device binding and revocation checks for the connection, then implement and test delivery and reconnect recovery.
+- Issue / PR / CI evidence: None.
+
 ---
+
+## 2026-11-14T10:49:44Z — TASK-009 — Notification contract inspection
+- Status: partial
+- Baseline / commit: 40f3b4e
+- Objective and acceptance criteria: Unchanged from the preceding TASK-009 entries.
+- Implementation / files changed: Inspected device and session repository interfaces, commit idempotency, and the existing project notification requirements; no runtime implementation.
+- Data migration or API compatibility: No changes. PROJECT.md requires sequence hints, authenticated pull, long-poll fallback, and membership and epoch revalidation.
+- Security / privacy review: Notification authorization must account for revocation and session binding; replayed idempotent commits can return cached responses and must not be treated as new mutations without deliberate duplicate-hint semantics.
+- Tests added (file + test names): None.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): `cargo metadata --locked --offline --no-deps --format-version 1` on macOS succeeded; no tests run.
+- Known limitations / failed attempts: WebSocket endpoint, notification dispatch, client integration and required tests and documentation remain outstanding.
+- Next precise step: Implement a revocable authenticated connection design and bounded event delivery; add integration tests before claiming support.
+- Issue / PR / CI evidence: None.
+
+## 2026-11-14T10:56:12Z — TASK-009 — WebSocket dependency preparation
+- Status: partial
+- Baseline / commit: 40f3b4e
+- Objective and acceptance criteria: Unchanged from the preceding TASK-009 entries.
+- Implementation / files changed: Temporarily enabled Axum's WebSocket feature to resolve dependencies; reverted the manifest and lockfile because the endpoint is not implemented.
+- Data migration or API compatibility: No changes.
+- Security / privacy review: Connection authentication, authorization on delivery, and reconnect recovery remain to be implemented.
+- Tests added (file + test names): None.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): `cargo check --workspace --offline` failed initially because WebSocket dependencies were not cached; `cargo fetch --locked` downloaded them after network access was granted. No feature tests run.
+- Known limitations / failed attempts: The feature is still unimplemented; no claims of WebSocket support are made.
+- Next precise step: Enable Axum WebSocket support, implement the endpoint and notifications, and verify authorization, reconnect, and failure paths.
+- Issue / PR / CI evidence: None.
+
+## 2026-11-14T11:13:02Z — TASK-009 — Experimental WebSocket endpoint
+- Status: partial
+- Baseline / commit: 40f3b4e
+- Objective and acceptance criteria: Add team vault hints while retaining REST as the source of truth; comprehensive delivery and revocation tests remain required.
+- Implementation / files changed: Enabled Axum WebSocket support, added a bounded process-local notification channel and `/api/v1/sync/events`, connected commit, metadata, member and key epoch handlers, and updated project, API, architecture, compatibility, threat model, roadmap, testing and changelog documentation.
+- Data migration or API compatibility: Additive endpoint; no migration or REST payload change.
+- Security / privacy review: Checks access token, owned active device, and current vault membership; bearer tokens are not session-bound and logout does not immediately invalidate connections. Notification delivery is best-effort and process-local.
+- Tests added (file + test names): `crates/shellumi-server/tests/sync_events.rs`: `websocket_rejects_unauthenticated_upgrade`.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): `cargo check --locked --workspace --offline` passed on macOS. `cargo test --locked -p shellumi-server --test sync_events --offline` started; result pending at time of entry. Full required gates and CI not run.
+- Known limitations / failed attempts: No complete delivery, revocation, reconnect, isolation, or backpressure tests; no client implementation, long-poll fallback, or multi-process fanout. Not every shared vault operation emits a hint.
+- Next precise step: Complete real-network delivery tests and event coverage, address session-bound revocation, then run all required gates.
+- Issue / PR / CI evidence: None.
+
+## 2026-11-14T11:21:44Z — TASK-009 — Network test and mutation coverage
+- Status: partial
+- Baseline / commit: 40f3b4e plus uncommitted TASK-009 changes.
+- Objective and acceptance criteria: Exercise a real WebSocket upgrade and extend notifications to invitation acceptance and key-envelope publication.
+- Implementation / files changed: `server.rs` now sends hints after accepting an invitation and publishing key envelopes; `sync_events.rs` uses a real loopback HTTP server for the unauthenticated upgrade test.
+- Data migration or API compatibility: No new migration or wire changes beyond the previously recorded endpoint.
+- Security / privacy review: Existing session binding and event-coverage limitations remain.
+- Tests added (file + test names): Revised `websocket_rejects_unauthenticated_upgrade`.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): On macOS, the earlier in-process `cargo test --locked -p shellumi-server --test sync_events --offline` failed 0/1 because it received 426 instead of 401; the first real-network run failed 0/1 because sandbox denied binding localhost. An elevated rerun is in progress. A temporary compilation failure from an incorrectly placed notification was corrected.
+- Known limitations / failed attempts: Delivery, isolation, revocation, reconnection, backpressure, full gates and client integration remain unverified.
+- Next precise step: Obtain test result, add end-to-end delivery and authorization coverage, and implement remaining lifecycle and mutation paths.
+- Issue / PR / CI evidence: None.
 
 ## 2026-11-11T08:10:00Z — TASK-001 — M0: Repository foundations, workspace skeleton, and configuration parser
 - Status: complete
@@ -551,3 +746,42 @@ This journal records every increment, decision, test execution, and verification
   - Commit and push Dockerfile fix to trigger clean green CI run on `main`.
 - Issue / PR / CI evidence:
   - Run ID `43002473434` confirmed `Code Quality & Unit Tests` passed in 41s. Container build builder image upgraded.
+
+## 2026-11-15T00:43:02Z — TASK-011 — Documentation refresh and publication
+- Status: planned
+- Baseline / commit: 40f3b4e plus uncommitted TASK-009 and TASK-010 work.
+- Objective and acceptance criteria: Refresh the README, align notification and operational documentation with actual behavior and limitations, validate documentation and applicable quality gates, and commit and push authorized changes when gates permit.
+- Implementation / files changed: Planned README and notification-related documentation updates.
+- Data migration or API compatibility: Documentation only in this increment; pending notification code remains an additive API change.
+- Security / privacy review: Avoid claiming PostgreSQL persistence, complete authorization testing, or production readiness without evidence.
+- Tests added (file + test names): Documentation link and example validation; pending code requires workspace checks.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): None yet.
+- Known limitations / failed attempts: Notification work has outstanding security tests; cargo-audit was unavailable in the preceding task.
+- Next precise step: Review runtime behavior and write accurate documentation.
+- Issue / PR / CI evidence: None.
+
+## 2026-11-15T00:44:28Z — TASK-011 — README and documentation refresh
+- Status: in_progress
+- Baseline / commit: 40f3b4e plus uncommitted TASK-009 and TASK-010 work.
+- Objective and acceptance criteria: Present a modern README and align documentation with the actual runtime and notification contract.
+- Implementation / files changed: Rewrote README; clarified current in-memory persistence in architecture, deployment, configuration and backup documentation; marked compatibility experimental; documented both notification endpoints in OpenAPI.
+- Data migration or API compatibility: Documentation only for this milestone. Existing uncommitted notification endpoints and session-bound token changes remain as recorded in TASK-009 and TASK-010.
+- Security / privacy review: README explicitly records incomplete isolation and recovery tests and avoids claiming persistent or production-ready behavior.
+- Tests added (file + test names): None; checked README and affected documentation local links and parsed OpenAPI using Ruby YAML.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): On macOS, `cargo fmt --all -- --check`, `cargo clippy --locked --workspace --all-targets --all-features --offline -- -D warnings`, `cargo build --locked --workspace --all-features --offline`, and `cargo test --locked --workspace --all-features --offline` with loopback access passed (79 tests, 0 failed, 0 ignored); `cargo test --locked --doc --workspace --offline` passed. `git diff --check` passed. `cargo audit` unavailable; temporary cargo-audit installation in progress.
+- Known limitations / failed attempts: Notification isolation, timeout, reconnect and backpressure tests remain incomplete; CI not run. Dependency audit pending.
+- Next precise step: Run the dependency audit, record its result and decide whether repository quality rules allow publication.
+- Issue / PR / CI evidence: None.
+
+## 2026-11-15T00:46:13Z — TASK-011 — Review branch preparation
+- Status: partial
+- Baseline / commit: 40f3b4e; review branch `codex/sync-notifications-docs`.
+- Objective and acceptance criteria: Prepare documented notification work for review and push without bypassing the main-branch review requirement.
+- Implementation / files changed: README and related guides refreshed; existing notification implementation and tests staged together for review.
+- Data migration or API compatibility: Additive notification endpoints and session-bound WebSocket token requirement as described in the compatibility guide; no database migration.
+- Security / privacy review: Code remains experimental; required cross-tenant isolation, timeout, reconnect, and backpressure tests are outstanding.
+- Tests added (file + test names): Notification tests recorded in TASK-009 and TASK-010; README and related local links validated.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): Local formatting, Clippy, build, workspace tests (79 passed), doc tests, OpenAPI YAML parse and `git diff --check` passed on macOS. `cargo audit` not available by default; temporary installation is in progress. CI not run.
+- Known limitations / failed attempts: No CI or completed dependency audit; in-memory storage is non-durable and client integration is unverified. Main branch must not receive the changes without required review and gates.
+- Next precise step: Complete audit and missing security and recovery tests; review CI before merging.
+- Issue / PR / CI evidence: None.

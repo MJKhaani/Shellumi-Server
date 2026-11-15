@@ -69,3 +69,17 @@ cargo test --test ops_and_resilience -- --nocapture
 # Tear down test database
 docker compose -f deploy/test/compose.yml down -v
 ```
+
+The sync event endpoint has an unauthenticated-upgrade regression test in
+`crates/shellumi-server/tests/sync_events.rs`. Real-network delivery, revocation,
+reconnection, isolation, and backpressure coverage remains to be added.
+
+`sync_events.rs::team_metadata_change_sends_hint` exercises a real loopback
+WebSocket upgrade and metadata hint. Both WebSocket tests need permission to bind
+localhost; a sandbox that denies socket creation cannot run them.
+
+The loopback delivery test also checks a vault deletion hint, socket closure on
+logout, and rejection of a reconnect using the revoked session token.
+
+The notification integration test exercises a long-poll hint and unauthenticated
+long-poll rejection; timeout, overflow and cross-tenant isolation remain untested.

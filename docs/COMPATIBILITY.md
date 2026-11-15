@@ -8,7 +8,7 @@ This document tracks version compatibility, cryptographic suites, data type mapp
 
 | Wire Protocol Version | Server Release | Minimum Client Version | Supported E2EE Suites | Status |
 | :---: | :---: | :---: | :---: | :---: |
-| **v1** | `0.1.0` | `0.0.7-alpha` | `x25519_hkdf_aes256gcm`, `argon2id_aes256gcm_legacy` | **Current Stable** |
+| **v1** | `0.1.0` | `0.0.7-alpha` | `x25519_hkdf_aes256gcm`, `argon2id_aes256gcm_legacy` | **Experimental; client integration not verified** |
 
 ---
 
@@ -124,3 +124,14 @@ For existing Shellumi clients upgrading from legacy AES-256-GCM PBKDF2 local/Dri
 4. **Envelope Ingestion:** Existing records are sealed into versioned `EncryptedEnvelope` structures under key epoch 1.
 5. **Initial Batch Commit:** The client submits records via `POST /api/v1/vaults/{id}/commits` with `expected_revision = 0`.
 6. **Integrity Verification:** The client performs a read-back check (`GET /api/v1/vaults/{id}/changes?since=0`), verifies digests and counts, and commits the active provider state. Original Google Drive data remains untouched.
+
+The experimental `/api/v1/sync/events` WebSocket is additive and does not change
+REST payloads or Google Drive synchronization. Existing clients can continue to
+poll; Shellumi client WebSocket support has not been implemented or verified.
+
+WebSocket connections require a newly issued session-bound access token; refresh or
+log in again if using an older token. Existing REST endpoints continue to accept
+the existing token format.
+
+The additive `/api/v1/sync/poll` endpoint supplies volatile hints to clients without
+WebSocket support; clients must reconcile via REST across polling gaps.

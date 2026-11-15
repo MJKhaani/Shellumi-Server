@@ -8,6 +8,69 @@ info:
     url: https://opensource.org/licenses/MIT
 
 paths:
+  /api/v1/sync/events:
+    get:
+      summary: Upgrade to the advisory sync notification WebSocket
+      description: >-
+        Requires a session-bound bearer token and active device. Events are
+        volatile; use the REST change feed to reconcile after reconnecting.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: X-Device-Id
+          in: header
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '101':
+          description: WebSocket upgrade accepted
+        '401':
+          description: Invalid session or device
+        '429':
+          description: Connection limit reached
+  /api/v1/sync/poll:
+    get:
+      summary: Wait for an advisory team-vault sync hint
+      description: >-
+        Requires a session-bound bearer token and active device. Hints are volatile;
+        reconcile via REST before and after polling gaps.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: X-Device-Id
+          in: header
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Authorized vault_changed or vault_deleted hint
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [type, vault_id]
+                properties:
+                  type:
+                    type: string
+                    enum: [vault_changed, vault_deleted]
+                  vault_id:
+                    type: string
+                    format: uuid
+                  latest_sequence:
+                    type: integer
+                    minimum: 0
+        '204':
+          description: No hint within 20 seconds
+        '401':
+          description: Invalid session or device
+        '409':
+          description: Receiver lagged; REST reconciliation required
+        '429':
+          description: Connection limit reached
   /health/live:
     get:
       summary: Liveness probe

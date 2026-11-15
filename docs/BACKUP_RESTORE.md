@@ -1,5 +1,7 @@
 # Shellumi Server — Backup, Verification & Disaster Recovery Guide
 
+> **Current limitation:** The running service uses in-memory storage and does not persist its state in PostgreSQL. The PostgreSQL backup procedures below do not back up the server’s in-memory state.
+
 > **Zero-Knowledge Invariant:** All vault records, item payloads, and sync mutations stored on Shellumi Server are client-encrypted envelopes (`EncryptedEnvelope`) with client-wrapped Data Encryption Keys (`wrapped_dek`). Database backups contain **only opaque ciphertext**. Server-side database backups **never** contain plaintext credentials, unencrypted vault keys, or SSH private keys.
 
 ---

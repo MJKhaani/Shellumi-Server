@@ -1,5 +1,7 @@
 # Shellumi Server — Architecture & System Design
 
+> **Current implementation:** The runtime uses `InMemoryStore`, not PostgreSQL. The diagram below describes the target architecture; data is lost on restart. Notification isolation and recovery tests are incomplete.
+
 ## 1. Architectural Principles
 
 1. **Self-Hosted First:** Headless, single-binary Rust service, easily deployed via Docker Compose or native systemd services without third-party cloud requirements.
@@ -47,12 +49,12 @@
 |  +---------------------------------------------------------------------------+  |
 |                                                                                 |
 |  +---------------------------------------------------------------------------+  |
-|  |               Repository Storage Traits (Store / SQLx Engine)             |  |
+|  |               Repository Storage Traits (Store / planned SQLx)             |  |
 |  +---------------------------------------------------------------------------+  |
 |                                         |                                       |
 |                                         v                                       |
 |  +---------------------------------------------------------------------------+  |
-|  |                         PostgreSQL Persistence                            |  |
+|  |                         Planned PostgreSQL Persistence                            |  |
 |  |  Forward-only migrations: 001(core), 002(sync), 003(teams), 004(collab)    |  |
 |  +---------------------------------------------------------------------------+  |
 +---------------------------------------------------------------------------------+
@@ -73,3 +75,14 @@
 - **Server Zone (Untrusted for Plaintext):**
   - Authenticates users and devices, authorizes role capabilities, transactionally coordinates revision numbers, and records immutable audit hashes.
   - Blind ciphertext forwarder: even in the event of an arbitrary database dump, the attacker obtains zero plaintext credentials, zero SSH private keys, and zero unencrypted terminal data.
+
+### Experimental sync notifications
+
+The HTTP process maintains a bounded, process-local broadcast channel for team
+vault change hints. Each connection rechecks device status and vault membership
+before forwarding a hint; the change feed remains authoritative. The channel is
+not durable or shared across server processes. Disconnect or receiver lag requires
+a full client reconciliation. WebSocket authentication requires a session-bound
+access token; logout signals the user’s sockets to close, while session validity,
+token expiry, and device revocation are checked during delivery and heartbeat. The bounded long-poll fallback uses the same process-local broadcast channel;
+it has gaps between requests and requires REST reconciliation.
