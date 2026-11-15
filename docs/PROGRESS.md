@@ -785,3 +785,16 @@ This journal records every increment, decision, test execution, and verification
 - Known limitations / failed attempts: No CI or completed dependency audit; in-memory storage is non-durable and client integration is unverified. Main branch must not receive the changes without required review and gates.
 - Next precise step: Complete audit and missing security and recovery tests; review CI before merging.
 - Issue / PR / CI evidence: None.
+
+## 2026-11-15T00:49:02Z — TASK-011 — Review branch publication
+- Status: partial
+- Baseline / commit: `b32ba20` on `codex/sync-notifications-docs`.
+- Objective and acceptance criteria: Publish the documented work for review without bypassing required main-branch gates.
+- Implementation / files changed: Pushed the review branch; no further runtime changes.
+- Data migration or API compatibility: No additional changes.
+- Security / privacy review: Cross-tenant isolation and recovery coverage remains incomplete; do not merge without the required review and checks.
+- Tests added (file + test names): None beyond earlier entries.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): Previous local checks passed as recorded above. `cargo audit` was unavailable; `cargo install cargo-audit --locked --root /private/tmp/shellumi-audit` was interrupted while compiling after several minutes, so no dependency audit was run. CI status not checked.
+- Known limitations / failed attempts: Dependency audit and CI remain unverified; feature and persistence limitations remain documented.
+- Next precise step: Install and run cargo-audit and complete the missing notification security tests before merge.
+- Issue / PR / CI evidence: Review branch `https://github.com/MJKhaani/Shellumi-Server/tree/codex/sync-notifications-docs`; no PR or CI evidence.
