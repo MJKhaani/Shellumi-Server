@@ -282,10 +282,10 @@ fn test_cli_backup_verification_on_valid_and_corrupt_dumps() {
         .contains("CRITICAL SECURITY VIOLATION"));
 }
 
-#[test]
-fn test_cli_migration_status_reports_migrations() {
+#[tokio::test]
+async fn test_cli_migration_status_reports_migrations() {
     let config = test_config();
-    let report = migrate::get_migration_status(&config);
+    let report = migrate::get_migration_status(&config).await;
     assert!(!report.available_migrations.is_empty());
     assert!(report
         .available_migrations

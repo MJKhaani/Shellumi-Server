@@ -1,6 +1,7 @@
 //! Database schema migration utilities (`shellumi-server migrate status` and `run`).
 
 use crate::config::ServerConfig;
+use sqlx::Row;
 use std::fs;
 use std::path::PathBuf;
 
@@ -9,12 +10,14 @@ use std::path::PathBuf;
 pub struct MigrationStatusReport {
     pub migrations_dir: PathBuf,
     pub available_migrations: Vec<String>,
+    pub applied_migrations: Vec<String>,
+    pub pending_migrations: Vec<String>,
     pub database_configured: bool,
     pub database_url_redacted: Option<String>,
 }
 
-/// Finds and lists available forward-only SQL migration files.
-pub fn get_migration_status(config: &ServerConfig) -> MigrationStatusReport {
+/// Finds and lists available forward-only SQL migration files and applied DB versions.
+pub async fn get_migration_status(config: &ServerConfig) -> MigrationStatusReport {
     // Look for migrations in relative paths or working directory
     let search_paths = [
         PathBuf::from("migrations"),
@@ -42,6 +45,9 @@ pub fn get_migration_status(config: &ServerConfig) -> MigrationStatusReport {
 
     available_migrations.sort();
 
+    let mut applied_migrations = Vec::new();
+    let mut pending_migrations = available_migrations.clone();
+
     let database_configured = config.database_url.is_some();
     let database_url_redacted = config.database_url.as_ref().map(|url| {
         // Redact password in URI if present
@@ -53,9 +59,47 @@ pub fn get_migration_status(config: &ServerConfig) -> MigrationStatusReport {
         url.clone()
     });
 
+    if let Some(ref db_url) = config.database_url {
+        if let Ok(pool) = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_secs(2))
+            .connect(db_url)
+            .await
+        {
+            if let Ok(rows) = sqlx::query(
+                "SELECT version, description, success, checksum FROM _sqlx_migrations ORDER BY version ASC",
+            )
+            .fetch_all(&pool)
+            .await
+            {
+                applied_migrations.clear();
+                pending_migrations.clear();
+                let applied_versions: std::collections::HashSet<i64> = rows
+                    .into_iter()
+                    .map(|r| {
+                        let ver: i64 = r.get("version");
+                        let desc: String = r.get("description");
+                        applied_migrations.push(format!("{}_{}", ver, desc));
+                        ver
+                    })
+                    .collect();
+
+                for m in &available_migrations {
+                    let version_part = m.split('_').next().and_then(|s| s.parse::<i64>().ok());
+                    match version_part {
+                        Some(v) if applied_versions.contains(&v) => {}
+                        _ => pending_migrations.push(m.clone()),
+                    }
+                }
+            }
+        }
+    }
+
     MigrationStatusReport {
         migrations_dir,
         available_migrations,
+        applied_migrations,
+        pending_migrations,
         database_configured,
         database_url_redacted,
     }
@@ -81,7 +125,20 @@ pub fn print_migration_status(report: &MigrationStatusReport) {
                 .as_deref()
                 .unwrap_or("configured")
         );
-        println!("Status: Ready to execute forward migrations.");
+        println!(
+            "Applied database migrations: {}",
+            report.applied_migrations.len()
+        );
+        for m in &report.applied_migrations {
+            println!("  [x] {m}");
+        }
+        println!(
+            "Pending database migrations: {}",
+            report.pending_migrations.len()
+        );
+        for m in &report.pending_migrations {
+            println!("  [ ] {m}");
+        }
     } else {
         println!("Target Database: Ephemeral In-Memory Storage");
         println!("Status: In-memory store automatically initializes runtime schemas.");
@@ -123,10 +180,10 @@ mod tests {
         assert!(res.is_ok());
     }
 
-    #[test]
-    fn test_migration_status_reports_migrations() {
+    #[tokio::test]
+    async fn test_migration_status_reports_migrations() {
         let config = ServerConfig::default();
-        let report = get_migration_status(&config);
+        let report = get_migration_status(&config).await;
         assert!(!report.database_configured);
         // Migrations should find the repo migrations dir
         assert!(!report.available_migrations.is_empty());

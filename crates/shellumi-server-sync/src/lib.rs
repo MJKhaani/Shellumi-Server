@@ -2,16 +2,14 @@
 
 use sha2::{Digest, Sha256};
 use shellumi_server_crypto::{
-    canonical_mutation_preimage, canonical_mutation_preimage_bytes, compute_ciphertext_digest,
-    validate_envelope, verify_device_signature,
+    canonical_mutation_preimage_bytes, compute_ciphertext_digest, validate_envelope,
+    verify_device_signature,
 };
-use shellumi_server_domain::{
-    ChangeLogEntry, DomainError, Record, Vault, VaultMember, VaultRole, VaultType,
-};
+use shellumi_server_domain::{DomainError, Vault, VaultMember, VaultRole, VaultType};
 use shellumi_server_protocol::{
     ChangeFeedResponse, CommitBatchRequest, CommitBatchResponse, CreateVaultRequest,
-    EncryptedEnvelope, MutationAck, SnapshotResponse, SyncChangeItem, UpdateVaultRequest,
-    VaultListResponse, VaultResponse, CURRENT_PROTOCOL_VERSION,
+    EncryptedEnvelope, SnapshotResponse, SyncChangeItem, UpdateVaultRequest, VaultListResponse,
+    VaultResponse, CURRENT_PROTOCOL_VERSION,
 };
 use shellumi_server_store::Store;
 use std::sync::Arc;
@@ -290,30 +288,13 @@ impl<S: Store> SyncEngine<S> {
                 &digest,
             );
 
-            // Verify using binary preimage, falling back to legacy UTF-8 string preimage
-            let sig_res = verify_device_signature(
+            // Verify using binary canonical preimage exclusively
+            verify_device_signature(
                 &device.signing_public_key,
                 &preimage_bytes,
                 &mutation.device_signature,
-            );
-            if sig_res.is_err() {
-                let legacy_preimage = canonical_mutation_preimage(
-                    req.vault_id,
-                    &mutation.object_id,
-                    &mutation.entity_type,
-                    mutation.expected_revision,
-                    mutation.deleted,
-                    mutation.key_epoch,
-                    mutation.device_counter,
-                    &digest,
-                );
-                verify_device_signature(
-                    &device.signing_public_key,
-                    legacy_preimage.as_bytes(),
-                    &mutation.device_signature,
-                )
-                .map_err(|e| DomainError::InvalidSignature(e.to_string()))?;
-            }
+            )
+            .map_err(|e| DomainError::InvalidSignature(e.to_string()))?;
 
             if mutation.deleted {
                 if mutation.encrypted_envelope.is_some() {
@@ -332,120 +313,13 @@ impl<S: Store> SyncEngine<S> {
             }
         }
 
-        // Monotonic sequence allocation and CAS revision checks
-        let base_sequence = vault.server_sequence;
-        let now = chrono::Utc::now().timestamp();
-        let mut records_to_upsert = Vec::with_capacity(req.mutations.len());
-        let mut change_log_entries = Vec::with_capacity(req.mutations.len());
-        let mut applied_acks = Vec::with_capacity(req.mutations.len());
-
-        for (idx, mutation) in req.mutations.iter().enumerate() {
-            let mutation_seq = base_sequence + 1 + idx as u64;
-            let existing = self
-                .store
-                .find_record(req.vault_id, &mutation.object_id)
-                .await?;
-
-            let assigned_revision = match (mutation.expected_revision, &existing) {
-                (0, None) => 1,
-                (0, Some(rec)) => {
-                    if !rec.deleted {
-                        return Err(DomainError::RevisionConflict {
-                            object_id: mutation.object_id.clone(),
-                            expected: 0,
-                            actual: rec.current_revision,
-                        });
-                    }
-                    rec.current_revision + 1
-                }
-                (expected, None) => {
-                    return Err(DomainError::RevisionConflict {
-                        object_id: mutation.object_id.clone(),
-                        expected,
-                        actual: 0,
-                    });
-                }
-                (expected, Some(rec)) => {
-                    if rec.current_revision != expected {
-                        return Err(DomainError::RevisionConflict {
-                            object_id: mutation.object_id.clone(),
-                            expected,
-                            actual: rec.current_revision,
-                        });
-                    }
-                    expected + 1
-                }
-            };
-
-            let envelope_json = mutation
-                .encrypted_envelope
-                .as_ref()
-                .map(|e| serde_json::to_string(e).unwrap());
-            let digest = compute_ciphertext_digest(mutation.encrypted_envelope.as_ref());
-
-            let record = Record {
-                vault_id: req.vault_id,
-                object_id: mutation.object_id.clone(),
-                entity_type: mutation.entity_type.clone(),
-                current_revision: assigned_revision,
-                key_epoch: mutation.key_epoch,
-                author_device_id: device_id,
-                deleted: mutation.deleted,
-                encrypted_envelope: envelope_json.clone(),
-                ciphertext_digest: digest.clone(),
-                last_server_sequence: mutation_seq,
-                updated_at: now,
-            };
-
-            let entry = ChangeLogEntry {
-                vault_id: req.vault_id,
-                sequence: mutation_seq,
-                object_id: mutation.object_id.clone(),
-                entity_type: mutation.entity_type.clone(),
-                revision: assigned_revision,
-                deleted: mutation.deleted,
-                author_device_id: device_id,
-                encrypted_envelope: envelope_json,
-                ciphertext_digest: digest,
-                created_at: now,
-            };
-
-            records_to_upsert.push(record);
-            change_log_entries.push(entry);
-            applied_acks.push(MutationAck {
-                object_id: mutation.object_id.clone(),
-                assigned_revision,
-                server_sequence: mutation_seq,
-                deleted: mutation.deleted,
-            });
-        }
-
-        let final_sequence = base_sequence + req.mutations.len() as u64;
-        let next_cursor = format!("seq:{}", final_sequence);
-        let response = CommitBatchResponse {
-            vault_id: req.vault_id,
-            commit_sequence: final_sequence,
-            next_cursor,
-            applied: applied_acks,
-        };
-
-        let response_payload =
-            serde_json::to_string(&response).map_err(|e| DomainError::Internal(e.to_string()))?;
+        let mutations_bytes =
+            serde_json::to_vec(&req.mutations).map_err(|e| DomainError::Internal(e.to_string()))?;
+        let request_hash = hex::encode(Sha256::digest(&mutations_bytes));
 
         self.store
-            .apply_commit_batch(
-                req.vault_id,
-                device_id,
-                &req.idempotency_key,
-                &request_hash,
-                &response_payload,
-                &records_to_upsert,
-                &change_log_entries,
-                final_sequence,
-            )
-            .await?;
-
-        Ok(response)
+            .apply_commit_batch(req.vault_id, device_id, &req, &request_hash)
+            .await
     }
 
     /// Fetches delta changes since a given sequence number.
@@ -526,6 +400,7 @@ impl<S: Store> SyncEngine<S> {
         &self,
         user_id: Uuid,
         vault_id: Uuid,
+        requested_revision: Option<u64>,
     ) -> Result<SnapshotResponse, DomainError> {
         let vault = self
             .store
@@ -543,7 +418,10 @@ impl<S: Store> SyncEngine<S> {
             .await?
             .ok_or(DomainError::NotFound)?;
 
-        let records_raw = self.store.get_snapshot_records(vault_id).await?;
+        let (watermark, records_raw) = self
+            .store
+            .get_snapshot_consistent(vault_id, requested_revision)
+            .await?;
         let mut records = Vec::with_capacity(records_raw.len());
         for r in records_raw {
             let env = match r.encrypted_envelope {
@@ -567,7 +445,7 @@ impl<S: Store> SyncEngine<S> {
 
         Ok(SnapshotResponse {
             vault_id,
-            server_sequence: vault.server_sequence,
+            server_sequence: watermark,
             records,
         })
     }
@@ -659,7 +537,7 @@ mod tests {
         keypair: &Ed25519KeyPair,
     ) -> MutationItem {
         let digest = compute_ciphertext_digest(envelope);
-        let preimage = canonical_mutation_preimage(
+        let preimage_bytes = canonical_mutation_preimage_bytes(
             vault_id,
             object_id,
             entity_type,
@@ -669,7 +547,7 @@ mod tests {
             device_counter,
             &digest,
         );
-        let sig = sign_message(keypair, preimage.as_bytes());
+        let sig = sign_message(keypair, &preimage_bytes);
 
         MutationItem {
             object_id: object_id.to_string(),
@@ -788,7 +666,10 @@ mod tests {
         assert!(!feed.has_more);
 
         // Snapshot
-        let snap = engine.get_snapshot(user_id, vault.vault_id).await.unwrap();
+        let snap = engine
+            .get_snapshot(user_id, vault.vault_id, None)
+            .await
+            .unwrap();
         assert_eq!(snap.records.len(), 2);
 
         // Future key epoch rejection test
@@ -1153,7 +1034,10 @@ mod tests {
         assert_eq!(del_ack.applied[0].assigned_revision, 2);
 
         // Snapshot excludes deleted record
-        let snap = engine.get_snapshot(user_id, vault.vault_id).await.unwrap();
+        let snap = engine
+            .get_snapshot(user_id, vault.vault_id, None)
+            .await
+            .unwrap();
         assert_eq!(snap.records.len(), 0);
 
         // Change feed includes tombstone

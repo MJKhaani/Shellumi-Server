@@ -9,7 +9,7 @@ use serde_json::Value;
 use shellumi_server::config::ServerConfig;
 use shellumi_server::server::create_router;
 use shellumi_server_crypto::{
-    canonical_mutation_preimage, compute_ciphertext_digest, generate_test_ed25519_keypair,
+    canonical_mutation_preimage_bytes, compute_ciphertext_digest, generate_test_ed25519_keypair,
     sign_message,
 };
 use shellumi_server_protocol::{
@@ -60,12 +60,28 @@ async fn register_test_device(
     name: &str,
 ) -> (Uuid, Ed25519KeyPair, String) {
     let (keypair, public_key_b64) = generate_test_ed25519_keypair().unwrap();
+
+    let chal_req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/devices/challenge")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let chal_resp = app.clone().oneshot(chal_req).await.unwrap();
+    assert_eq!(chal_resp.status(), StatusCode::OK);
+    let chal_body = axum::body::to_bytes(chal_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let chal_json: Value = serde_json::from_slice(&chal_body).unwrap();
+    let challenge_str = chal_json["challenge"].as_str().unwrap();
+    let sig = sign_message(&keypair, challenge_str.as_bytes());
+
     let reg_req = RegisterDeviceRequest {
         device_name: name.to_string(),
         signing_public_key: public_key_b64.clone(),
         agreement_public_key: BASE64_STANDARD.encode([2u8; 32]),
-        challenge: None,
-        challenge_signature: None,
+        challenge: Some(challenge_str.to_string()),
+        challenge_signature: Some(sig),
     };
 
     let req = Request::builder()
@@ -114,7 +130,7 @@ fn create_signed_mutation(
     keypair: &Ed25519KeyPair,
 ) -> MutationItem {
     let digest = compute_ciphertext_digest(envelope);
-    let preimage = canonical_mutation_preimage(
+    let preimage = canonical_mutation_preimage_bytes(
         vault_id,
         object_id,
         entity_type,
@@ -124,7 +140,7 @@ fn create_signed_mutation(
         device_counter,
         &digest,
     );
-    let sig = sign_message(keypair, preimage.as_bytes());
+    let sig = sign_message(keypair, &preimage);
 
     MutationItem {
         object_id: object_id.to_string(),
@@ -758,4 +774,165 @@ async fn test_tombstone_propagation_and_tampered_signature() {
     assert_eq!(records.len(), 2);
     assert_eq!(records[0]["deleted"], false);
     assert_eq!(records[1]["deleted"], true);
+}
+
+#[tokio::test]
+async fn test_get_changes_rejects_malformed_cursors_with_400_invalid_cursor() {
+    let (app, token, _user_id) = setup_app_and_bootstrap().await;
+
+    // Create personal vault
+    let vault_req = CreateVaultRequest {
+        name: Some("Personal Cursors".to_string()),
+        vault_type: "personal".to_string(),
+        encrypted_name: None,
+    };
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/vaults")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&vault_req).unwrap()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let val: Value = serde_json::from_slice(&body).unwrap();
+    let vault_id = val["vault_id"].as_str().unwrap();
+
+    // 1. Non-seq cursor prefix -> 400 INVALID_CURSOR
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!(
+            "/api/v1/vaults/{vault_id}/changes?cursor=invalid_prefix_123"
+        ))
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let err: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(err["error_code"], "INVALID_CURSOR");
+
+    // 2. Non-numeric seq suffix -> 400 INVALID_CURSOR
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!(
+            "/api/v1/vaults/{vault_id}/changes?cursor=seq:not_a_number"
+        ))
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let err: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(err["error_code"], "INVALID_CURSOR");
+
+    // 3. Valid cursor seq:0 -> 200 OK
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("/api/v1/vaults/{vault_id}/changes?cursor=seq:0"))
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_snapshot_bounded_revision_and_watermark() {
+    let (app, token, _user_id) = setup_app_and_bootstrap().await;
+    let (device_id, keypair, _pk) = register_test_device(&app, &token, "Snap Device").await;
+
+    // Create vault
+    let vault_req = CreateVaultRequest {
+        name: Some("Snapshots Vault".to_string()),
+        vault_type: "personal".to_string(),
+        encrypted_name: None,
+    };
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/vaults")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&vault_req).unwrap()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let val: Value = serde_json::from_slice(&body).unwrap();
+    let vault_id = Uuid::parse_str(val["vault_id"].as_str().unwrap()).unwrap();
+
+    let env = sample_envelope();
+    let m = create_signed_mutation(
+        vault_id,
+        "entry-1",
+        "snippet",
+        0,
+        false,
+        1,
+        1,
+        Some(&env),
+        &keypair,
+    );
+    let commit = CommitBatchRequest {
+        protocol_version: CURRENT_PROTOCOL_VERSION,
+        vault_id,
+        idempotency_key: "idem-snap-1".to_string(),
+        base_cursor: None,
+        mutations: vec![m],
+    };
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/api/v1/vaults/{vault_id}/commits"))
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header("x-device-id", device_id.to_string())
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&commit).unwrap()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 1. Snapshot at current watermark (sequence 1) -> 200 OK
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("/api/v1/vaults/{vault_id}/snapshots"))
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let snap: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(snap["server_sequence"], 1);
+    assert_eq!(snap["records"].as_array().unwrap().len(), 1);
+
+    // 2. Snapshot with explicit bounded revision 1 -> 200 OK
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("/api/v1/vaults/{vault_id}/snapshots/1"))
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 3. Snapshot with requested revision > watermark (e.g. 99) -> 422 Unprocessable Entity
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("/api/v1/vaults/{vault_id}/snapshots/99"))
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }

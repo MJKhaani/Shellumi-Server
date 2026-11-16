@@ -90,7 +90,7 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            server_instance_id: Uuid::from_u128(0x3b21741a_0f47_490f_ac7b_2cedaf8e0ebc),
+            server_instance_id: Uuid::new_v4(),
             listen_addr: SocketAddr::from(([127, 0, 0, 1], 8080)),
             public_url: "http://127.0.0.1:8080".to_string(),
             database_url: None,
@@ -137,6 +137,14 @@ impl ServerConfig {
             return Err(ConfigError::Validation(
                 "access_token_ttl_secs must be greater than 0".to_string(),
             ));
+        }
+
+        if let Some(ref key) = self.token_signing_key {
+            if key.len() < 32 {
+                return Err(ConfigError::Validation(
+                    "token_signing_key must be at least 32 bytes (256 bits)".to_string(),
+                ));
+            }
         }
 
         if self.refresh_token_ttl_secs < self.access_token_ttl_secs {

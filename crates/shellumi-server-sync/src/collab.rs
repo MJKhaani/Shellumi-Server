@@ -485,13 +485,6 @@ impl<S: Store> SyncEngine<S> {
             return Err(DomainError::NotFound);
         }
 
-        let member = VaultMember {
-            vault_id: invite.vault_id,
-            user_id: caller_user_id,
-            role: invite.role,
-            joined_at: now,
-        };
-        self.store.add_vault_member(&member).await?;
         self.store
             .accept_invite(invite.id, caller_user_id, now)
             .await?;

@@ -74,3 +74,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Monotonic transaction sequence allocation assigning a unique ordered sequence to each mutation in atomic batch commits.
   - Standard WebSocket instant notifications endpoint (`GET /api/v1/events/ws`) supporting `subscribe`, `subscribed`, `vault.changed`, `vault.key_rotated`, `vault.access_revoked`, `ping`, and `pong` frames with post-commit fan-out.
 
+- **Phase 11 Audit Remediation: Security Hardening & Documentation Truth**
+  - Cryptographically secure random token signing key generation using OS CSPRNG (`ring::rand::SystemRandom`) when not explicitly configured, with minimum length validation (>= 32 bytes).
+  - Universal active session and device validation across all 38 protected REST route handlers (`extract_auth_claims`), immediately invalidating access tokens upon logout or revocation.
+  - Strictly mandatory Ed25519 proof-of-possession challenge and signature verification during device enrollment (`POST /api/v1/devices`).
+  - Atomic Compare-And-Swap (CAS) and anti-replay validation within a single PostgreSQL transaction (`SELECT FOR UPDATE`), validating `expected_revision`, idempotency, and monotonic per-device counter (`device_sync_counters`).
+  - Atomic bootstrap and invite acceptance preventing partial state mutations.
+  - Canonical whole-envelope SHA-256 digest computation binding suite, nonce, salt, iterations, associated data, and ciphertext.
+  - Multi-instance cross-process WebSocket and poll notification fan-out via PostgreSQL `LISTEN`/`NOTIFY` (`shellumi_sync_events`).
+  - Strict cursor parsing rejecting malformed cursors with `400 INVALID_CURSOR`.
+  - Consistent watermark recovery snapshots (`GET /api/v1/vaults/:id/snapshots` and bounded `/snapshots/:revision`).
+  - Database-backed migration status reporting (`shellumi-server migrate status`).
+  - Complete overhaul of `README.md` with project description, architecture diagrams, operating modes, CLI usage, deployment guides, and status badges.
+

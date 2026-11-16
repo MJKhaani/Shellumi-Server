@@ -93,7 +93,7 @@ pub fn create_access_token(
     secret: &[u8],
     ttl_secs: u64,
 ) -> Result<String, DomainError> {
-    create_session_access_token(user_id, username, secret, ttl_secs, None)
+    create_session_access_token(user_id, username, secret, ttl_secs, None, None)
 }
 
 fn create_session_access_token(
@@ -102,6 +102,7 @@ fn create_session_access_token(
     secret: &[u8],
     ttl_secs: u64,
     session_id: Option<Uuid>,
+    device_id: Option<Uuid>,
 ) -> Result<String, DomainError> {
     let now = chrono::Utc::now().timestamp();
     let exp = now + (ttl_secs as i64);
@@ -112,7 +113,7 @@ fn create_session_access_token(
         exp,
         iat: now,
         session_id,
-        device_id: None,
+        device_id,
         iss: None,
     };
 
@@ -311,17 +312,7 @@ impl<S: Store> AuthService<S> {
             return Err(DomainError::Unauthenticated);
         }
 
-        if let Some(did) = device_id {
-            let device = self
-                .store
-                .find_device_by_id(did)
-                .await?
-                .ok_or(DomainError::DeviceNotFound)?;
-            if device.user_id != claims.sub || device.revoked_at.is_some() {
-                return Err(DomainError::DeviceRevoked);
-            }
-        }
-
+        let mut session_device_id = None;
         if let Some(sid) = claims.session_id {
             let session = self
                 .store
@@ -333,6 +324,21 @@ impl<S: Store> AuthService<S> {
             }
             if session.expires_at < chrono::Utc::now().timestamp() {
                 return Err(DomainError::TokenExpired);
+            }
+            if session.user_id != claims.sub {
+                return Err(DomainError::Unauthenticated);
+            }
+            session_device_id = session.device_id;
+        }
+
+        let effective_device = device_id.or(claims.device_id).or(session_device_id);
+        if let Some(did) = effective_device {
+            let device = match self.store.find_device_by_id(did).await? {
+                Some(d) => d,
+                None => return Err(DomainError::Unauthenticated),
+            };
+            if device.user_id != claims.sub || device.revoked_at.is_some() {
+                return Err(DomainError::DeviceRevoked);
             }
         }
 
@@ -363,12 +369,6 @@ impl<S: Store> AuthService<S> {
             ));
         }
 
-        // Verify and mark bootstrap as consumed atomically
-        let token_hash = req.bootstrap_token.as_deref().map(hash_refresh_token);
-        self.store
-            .mark_bootstrap_consumed(token_hash.as_deref())
-            .await?;
-
         let now = chrono::Utc::now().timestamp();
         let user_id = Uuid::new_v4();
         let password_hash = hash_password(&req.admin_password)?;
@@ -382,7 +382,6 @@ impl<S: Store> AuthService<S> {
             updated_at: now,
             is_active: true,
         };
-        self.store.create_user(&user).await?;
 
         let org_id = Uuid::new_v4();
         let org = Organization {
@@ -390,7 +389,6 @@ impl<S: Store> AuthService<S> {
             name: req.org_name,
             created_at: now,
         };
-        self.store.create_org(&org, user_id).await?;
 
         // Issue initial access and refresh tokens
         let refresh_token = generate_refresh_token();
@@ -405,7 +403,11 @@ impl<S: Store> AuthService<S> {
             created_at: now,
             revoked_at: None,
         };
-        self.store.create_session(&session).await?;
+
+        let token_hash = req.bootstrap_token.as_deref().map(hash_refresh_token);
+        self.store
+            .complete_bootstrap(token_hash.as_deref(), &user, &org, &session)
+            .await?;
 
         let access_token = create_session_access_token(
             user_id,
@@ -413,6 +415,7 @@ impl<S: Store> AuthService<S> {
             &self.token_secret,
             self.access_token_ttl_secs,
             Some(session.id),
+            session.device_id,
         )?;
 
         Ok(BootstrapResponse {
@@ -477,6 +480,7 @@ impl<S: Store> AuthService<S> {
             &self.token_secret,
             self.access_token_ttl_secs,
             Some(session.id),
+            session.device_id,
         )?;
 
         Ok(LoginResponse {
@@ -531,6 +535,7 @@ impl<S: Store> AuthService<S> {
             &self.token_secret,
             self.access_token_ttl_secs,
             Some(new_session.id),
+            new_session.device_id,
         )?;
 
         Ok(RefreshTokenResponse {
@@ -615,21 +620,25 @@ impl<S: Store> AuthService<S> {
             )));
         }
 
-        if let Some(challenge) = &req.challenge {
-            let mut lock = self.challenges.write().await;
-            let now = chrono::Utc::now().timestamp();
-            match lock.remove(challenge) {
-                Some(exp) if exp >= now => {
-                    let sig = req
-                        .challenge_signature
-                        .as_deref()
-                        .ok_or(DomainError::InvalidChallenge)?;
-                    shellumi_server_crypto::verify_device_challenge(signing_b64, challenge, sig)
-                        .map_err(|_| DomainError::InvalidChallenge)?;
-                }
-                Some(_) => return Err(DomainError::ChallengeExpired),
-                None => return Err(DomainError::InvalidChallenge),
+        let challenge = match req.challenge.as_deref() {
+            Some(c) if !c.trim().is_empty() => c.trim(),
+            _ => return Err(DomainError::InvalidChallenge),
+        };
+
+        let sig = match req.challenge_signature.as_deref() {
+            Some(s) if !s.trim().is_empty() => s.trim(),
+            _ => return Err(DomainError::InvalidChallenge),
+        };
+
+        let mut lock = self.challenges.write().await;
+        let now = chrono::Utc::now().timestamp();
+        match lock.remove(challenge) {
+            Some(exp) if exp >= now => {
+                shellumi_server_crypto::verify_device_challenge(signing_b64, challenge, sig)
+                    .map_err(|_| DomainError::InvalidChallenge)?;
             }
+            Some(_) => return Err(DomainError::ChallengeExpired),
+            None => return Err(DomainError::InvalidChallenge),
         }
 
         let now = chrono::Utc::now().timestamp();
@@ -787,16 +796,35 @@ mod tests {
         };
         assert!(auth.register_device(user_id, bad_dev_req).await.is_err());
 
-        // Valid 32-byte base64 keys
-        let signing_pk = BASE64_STANDARD.encode([10u8; 32]);
+        // Missing challenge rejected (mandatory PoP)
+        let (signing_kp, _) = shellumi_server_crypto::generate_test_ed25519_keypair().unwrap();
+        let signing_pk = BASE64_STANDARD.encode(signing_kp.public_key().as_ref());
         let agreement_pk = BASE64_STANDARD.encode([20u8; 32]);
 
-        let dev_req = RegisterDeviceRequest {
+        let no_pop_req = RegisterDeviceRequest {
             device_name: "Carol's Laptop".to_string(),
             signing_public_key: signing_pk.clone(),
             agreement_public_key: agreement_pk.clone(),
             challenge: None,
             challenge_signature: None,
+        };
+        assert!(matches!(
+            auth.register_device(user_id, no_pop_req).await,
+            Err(DomainError::InvalidChallenge)
+        ));
+
+        // Obtain challenge and sign it
+        let challenge_resp = auth.create_device_challenge().await;
+        let challenge_msg = format!("shellumi-device-challenge:{}", challenge_resp.challenge);
+        let sig = signing_kp.sign(challenge_msg.as_bytes());
+        let sig_b64 = BASE64_STANDARD.encode(sig.as_ref());
+
+        let dev_req = RegisterDeviceRequest {
+            device_name: "Carol's Laptop".to_string(),
+            signing_public_key: signing_pk,
+            agreement_public_key: agreement_pk,
+            challenge: Some(challenge_resp.challenge),
+            challenge_signature: Some(sig_b64),
         };
 
         let device = auth.register_device(user_id, dev_req).await.unwrap();

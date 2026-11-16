@@ -11,7 +11,7 @@ use shellumi_server::config::ServerConfig;
 use shellumi_server::server::create_router_with_auth_and_sync;
 use shellumi_server_auth::{create_access_token, AuthService};
 use shellumi_server_crypto::{
-    canonical_mutation_preimage, compute_ciphertext_digest, generate_test_ed25519_keypair,
+    canonical_mutation_preimage_bytes, compute_ciphertext_digest, generate_test_ed25519_keypair,
     sign_message,
 };
 use shellumi_server_domain::{Organization, User, VaultRole};
@@ -67,7 +67,7 @@ fn create_signed_mutation(
     keypair: &Ed25519KeyPair,
 ) -> MutationItem {
     let digest = compute_ciphertext_digest(envelope);
-    let preimage = canonical_mutation_preimage(
+    let preimage = canonical_mutation_preimage_bytes(
         vault_id,
         object_id,
         entity_type,
@@ -77,7 +77,7 @@ fn create_signed_mutation(
         device_counter,
         &digest,
     );
-    let sig = sign_message(keypair, preimage.as_bytes());
+    let sig = sign_message(keypair, &preimage);
 
     MutationItem {
         object_id: object_id.to_string(),
@@ -139,6 +139,7 @@ async fn setup_test_context() -> TestContext {
         "owner_macbook",
         &public_key_b64,
         &agree_pk_owner,
+        &owner_keypair,
     )
     .await;
 
@@ -182,6 +183,7 @@ async fn create_user(
         &format!("{username}_device"),
         &public_key_b64,
         &agree_pk_user,
+        &keypair,
     )
     .await;
 
@@ -194,13 +196,29 @@ async fn register_device(
     name: &str,
     signing_pk: &str,
     agree_pk: &str,
+    keypair: &Ed25519KeyPair,
 ) -> Uuid {
+    let chal_req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/devices/challenge")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let chal_resp = app.clone().oneshot(chal_req).await.unwrap();
+    assert_eq!(chal_resp.status(), StatusCode::OK);
+    let chal_body = axum::body::to_bytes(chal_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let chal_json: Value = serde_json::from_slice(&chal_body).unwrap();
+    let challenge_str = chal_json["challenge"].as_str().unwrap();
+    let sig = sign_message(keypair, challenge_str.as_bytes());
+
     let req_body = RegisterDeviceRequest {
         device_name: name.to_string(),
         signing_public_key: signing_pk.to_string(),
         agreement_public_key: agree_pk.to_string(),
-        challenge: None,
-        challenge_signature: None,
+        challenge: Some(challenge_str.to_string()),
+        challenge_signature: Some(sig),
     };
 
     let req = Request::builder()

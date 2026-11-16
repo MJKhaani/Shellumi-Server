@@ -1635,6 +1635,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "shellumi-server-crypto",
  "shellumi-server-domain",
  "shellumi-server-protocol",
  "sqlx",

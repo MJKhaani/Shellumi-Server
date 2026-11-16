@@ -7,14 +7,14 @@ This document outlines the milestones and progress of Shellumi Server.
 | Milestone | Title | Status | Primary Gates & Acceptance Criteria |
 | :--- | :--- | :--- | :--- |
 | **M0** | Repository Foundations & Hygiene | **Complete** | Workspace skeleton, configuration parser, `/health/live`, `/health/ready`, `/api/v1/capabilities`, strict config validation, unit/integration tests, CI workflow, docs. |
-| **M1** | Storage, Migrations, Tenants & Auth | **Remediation / In Progress** | Real PostgreSQL `PgStore` runtime, executed migrations, durable bootstrap, HMAC session tokens, device challenge PoP, token revocation. |
-| **M2** | Encrypted Private Vault & Sync v1 | **Remediation / In Progress** | Transactional CAS, direct-DEK record envelope (`aes256gcm_dek_v1`), unambiguous canonical preimages, unique sequence per mutation, consistent snapshot watermarks. |
-| **M3** | Team Vaults, Invites, RBAC & E2EE Keys | **Remediation / In Progress** | Scoped recipient device discovery (`GET /api/v1/vaults/:id/recipient-devices`), strict epoch bounds (reject future and past), atomic invite redemption. |
-| **M4** | Resilience, Operations & Releases | **Remediation / In Progress** | Database-backed readiness probe, doctor DB check, CLI admin commands backed by real storage, Prometheus telemetry. |
+| **M1** | Storage, Migrations, Tenants & Auth | **Complete** | Real PostgreSQL `PgStore` runtime, forward migrations, atomic bootstrap, CSPRNG signing key, device challenge PoP, universal REST session revocation. |
+| **M2** | Encrypted Private Vault & Sync v1 | **Complete** | Atomic CAS (`SELECT FOR UPDATE`), direct-DEK record envelope (`aes256gcm_dek_v1`), unambiguous canonical binary preimages, monotonic per-mutation sequence, anti-replay device counters, consistent watermark snapshots. |
+| **M3** | Team Vaults, Invites, RBAC & E2EE Keys | **Complete** | Scoped recipient device discovery (`GET /api/v1/vaults/:id/recipient-devices`), strict epoch bounds (reject future and past), atomic invite redemption, hash-chained audit log. |
+| **M4** | Resilience, Operations & Releases | **Complete** | Database-backed readiness probe, doctor DB diagnostic check, CLI admin commands backed by real storage, Prometheus telemetry, backup verification. |
 | **M5** | Optional Live Terminal Collaboration | **Complete (Isolated)** | Terminal collaboration SSE & polling relay (opt-in, separate from vault sync notifications). |
-| **M6** | Advanced Self-Hosting & Client Polish | **Remediation / In Progress** | Golden contract fixtures, client compatibility matrix alignment, pre-release v1 contract finalization. |
-| **Phase 11** | Live Sync Notifications & WSS | **In Progress** | Standard WSS `/api/v1/events/ws` with `subscribe`/`subscribed`/`vault.changed`/`vault.key_rotated`/`vault.access_revoked` frames, post-commit dispatch. |
-| **M7** | Enterprise Integrations (Post-v1) | Planned | OIDC/SSO, optional SMTP notification delivery, S3-compatible large encrypted attachment storage, horizontal PostgreSQL cluster coordination. |
+| **M6** | Advanced Self-Hosting & Client Polish | **Complete** | Golden contract fixtures, client compatibility matrix alignment, pre-release v1 contract finalization. |
+| **Phase 11** | Protocol v1 Hardening & Live Sync Notifications | **Complete** | Standard WSS `/api/v1/events/ws` with `subscribe`/`subscribed`/`vault.changed`/`vault.key_rotated`/`vault.access_revoked` frames, PostgreSQL `LISTEN`/`NOTIFY` multi-instance bridge, post-commit dispatch, comprehensive audit remediation. |
+| **M7** | Enterprise Integrations (Post-v1) | Planned | OIDC/SSO, optional SMTP notification delivery, S3-compatible large encrypted attachment storage, horizontal clustering enhancements. |
 
 ---
 

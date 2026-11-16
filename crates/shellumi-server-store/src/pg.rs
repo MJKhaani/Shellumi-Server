@@ -7,7 +7,7 @@ use shellumi_server_domain::{
     DomainError, MutationIdempotency, OrgRole, Organization, Record, ServerSettings, Session, User,
     Vault, VaultInvite, VaultKeyEnvelope, VaultMember, VaultRole, VaultType,
 };
-use shellumi_server_protocol::CollabFrame;
+use shellumi_server_protocol::{CollabFrame, CommitBatchRequest, CommitBatchResponse, MutationAck};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 use std::collections::HashMap;
@@ -218,6 +218,132 @@ impl SettingsRepository for PgStore {
         )
         .bind(now)
         .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_db_error)?;
+
+        tx.commit().await.map_err(map_db_error)?;
+        Ok(())
+    }
+
+    async fn complete_bootstrap(
+        &self,
+        expected_token_hash: Option<&str>,
+        user: &User,
+        org: &Organization,
+        session: &Session,
+    ) -> Result<(), DomainError> {
+        let mut tx = self.pool.begin().await.map_err(map_db_error)?;
+
+        let row = sqlx::query(
+            "SELECT id, bootstrap_consumed, bootstrap_token_hash FROM server_settings LIMIT 1 FOR UPDATE",
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_db_error)?;
+
+        let (id, consumed, stored_token_hash) = if let Some(r) = row {
+            (
+                r.get::<Uuid, _>("id"),
+                r.get::<bool, _>("bootstrap_consumed"),
+                r.get::<Option<String>, _>("bootstrap_token_hash"),
+            )
+        } else {
+            let now = Utc::now().timestamp();
+            let new_id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO server_settings (id, install_id, schema_version, bootstrap_consumed, bootstrap_token_hash, created_at, updated_at) VALUES ($1, $2, 1, false, NULL, $3, $3)",
+            )
+            .bind(new_id)
+            .bind(Uuid::new_v4())
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_db_error)?;
+            (new_id, false, None)
+        };
+
+        if consumed {
+            return Err(DomainError::BootstrapAlreadyConsumed);
+        }
+
+        if let Some(expected_hash) = expected_token_hash {
+            if let Some(actual_hash) = &stored_token_hash {
+                if actual_hash != expected_hash {
+                    return Err(DomainError::InvalidBootstrapToken);
+                }
+            }
+        }
+
+        let now = Utc::now().timestamp();
+        sqlx::query(
+            "UPDATE server_settings SET bootstrap_consumed = true, updated_at = $1 WHERE id = $2",
+        )
+        .bind(now)
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_db_error)?;
+
+        // Insert User
+        sqlx::query(
+            r#"
+            INSERT INTO users (id, username, email, password_hash, is_active, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            "#,
+        )
+        .bind(user.id)
+        .bind(&user.username)
+        .bind(&user.email)
+        .bind(&user.password_hash)
+        .bind(user.is_active)
+        .bind(to_timestamptz(user.created_at))
+        .bind(to_timestamptz(user.updated_at))
+        .execute(&mut *tx)
+        .await
+        .map_err(map_db_error)?;
+
+        // Insert Org
+        sqlx::query(
+            r#"
+            INSERT INTO organizations (id, name, created_at)
+            VALUES ($1, $2, $3)
+            "#,
+        )
+        .bind(org.id)
+        .bind(&org.name)
+        .bind(to_timestamptz(org.created_at))
+        .execute(&mut *tx)
+        .await
+        .map_err(map_db_error)?;
+
+        // Insert Org Membership
+        sqlx::query(
+            r#"
+            INSERT INTO org_memberships (org_id, user_id, role, joined_at)
+            VALUES ($1, $2, 'owner', $3)
+            "#,
+        )
+        .bind(org.id)
+        .bind(user.id)
+        .bind(to_timestamptz(user.created_at))
+        .execute(&mut *tx)
+        .await
+        .map_err(map_db_error)?;
+
+        // Insert Session
+        sqlx::query(
+            r#"
+            INSERT INTO sessions (id, user_id, device_id, refresh_token_hash, expires_at, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            "#,
+        )
+        .bind(session.id)
+        .bind(session.user_id)
+        .bind(session.device_id)
+        .bind(&session.refresh_token_hash)
+        .bind(to_timestamptz(session.expires_at))
+        .bind(to_timestamptz(session.created_at))
         .execute(&mut *tx)
         .await
         .map_err(map_db_error)?;
@@ -1598,32 +1724,56 @@ impl SyncRepository for PgStore {
         &self,
         vault_id: Uuid,
         device_id: Uuid,
-        idempotency_key: &str,
+        req: &CommitBatchRequest,
         request_hash: &str,
-        response_payload: &str,
-        records_to_upsert: &[Record],
-        change_log_entries: &[ChangeLogEntry],
-        new_server_sequence: u64,
-    ) -> Result<(), DomainError> {
+    ) -> Result<CommitBatchResponse, DomainError> {
         let mut tx = self.pool.begin().await.map_err(map_db_error)?;
 
         // 1. Lock vault row for concurrency control
-        let vault_row = sqlx::query("SELECT server_sequence FROM vaults WHERE id = $1 FOR UPDATE")
-            .bind(vault_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(map_db_error)?;
-
-        if vault_row.is_none() {
-            return Err(DomainError::VaultNotFound(vault_id));
-        }
-
-        // 2. Check idempotency within transaction lock
-        let idem_row = sqlx::query(
-            "SELECT request_hash FROM mutation_idempotency WHERE vault_id = $1 AND idempotency_key = $2"
+        let vault_row = sqlx::query(
+            "SELECT server_sequence, active_key_epoch, deleted_at FROM vaults WHERE id = $1 FOR UPDATE",
         )
         .bind(vault_id)
-        .bind(idempotency_key)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_db_error)?;
+
+        let (base_sequence, active_key_epoch) = match vault_row {
+            Some(r) => {
+                let deleted: Option<DateTime<Utc>> = r.get("deleted_at");
+                if deleted.is_some() {
+                    return Err(DomainError::VaultNotFound(vault_id));
+                }
+                (
+                    r.get::<i64, _>("server_sequence") as u64,
+                    r.get::<i32, _>("active_key_epoch") as u32,
+                )
+            }
+            None => return Err(DomainError::VaultNotFound(vault_id)),
+        };
+
+        // 2. Validate key epochs
+        for m in &req.mutations {
+            if m.key_epoch < active_key_epoch {
+                return Err(DomainError::StaleKeyEpoch {
+                    current: active_key_epoch,
+                    provided: m.key_epoch,
+                });
+            }
+            if m.key_epoch > active_key_epoch {
+                return Err(DomainError::FutureKeyEpoch {
+                    current: active_key_epoch,
+                    provided: m.key_epoch,
+                });
+            }
+        }
+
+        // 3. Check idempotency within transaction lock
+        let idem_row = sqlx::query(
+            "SELECT request_hash, response_payload FROM mutation_idempotency WHERE vault_id = $1 AND idempotency_key = $2",
+        )
+        .bind(vault_id)
+        .bind(&req.idempotency_key)
         .fetch_optional(&mut *tx)
         .await
         .map_err(map_db_error)?;
@@ -1631,50 +1781,124 @@ impl SyncRepository for PgStore {
         if let Some(r) = idem_row {
             let existing_hash: String = r.get("request_hash");
             if existing_hash == request_hash {
-                // Already successfully applied
-                return Ok(());
+                let payload: serde_json::Value = r.get("response_payload");
+                let cached: CommitBatchResponse = serde_json::from_value(payload)
+                    .map_err(|e| DomainError::Internal(e.to_string()))?;
+                return Ok(cached);
             } else {
                 return Err(DomainError::IdempotencyConflict {
-                    key: idempotency_key.to_string(),
+                    key: req.idempotency_key.clone(),
                 });
             }
         }
 
-        // 3. Insert change log entries
-        for entry in change_log_entries {
-            let env_val = entry
+        // 4. Anti-replay monotonic device counter check
+        let counter_row = sqlx::query(
+            "SELECT last_device_counter FROM device_sync_counters WHERE vault_id = $1 AND device_id = $2 FOR UPDATE",
+        )
+        .bind(vault_id)
+        .bind(device_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_db_error)?;
+
+        let mut last_counter: u64 = counter_row
+            .map(|r| r.get::<i64, _>("last_device_counter") as u64)
+            .unwrap_or(0);
+        for m in &req.mutations {
+            if m.device_counter <= last_counter {
+                return Err(DomainError::Conflict(format!(
+                    "Stale or replayed device counter: got {}, expected > {}",
+                    m.device_counter, last_counter
+                )));
+            }
+            last_counter = m.device_counter;
+        }
+
+        // 5. CAS and revision validation for each mutation
+        let now = Utc::now().timestamp();
+        let mut applied_acks = Vec::with_capacity(req.mutations.len());
+
+        for (idx, mutation) in req.mutations.iter().enumerate() {
+            let mutation_seq = base_sequence + 1 + idx as u64;
+
+            let existing_row = sqlx::query(
+                "SELECT current_revision, deleted FROM records WHERE vault_id = $1 AND object_id = $2 FOR UPDATE",
+            )
+            .bind(vault_id)
+            .bind(&mutation.object_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(map_db_error)?;
+
+            let existing = existing_row.map(|r| {
+                (
+                    r.get::<i64, _>("current_revision") as u64,
+                    r.get::<bool, _>("deleted"),
+                )
+            });
+
+            let assigned_revision = match (mutation.expected_revision, existing) {
+                (0, None) => 1,
+                (0, Some((rev, deleted))) => {
+                    if !deleted {
+                        return Err(DomainError::RevisionConflict {
+                            object_id: mutation.object_id.clone(),
+                            expected: 0,
+                            actual: rev,
+                        });
+                    }
+                    rev + 1
+                }
+                (expected, None) => {
+                    return Err(DomainError::RevisionConflict {
+                        object_id: mutation.object_id.clone(),
+                        expected,
+                        actual: 0,
+                    });
+                }
+                (expected, Some((rev, _))) => {
+                    if rev != expected {
+                        return Err(DomainError::RevisionConflict {
+                            object_id: mutation.object_id.clone(),
+                            expected,
+                            actual: rev,
+                        });
+                    }
+                    expected + 1
+                }
+            };
+
+            let env_val = mutation
                 .encrypted_envelope
                 .as_ref()
-                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
+                .map(|e| serde_json::to_value(e).unwrap());
+            let digest = shellumi_server_crypto::compute_ciphertext_digest(
+                mutation.encrypted_envelope.as_ref(),
+            );
 
+            // Insert into change_log
             sqlx::query(
                 r#"
                 INSERT INTO change_log (vault_id, sequence, object_id, entity_type, revision, deleted, author_device_id, encrypted_envelope, ciphertext_digest, created_at)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-                "#
+                "#,
             )
-            .bind(entry.vault_id)
-            .bind(entry.sequence as i64)
-            .bind(&entry.object_id)
-            .bind(&entry.entity_type)
-            .bind(entry.revision as i64)
-            .bind(entry.deleted)
-            .bind(entry.author_device_id)
-            .bind(env_val)
-            .bind(&entry.ciphertext_digest)
-            .bind(to_timestamptz(entry.created_at))
+            .bind(vault_id)
+            .bind(mutation_seq as i64)
+            .bind(&mutation.object_id)
+            .bind(&mutation.entity_type)
+            .bind(assigned_revision as i64)
+            .bind(mutation.deleted)
+            .bind(device_id)
+            .bind(env_val.clone())
+            .bind(&digest)
+            .bind(to_timestamptz(now))
             .execute(&mut *tx)
             .await
             .map_err(map_db_error)?;
-        }
 
-        // 4. Upsert records
-        for record in records_to_upsert {
-            let env_val = record
-                .encrypted_envelope
-                .as_ref()
-                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
-
+            // Upsert into records
             sqlx::query(
                 r#"
                 INSERT INTO records (vault_id, object_id, entity_type, current_revision, key_epoch, author_device_id, deleted, encrypted_envelope, ciphertext_digest, last_server_sequence, updated_at)
@@ -1689,53 +1913,101 @@ impl SyncRepository for PgStore {
                     ciphertext_digest = EXCLUDED.ciphertext_digest,
                     last_server_sequence = EXCLUDED.last_server_sequence,
                     updated_at = EXCLUDED.updated_at
-                "#
+                "#,
             )
-            .bind(record.vault_id)
-            .bind(&record.object_id)
-            .bind(&record.entity_type)
-            .bind(record.current_revision as i64)
-            .bind(record.key_epoch as i32)
-            .bind(record.author_device_id)
-            .bind(record.deleted)
+            .bind(vault_id)
+            .bind(&mutation.object_id)
+            .bind(&mutation.entity_type)
+            .bind(assigned_revision as i64)
+            .bind(mutation.key_epoch as i32)
+            .bind(device_id)
+            .bind(mutation.deleted)
             .bind(env_val)
-            .bind(&record.ciphertext_digest)
-            .bind(record.last_server_sequence as i64)
-            .bind(to_timestamptz(record.updated_at))
+            .bind(&digest)
+            .bind(mutation_seq as i64)
+            .bind(to_timestamptz(now))
             .execute(&mut *tx)
             .await
             .map_err(map_db_error)?;
+
+            applied_acks.push(MutationAck {
+                object_id: mutation.object_id.clone(),
+                assigned_revision,
+                server_sequence: mutation_seq,
+                deleted: mutation.deleted,
+            });
         }
 
-        // 5. Insert idempotency record
-        let resp_json: serde_json::Value =
-            serde_json::from_str(response_payload).unwrap_or(serde_json::Value::Null);
+        let final_sequence = base_sequence + req.mutations.len() as u64;
 
-        sqlx::query(
-            r#"
-            INSERT INTO mutation_idempotency (vault_id, idempotency_key, device_id, request_hash, response_payload, created_at)
-            VALUES ($1, $2, $3, $4, $5, NOW())
-            "#
-        )
-        .bind(vault_id)
-        .bind(idempotency_key)
-        .bind(device_id)
-        .bind(request_hash)
-        .bind(resp_json)
-        .execute(&mut *tx)
-        .await
-        .map_err(map_db_error)?;
-
-        // 6. Update vault server sequence
-        sqlx::query("UPDATE vaults SET server_sequence = $1, updated_at = NOW() WHERE id = $2")
-            .bind(new_server_sequence as i64)
+        // 6. Update vault sequence
+        sqlx::query("UPDATE vaults SET server_sequence = $1, updated_at = $2 WHERE id = $3")
+            .bind(final_sequence as i64)
+            .bind(to_timestamptz(now))
             .bind(vault_id)
             .execute(&mut *tx)
             .await
             .map_err(map_db_error)?;
 
+        // 7. Upsert device_sync_counters
+        sqlx::query(
+            r#"
+            INSERT INTO device_sync_counters (vault_id, device_id, last_device_counter, updated_at)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (vault_id, device_id) DO UPDATE SET
+                last_device_counter = EXCLUDED.last_device_counter,
+                updated_at = EXCLUDED.updated_at
+            "#,
+        )
+        .bind(vault_id)
+        .bind(device_id)
+        .bind(last_counter as i64)
+        .bind(to_timestamptz(now))
+        .execute(&mut *tx)
+        .await
+        .map_err(map_db_error)?;
+
+        // 8. Insert mutation_idempotency
+        let response = CommitBatchResponse {
+            vault_id,
+            commit_sequence: final_sequence,
+            next_cursor: format!("seq:{}", final_sequence),
+            applied: applied_acks,
+        };
+        let response_json =
+            serde_json::to_value(&response).map_err(|e| DomainError::Internal(e.to_string()))?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO mutation_idempotency (vault_id, idempotency_key, device_id, request_hash, response_payload, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            "#,
+        )
+        .bind(vault_id)
+        .bind(&req.idempotency_key)
+        .bind(device_id)
+        .bind(request_hash)
+        .bind(response_json)
+        .bind(to_timestamptz(now))
+        .execute(&mut *tx)
+        .await
+        .map_err(map_db_error)?;
+
+        // 9. Send PostgreSQL NOTIFY for multi-instance event fanout
+        let notif_payload = serde_json::json!({
+            "type": "vault_changed",
+            "vault_id": vault_id,
+            "latest_sequence": final_sequence,
+        })
+        .to_string();
+        let _ = sqlx::query("SELECT pg_notify('shellumi_sync_events', $1)")
+            .bind(&notif_payload)
+            .execute(&mut *tx)
+            .await;
+
         tx.commit().await.map_err(map_db_error)?;
-        Ok(())
+
+        Ok(response)
     }
 
     async fn get_changes(
@@ -1813,6 +2085,69 @@ impl SyncRepository for PgStore {
                 }
             })
             .collect())
+    }
+
+    async fn get_snapshot_consistent(
+        &self,
+        vault_id: Uuid,
+        requested_revision: Option<u64>,
+    ) -> Result<(u64, Vec<Record>), DomainError> {
+        let mut tx = self.pool.begin().await.map_err(map_db_error)?;
+
+        let row = sqlx::query("SELECT server_sequence FROM vaults WHERE id = $1")
+            .bind(vault_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(map_db_error)?;
+
+        let watermark = match row {
+            Some(r) => r.get::<i64, _>("server_sequence") as u64,
+            None => return Err(DomainError::VaultNotFound(vault_id)),
+        };
+
+        if let Some(rev) = requested_revision {
+            if rev > watermark {
+                return Err(DomainError::InvalidInput(format!(
+                    "Requested snapshot revision {} exceeds current watermark {}",
+                    rev, watermark
+                )));
+            }
+        }
+
+        let rows = sqlx::query(
+            r#"
+            SELECT object_id, entity_type, current_revision, key_epoch, author_device_id, deleted, encrypted_envelope, ciphertext_digest, last_server_sequence, updated_at
+            FROM records
+            WHERE vault_id = $1 AND deleted = FALSE
+            ORDER BY object_id ASC
+            "#
+        )
+        .bind(vault_id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(map_db_error)?;
+
+        let mut records = Vec::with_capacity(rows.len());
+        for r in rows {
+            let env_val: Option<serde_json::Value> = r.get("encrypted_envelope");
+            let env_str = env_val.map(|v| v.to_string());
+            records.push(Record {
+                vault_id,
+                object_id: r.get("object_id"),
+                entity_type: r.get("entity_type"),
+                current_revision: r.get::<i64, _>("current_revision") as u64,
+                key_epoch: r.get::<i32, _>("key_epoch") as u32,
+                author_device_id: r.get("author_device_id"),
+                deleted: r.get("deleted"),
+                encrypted_envelope: env_str,
+                ciphertext_digest: r.get("ciphertext_digest"),
+                last_server_sequence: r.get::<i64, _>("last_server_sequence") as u64,
+                updated_at: from_timestamptz(r.get("updated_at")),
+            });
+        }
+
+        tx.commit().await.map_err(map_db_error)?;
+        Ok((watermark, records))
     }
 }
 
@@ -2225,6 +2560,25 @@ impl SettingsRepository for AnyStore {
         match self {
             Self::Memory(s) => s.mark_bootstrap_consumed(expected_token_hash).await,
             Self::Postgres(s) => s.mark_bootstrap_consumed(expected_token_hash).await,
+        }
+    }
+
+    async fn complete_bootstrap(
+        &self,
+        expected_token_hash: Option<&str>,
+        user: &User,
+        org: &Organization,
+        session: &Session,
+    ) -> Result<(), DomainError> {
+        match self {
+            Self::Memory(s) => {
+                s.complete_bootstrap(expected_token_hash, user, org, session)
+                    .await
+            }
+            Self::Postgres(s) => {
+                s.complete_bootstrap(expected_token_hash, user, org, session)
+                    .await
+            }
         }
     }
 }
@@ -2672,39 +3026,17 @@ impl SyncRepository for AnyStore {
         &self,
         vault_id: Uuid,
         device_id: Uuid,
-        idempotency_key: &str,
+        req: &CommitBatchRequest,
         request_hash: &str,
-        response_payload: &str,
-        records_to_upsert: &[Record],
-        change_log_entries: &[ChangeLogEntry],
-        new_server_sequence: u64,
-    ) -> Result<(), DomainError> {
+    ) -> Result<CommitBatchResponse, DomainError> {
         match self {
             Self::Memory(s) => {
-                s.apply_commit_batch(
-                    vault_id,
-                    device_id,
-                    idempotency_key,
-                    request_hash,
-                    response_payload,
-                    records_to_upsert,
-                    change_log_entries,
-                    new_server_sequence,
-                )
-                .await
+                s.apply_commit_batch(vault_id, device_id, req, request_hash)
+                    .await
             }
             Self::Postgres(s) => {
-                s.apply_commit_batch(
-                    vault_id,
-                    device_id,
-                    idempotency_key,
-                    request_hash,
-                    response_payload,
-                    records_to_upsert,
-                    change_log_entries,
-                    new_server_sequence,
-                )
-                .await
+                s.apply_commit_batch(vault_id, device_id, req, request_hash)
+                    .await
             }
         }
     }
@@ -2725,6 +3057,23 @@ impl SyncRepository for AnyStore {
         match self {
             Self::Memory(s) => s.get_snapshot_records(vault_id).await,
             Self::Postgres(s) => s.get_snapshot_records(vault_id).await,
+        }
+    }
+
+    async fn get_snapshot_consistent(
+        &self,
+        vault_id: Uuid,
+        requested_revision: Option<u64>,
+    ) -> Result<(u64, Vec<Record>), DomainError> {
+        match self {
+            Self::Memory(s) => {
+                s.get_snapshot_consistent(vault_id, requested_revision)
+                    .await
+            }
+            Self::Postgres(s) => {
+                s.get_snapshot_consistent(vault_id, requested_revision)
+                    .await
+            }
         }
     }
 }

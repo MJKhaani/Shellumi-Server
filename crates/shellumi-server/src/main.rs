@@ -52,12 +52,12 @@ async fn main() -> ExitCode {
         }
         Some(Commands::Migrate(migrate_args)) => match &migrate_args.action {
             MigrateAction::Status => {
-                let report = migrate::get_migration_status(&config);
+                let report = migrate::get_migration_status(&config).await;
                 migrate::print_migration_status(&report);
                 return ExitCode::SUCCESS;
             }
             MigrateAction::Run => {
-                let report = migrate::get_migration_status(&config);
+                let report = migrate::get_migration_status(&config).await;
                 migrate::print_migration_status(&report);
                 match migrate::run_database_migrations(&config).await {
                     Ok(_) => return ExitCode::SUCCESS,

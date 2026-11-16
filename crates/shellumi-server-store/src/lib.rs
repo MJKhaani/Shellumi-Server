@@ -7,7 +7,7 @@ use shellumi_server_domain::{
     MutationIdempotency, OrgMembership, OrgRole, Organization, Record, ServerSettings, Session,
     User, Vault, VaultInvite, VaultKeyEnvelope, VaultMember, VaultRole,
 };
-use shellumi_server_protocol::CollabFrame;
+use shellumi_server_protocol::{CollabFrame, CommitBatchRequest, CommitBatchResponse, MutationAck};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -23,6 +23,13 @@ pub trait SettingsRepository: Send + Sync {
     async fn mark_bootstrap_consumed(
         &self,
         expected_token_hash: Option<&str>,
+    ) -> Result<(), DomainError>;
+    async fn complete_bootstrap(
+        &self,
+        expected_token_hash: Option<&str>,
+        user: &User,
+        org: &Organization,
+        session: &Session,
     ) -> Result<(), DomainError>;
 }
 
@@ -196,18 +203,13 @@ pub trait SyncRepository: Send + Sync {
         vault_id: Uuid,
         idempotency_key: &str,
     ) -> Result<Option<MutationIdempotency>, DomainError>;
-    #[allow(clippy::too_many_arguments)]
     async fn apply_commit_batch(
         &self,
         vault_id: Uuid,
         device_id: Uuid,
-        idempotency_key: &str,
+        req: &CommitBatchRequest,
         request_hash: &str,
-        response_payload: &str,
-        records_to_upsert: &[Record],
-        change_log_entries: &[ChangeLogEntry],
-        new_server_sequence: u64,
-    ) -> Result<(), DomainError>;
+    ) -> Result<CommitBatchResponse, DomainError>;
     async fn get_changes(
         &self,
         vault_id: Uuid,
@@ -215,6 +217,11 @@ pub trait SyncRepository: Send + Sync {
         limit: usize,
     ) -> Result<Vec<ChangeLogEntry>, DomainError>;
     async fn get_snapshot_records(&self, vault_id: Uuid) -> Result<Vec<Record>, DomainError>;
+    async fn get_snapshot_consistent(
+        &self,
+        vault_id: Uuid,
+        requested_revision: Option<u64>,
+    ) -> Result<(u64, Vec<Record>), DomainError>;
 }
 
 #[async_trait]
@@ -307,6 +314,7 @@ struct MemoryState {
     records: HashMap<(Uuid, String), Record>,
     change_log: Vec<ChangeLogEntry>,
     idempotency: HashMap<(Uuid, String), MutationIdempotency>,
+    device_counters: HashMap<(Uuid, Uuid), u64>,
     invites: HashMap<Uuid, VaultInvite>,
     invites_by_hash: HashMap<String, Uuid>,
     key_envelopes: Vec<VaultKeyEnvelope>,
@@ -403,6 +411,78 @@ impl SettingsRepository for InMemoryStore {
         settings.bootstrap_consumed = true;
         settings.updated_at = chrono::Utc::now().timestamp();
         lock.settings = Some(settings);
+        Ok(())
+    }
+
+    async fn complete_bootstrap(
+        &self,
+        expected_token_hash: Option<&str>,
+        user: &User,
+        org: &Organization,
+        session: &Session,
+    ) -> Result<(), DomainError> {
+        let mut lock = self.state.write().await;
+        let mut settings = if let Some(s) = lock.settings.clone() {
+            s
+        } else {
+            let now = chrono::Utc::now().timestamp();
+            ServerSettings {
+                id: Uuid::new_v4(),
+                install_id: Uuid::new_v4(),
+                schema_version: 1,
+                bootstrap_consumed: false,
+                bootstrap_token_hash: None,
+                created_at: now,
+                updated_at: now,
+            }
+        };
+
+        if settings.bootstrap_consumed {
+            return Err(DomainError::BootstrapAlreadyConsumed);
+        }
+
+        if let Some(expected_hash) = &settings.bootstrap_token_hash {
+            match expected_token_hash {
+                Some(provided) if provided == expected_hash => {}
+                _ => return Err(DomainError::InvalidBootstrapToken),
+            }
+        }
+
+        let lower_username = user.username.to_lowercase();
+        let lower_email = user.email.to_lowercase();
+        if lock.users_by_username.contains_key(&lower_username) {
+            return Err(DomainError::Conflict(format!(
+                "Username '{}' is already registered",
+                user.username
+            )));
+        }
+        if lock.users_by_email.contains_key(&lower_email) {
+            return Err(DomainError::Conflict(format!(
+                "Email '{}' is already registered",
+                user.email
+            )));
+        }
+
+        settings.bootstrap_consumed = true;
+        settings.updated_at = chrono::Utc::now().timestamp();
+        lock.settings = Some(settings);
+
+        lock.users.insert(user.id, user.clone());
+        lock.users_by_username.insert(lower_username, user.id);
+        lock.users_by_email.insert(lower_email, user.id);
+
+        lock.organizations.insert(org.id, org.clone());
+        lock.memberships.push(OrgMembership {
+            org_id: org.id,
+            user_id: user.id,
+            role: OrgRole::Owner,
+            created_at: user.created_at,
+        });
+
+        lock.sessions.insert(session.id, session.clone());
+        lock.sessions_by_hash
+            .insert(session.refresh_token_hash.clone(), session.id);
+
         Ok(())
     }
 }
@@ -949,8 +1029,34 @@ impl InviteRepository for InMemoryStore {
             .invites
             .get_mut(&invite_id)
             .ok_or(DomainError::InviteNotFound)?;
+        if invite.accepted_at.is_some() {
+            return Err(DomainError::InviteAlreadyAccepted);
+        }
+        if invite.revoked_at.is_some() {
+            return Err(DomainError::InviteRevoked);
+        }
+        if invite.expires_at <= accepted_at {
+            return Err(DomainError::InviteExpired);
+        }
         invite.accepted_at = Some(accepted_at);
         invite.accepted_by_user_id = Some(accepted_by_user_id);
+        let vault_id = invite.vault_id;
+        let role = invite.role;
+
+        if let Some(existing) = lock
+            .vault_members
+            .iter_mut()
+            .find(|m| m.vault_id == vault_id && m.user_id == accepted_by_user_id)
+        {
+            existing.role = role;
+        } else {
+            lock.vault_members.push(VaultMember {
+                vault_id,
+                user_id: accepted_by_user_id,
+                role,
+                joined_at: accepted_at,
+            });
+        }
         Ok(())
     }
 }
@@ -1096,47 +1202,202 @@ impl SyncRepository for InMemoryStore {
             .cloned())
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn apply_commit_batch(
         &self,
         vault_id: Uuid,
         device_id: Uuid,
-        idempotency_key: &str,
+        req: &CommitBatchRequest,
         request_hash: &str,
-        response_payload: &str,
-        records_to_upsert: &[Record],
-        change_log_entries: &[ChangeLogEntry],
-        new_server_sequence: u64,
-    ) -> Result<(), DomainError> {
+    ) -> Result<CommitBatchResponse, DomainError> {
         let mut lock = self.state.write().await;
         let now = chrono::Utc::now().timestamp();
 
+        let (base_sequence, active_key_epoch) = {
+            let vault = lock
+                .vaults
+                .get(&vault_id)
+                .ok_or(DomainError::VaultNotFound(vault_id))?;
+            if vault.deleted_at.is_some() {
+                return Err(DomainError::VaultNotFound(vault_id));
+            }
+            (vault.server_sequence, vault.active_key_epoch)
+        };
+
+        // 1. Key epoch validation
+        for m in &req.mutations {
+            if m.key_epoch < active_key_epoch {
+                return Err(DomainError::StaleKeyEpoch {
+                    current: active_key_epoch,
+                    provided: m.key_epoch,
+                });
+            }
+            if m.key_epoch > active_key_epoch {
+                return Err(DomainError::FutureKeyEpoch {
+                    current: active_key_epoch,
+                    provided: m.key_epoch,
+                });
+            }
+        }
+
+        // 2. Idempotency validation
+        if let Some(existing) = lock
+            .idempotency
+            .get(&(vault_id, req.idempotency_key.clone()))
+        {
+            if existing.request_hash == request_hash {
+                let cached: CommitBatchResponse = serde_json::from_str(&existing.response_payload)
+                    .map_err(|e| DomainError::Internal(e.to_string()))?;
+                return Ok(cached);
+            } else {
+                return Err(DomainError::IdempotencyConflict {
+                    key: req.idempotency_key.clone(),
+                });
+            }
+        }
+
+        // 3. Anti-replay monotonic device counter check
+        let mut last_counter = lock
+            .device_counters
+            .get(&(vault_id, device_id))
+            .copied()
+            .unwrap_or(0);
+        for m in &req.mutations {
+            if m.device_counter <= last_counter {
+                return Err(DomainError::Conflict(format!(
+                    "Stale or replayed device counter: got {}, expected > {}",
+                    m.device_counter, last_counter
+                )));
+            }
+            last_counter = m.device_counter;
+        }
+
+        // 4. CAS and revision validation for each mutation
+        let mut applied_acks = Vec::with_capacity(req.mutations.len());
+        let mut new_records = Vec::with_capacity(req.mutations.len());
+        let mut new_changes = Vec::with_capacity(req.mutations.len());
+
+        for (idx, mutation) in req.mutations.iter().enumerate() {
+            let mutation_seq = base_sequence + 1 + idx as u64;
+            let existing = lock.records.get(&(vault_id, mutation.object_id.clone()));
+
+            let assigned_revision = match (mutation.expected_revision, existing) {
+                (0, None) => 1,
+                (0, Some(rec)) => {
+                    if !rec.deleted {
+                        return Err(DomainError::RevisionConflict {
+                            object_id: mutation.object_id.clone(),
+                            expected: 0,
+                            actual: rec.current_revision,
+                        });
+                    }
+                    rec.current_revision + 1
+                }
+                (expected, None) => {
+                    return Err(DomainError::RevisionConflict {
+                        object_id: mutation.object_id.clone(),
+                        expected,
+                        actual: 0,
+                    });
+                }
+                (expected, Some(rec)) => {
+                    if rec.current_revision != expected {
+                        return Err(DomainError::RevisionConflict {
+                            object_id: mutation.object_id.clone(),
+                            expected,
+                            actual: rec.current_revision,
+                        });
+                    }
+                    expected + 1
+                }
+            };
+
+            let env_json = mutation
+                .encrypted_envelope
+                .as_ref()
+                .map(|e| serde_json::to_string(e).unwrap());
+            let digest = shellumi_server_crypto::compute_ciphertext_digest(
+                mutation.encrypted_envelope.as_ref(),
+            );
+
+            let record = Record {
+                vault_id,
+                object_id: mutation.object_id.clone(),
+                entity_type: mutation.entity_type.clone(),
+                current_revision: assigned_revision,
+                key_epoch: mutation.key_epoch,
+                author_device_id: device_id,
+                deleted: mutation.deleted,
+                encrypted_envelope: env_json.clone(),
+                ciphertext_digest: digest.clone(),
+                last_server_sequence: mutation_seq,
+                updated_at: now,
+            };
+
+            let entry = ChangeLogEntry {
+                vault_id,
+                sequence: mutation_seq,
+                object_id: mutation.object_id.clone(),
+                entity_type: mutation.entity_type.clone(),
+                revision: assigned_revision,
+                deleted: mutation.deleted,
+                author_device_id: device_id,
+                encrypted_envelope: env_json,
+                ciphertext_digest: digest,
+                created_at: now,
+            };
+
+            new_records.push(record);
+            new_changes.push(entry);
+            applied_acks.push(MutationAck {
+                object_id: mutation.object_id.clone(),
+                assigned_revision,
+                server_sequence: mutation_seq,
+                deleted: mutation.deleted,
+            });
+        }
+
+        let final_sequence = base_sequence + req.mutations.len() as u64;
+
+        // Apply mutations to store
         if let Some(vault) = lock.vaults.get_mut(&vault_id) {
-            vault.server_sequence = new_server_sequence;
+            vault.server_sequence = final_sequence;
             vault.updated_at = now;
         }
 
-        for record in records_to_upsert {
+        for record in new_records {
             lock.records
-                .insert((vault_id, record.object_id.clone()), record.clone());
+                .insert((vault_id, record.object_id.clone()), record);
+        }
+        for entry in new_changes {
+            lock.change_log.push(entry);
         }
 
-        for entry in change_log_entries {
-            lock.change_log.push(entry.clone());
-        }
+        lock.device_counters
+            .insert((vault_id, device_id), last_counter);
 
-        let idem = MutationIdempotency {
+        let response = CommitBatchResponse {
             vault_id,
-            idempotency_key: idempotency_key.to_string(),
-            device_id,
-            request_hash: request_hash.to_string(),
-            response_payload: response_payload.to_string(),
-            created_at: now,
+            commit_sequence: final_sequence,
+            next_cursor: format!("seq:{}", final_sequence),
+            applied: applied_acks,
         };
-        lock.idempotency
-            .insert((vault_id, idempotency_key.to_string()), idem);
 
-        Ok(())
+        let response_payload =
+            serde_json::to_string(&response).map_err(|e| DomainError::Internal(e.to_string()))?;
+
+        lock.idempotency.insert(
+            (vault_id, req.idempotency_key.clone()),
+            MutationIdempotency {
+                vault_id,
+                idempotency_key: req.idempotency_key.clone(),
+                device_id,
+                request_hash: request_hash.to_string(),
+                response_payload,
+                created_at: now,
+            },
+        );
+
+        Ok(response)
     }
 
     async fn get_changes(
@@ -1167,6 +1428,35 @@ impl SyncRepository for InMemoryStore {
             .cloned()
             .collect();
         Ok(records)
+    }
+
+    async fn get_snapshot_consistent(
+        &self,
+        vault_id: Uuid,
+        requested_revision: Option<u64>,
+    ) -> Result<(u64, Vec<Record>), DomainError> {
+        let lock = self.state.read().await;
+        let vault = lock
+            .vaults
+            .get(&vault_id)
+            .ok_or(DomainError::VaultNotFound(vault_id))?;
+        let watermark = vault.server_sequence;
+        if let Some(rev) = requested_revision {
+            if rev > watermark {
+                return Err(DomainError::InvalidInput(format!(
+                    "Requested snapshot revision {} exceeds current watermark {}",
+                    rev, watermark
+                )));
+            }
+        }
+        let mut list: Vec<Record> = lock
+            .records
+            .values()
+            .filter(|r| r.vault_id == vault_id && !r.deleted)
+            .cloned()
+            .collect();
+        list.sort_by(|a, b| a.object_id.cmp(&b.object_id));
+        Ok((watermark, list))
     }
 }
 
@@ -1585,44 +1875,59 @@ mod tests {
         let device_id = Uuid::new_v4();
         let now = chrono::Utc::now().timestamp();
 
-        let record = Record {
-            vault_id,
-            object_id: "host-1".to_string(),
-            entity_type: "host".to_string(),
-            current_revision: 1,
-            key_epoch: 1,
-            author_device_id: device_id,
-            deleted: false,
-            encrypted_envelope: Some("ciphertext-json".to_string()),
-            ciphertext_digest: "digest-1".to_string(),
-            last_server_sequence: 1,
-            updated_at: now,
-        };
+        let user_id = Uuid::new_v4();
+        store
+            .create_vault(
+                &Vault {
+                    id: vault_id,
+                    tenant_id: Uuid::new_v4(),
+                    owner_id: user_id,
+                    vault_type: shellumi_server_domain::VaultType::Personal,
+                    encrypted_name: None,
+                    active_key_epoch: 1,
+                    server_sequence: 0,
+                    created_at: now,
+                    updated_at: now,
+                    deleted_at: None,
+                },
+                &VaultMember {
+                    vault_id,
+                    user_id,
+                    role: VaultRole::Owner,
+                    joined_at: now,
+                },
+            )
+            .await
+            .unwrap();
 
-        let entry = ChangeLogEntry {
+        let req = CommitBatchRequest {
+            protocol_version: 1,
             vault_id,
-            sequence: 1,
-            object_id: "host-1".to_string(),
-            entity_type: "host".to_string(),
-            revision: 1,
-            deleted: false,
-            author_device_id: device_id,
-            encrypted_envelope: Some("ciphertext-json".to_string()),
-            ciphertext_digest: "digest-1".to_string(),
-            created_at: now,
+            idempotency_key: "idem-key-1".to_string(),
+            base_cursor: None,
+            mutations: vec![shellumi_server_protocol::MutationItem {
+                object_id: "host-1".to_string(),
+                entity_type: "host".to_string(),
+                expected_revision: 0,
+                device_counter: 1,
+                deleted: false,
+                key_epoch: 1,
+                encrypted_envelope: Some(shellumi_server_protocol::EncryptedEnvelope {
+                    format_version: 1,
+                    suite: "xchacha20poly1305_argon2id".to_string(),
+                    key_epoch: 1,
+                    nonce: "abcd".to_string(),
+                    ciphertext: "cipher".to_string(),
+                    salt: String::new(),
+                    kdf_iterations: 0,
+                    associated_data: String::new(),
+                }),
+                device_signature: "sig".to_string(),
+            }],
         };
 
         store
-            .apply_commit_batch(
-                vault_id,
-                device_id,
-                "idem-key-1",
-                "request-hash-1",
-                "{\"applied\":[]}",
-                &[record],
-                &[entry],
-                1,
-            )
+            .apply_commit_batch(vault_id, device_id, &req, "request-hash-1")
             .await
             .unwrap();
 

@@ -106,12 +106,24 @@ pub fn canonical_mutation_preimage(
     )
 }
 
-/// Computes a hex-encoded SHA-256 digest of the ciphertext envelope.
+/// Computes a hex-encoded SHA-256 digest of the canonical ciphertext envelope.
+/// Binds suite, nonce, salt, kdf_iterations, associated_data, and ciphertext.
 /// Returns an empty string for tombstones with no envelope.
 pub fn compute_ciphertext_digest(envelope: Option<&EncryptedEnvelope>) -> String {
     match envelope {
         Some(env) => {
             let mut hasher = Sha256::new();
+            hasher.update(b"shellumi-envelope-v1\0");
+            hasher.update((env.suite.len() as u32).to_be_bytes());
+            hasher.update(env.suite.as_bytes());
+            hasher.update((env.nonce.len() as u32).to_be_bytes());
+            hasher.update(env.nonce.as_bytes());
+            hasher.update((env.salt.len() as u32).to_be_bytes());
+            hasher.update(env.salt.as_bytes());
+            hasher.update(env.kdf_iterations.to_be_bytes());
+            hasher.update((env.associated_data.len() as u32).to_be_bytes());
+            hasher.update(env.associated_data.as_bytes());
+            hasher.update((env.ciphertext.len() as u32).to_be_bytes());
             hasher.update(env.ciphertext.as_bytes());
             hex::encode(hasher.finalize())
         }
@@ -373,5 +385,54 @@ mod tests {
 
         let fingerprint = compute_key_fingerprint(&pk_b64).unwrap();
         assert_eq!(fingerprint.len(), 64);
+    }
+
+    #[test]
+    fn test_compute_ciphertext_digest_binds_whole_envelope() {
+        let env1 = EncryptedEnvelope {
+            format_version: 1,
+            suite: "aes256gcm_dek_v1".to_string(),
+            key_epoch: 1,
+            salt: String::new(),
+            nonce: BASE64_STANDARD.encode([1u8; NONCE_LEN]),
+            ciphertext: BASE64_STANDARD.encode(vec![2u8; 32]),
+            associated_data: "host:001".to_string(),
+            kdf_iterations: 0,
+        };
+
+        let digest1 = compute_ciphertext_digest(Some(&env1));
+        assert!(!digest1.is_empty());
+
+        // Modifying associated_data MUST alter digest
+        let mut env_tampered_aad = env1.clone();
+        env_tampered_aad.associated_data = "host:002".to_string();
+        assert_ne!(digest1, compute_ciphertext_digest(Some(&env_tampered_aad)));
+
+        // Modifying nonce MUST alter digest
+        let mut env_tampered_nonce = env1.clone();
+        env_tampered_nonce.nonce = BASE64_STANDARD.encode([9u8; NONCE_LEN]);
+        assert_ne!(
+            digest1,
+            compute_ciphertext_digest(Some(&env_tampered_nonce))
+        );
+
+        // Modifying suite MUST alter digest
+        let mut env_tampered_suite = env1.clone();
+        env_tampered_suite.suite = "other_suite".to_string();
+        assert_ne!(
+            digest1,
+            compute_ciphertext_digest(Some(&env_tampered_suite))
+        );
+
+        // Modifying ciphertext MUST alter digest
+        let mut env_tampered_cipher = env1.clone();
+        env_tampered_cipher.ciphertext = BASE64_STANDARD.encode(vec![3u8; 32]);
+        assert_ne!(
+            digest1,
+            compute_ciphertext_digest(Some(&env_tampered_cipher))
+        );
+
+        // None envelope gives empty digest
+        assert_eq!(compute_ciphertext_digest(None), "");
     }
 }

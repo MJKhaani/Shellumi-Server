@@ -859,3 +859,66 @@ This journal records every increment, decision, test execution, and verification
 - Issue / PR / CI evidence:
   - Review branch `https://github.com/MJKhaani/Shellumi-Server/tree/codex/sync-notifications-docs`.
 
+---
+
+## 2026-11-16T06:30:00Z — TASK-013 — Phase 11 Independent Audit Remediation & Documentation Truth
+- Status: complete
+- Baseline / commit: `500d3b3d0f63aee11697b2d64bd0b2b5dac238f4` (on `main`).
+- Objective and acceptance criteria:
+  - Address all P0 and P1 findings from independent verification report `SHELLUMI_SERVER_PHASE11_VERIFICATION_2026-11-16.md`.
+  - P0-A: Enforce unpredictable persistent token-signing secret generation; enforce universal active session/revocation checks across all protected REST routes; make device challenge proof-of-possession strictly mandatory.
+  - P0-B: Transactionalize `commit_batch` with atomic row lock (`SELECT FOR UPDATE`), validating expected revisions, idempotency hash, (vault, device) monotonic anti-replay counter, and assigning per-mutation monotonic event sequences within the transaction.
+  - P0-C: Atomic bootstrap (single transaction for consuming bootstrap token, creating admin user, org, and session); atomic invitation acceptance without redundant outside membership insertion.
+  - P0-D: Canonical whole-envelope ciphertext digest (including suite, nonce, salt, iterations, aad, ciphertext); eliminate legacy colon-separated signing fallback in favor of unambiguous binary length-prefixed preimage.
+  - P0-E: Reliable WSS notifications with multi-instance PostgreSQL `LISTEN`/`NOTIFY` bridge and comprehensive WebSocket tests.
+  - P1-F: Stable watermark snapshots (`GET /api/v1/vaults/:id/snapshots` and `:revision`); strict cursor validation returning `400 INVALID_CURSOR` or `410 CURSOR_EXPIRED`; DB-backed `migrate status`; comprehensive update of `README.md` and project docs.
+- Implementation / files changed:
+  - `crates/shellumi-server-crypto/src/lib.rs`: Canonical whole-envelope digest binding, clippy cleanup.
+  - `crates/shellumi-server/src/config.rs`: Dynamic CSPRNG server instance ID, minimum token signing key length validation.
+  - `crates/shellumi-server/src/server.rs`: CSPRNG default secret generation, multi-instance PostgreSQL `LISTEN`/`NOTIFY` bridge, typed cursor validation, consistent snapshot watermark routing, async `extract_auth_claims` with active session and device validation across all routes.
+  - `crates/shellumi-server/src/cli/migrate.rs`: Query real applied migrations from database schema.
+  - `crates/shellumi-server/src/main.rs`: Await async `get_migration_status`.
+  - `crates/shellumi-server-store/src/lib.rs`: Atomic `complete_bootstrap`, atomic `apply_commit_batch`, consistent `get_snapshot_consistent`, device counters tracking.
+  - `crates/shellumi-server-store/src/pg.rs`: Single transaction `complete_bootstrap`, `apply_commit_batch` with `SELECT FOR UPDATE`, idempotency cache, monotonic device counter checks, CAS validation, per-mutation sequence assignment, `change_log` insertion, record upsert, and `pg_notify`.
+  - `crates/shellumi-server-auth/src/lib.rs`: Strict active session and revoked device validation, mandatory Ed25519 PoP challenge/response in device registration.
+  - `crates/shellumi-server-sync/src/lib.rs`: Strict canonical binary mutation preimage verification, delegated atomic transaction execution, bounded snapshot watermark retrieval.
+  - `crates/shellumi-server-sync/src/collab.rs`: Atomic single-transaction invitation acceptance.
+  - `migrations/20261116000001_device_counters.sql`: Forward-only migration for `device_sync_counters`.
+  - `crates/shellumi-server/tests/auth_and_devices.rs`: Challenge PoP registration tests, session revocation enforcement after logout, missing challenge rejection.
+  - `crates/shellumi-server/tests/sync_and_vaults.rs`: Mandatory challenge PoP device registration, canonical binary preimage mutation signing, malformed cursor 400 rejection, bounded watermark snapshots.
+  - `crates/shellumi-server/tests/team_and_keys.rs`: Mandatory challenge PoP device registration, canonical binary preimage mutation signing.
+  - `crates/shellumi-server/tests/sync_events.rs`: Device registration with challenge PoP, WebSocket upgrade and notification verification.
+  - `crates/shellumi-server/tests/ops_and_resilience.rs`: Await async `get_migration_status`.
+  - `README.md`: Complete overhaul with badges, architecture diagrams, operating modes, CLI usage, deployment guides, and document index.
+  - `docs/ROADMAP.md`, `CHANGELOG.md`, `docs/PROGRESS.md`: Synchronized progress and release logs.
+- Data migration or API compatibility:
+  - Added forward-only migration `migrations/20261116000001_device_counters.sql` (`device_sync_counters` table).
+  - Maintained strict pre-release Protocol v1 contract without `/api/v2`.
+- Security / privacy review:
+  - Zero-knowledge invariant strictly preserved: no server plaintext keys, no decrypted DEKs, no server-side SSH decryption.
+  - Logout immediately revokes access tokens across all REST endpoints.
+  - Mandatory Ed25519 PoP challenge prevents unauthorized device impersonation.
+  - Atomic CAS prevents concurrent update loss and change log sequence collisions.
+  - Anti-replay monotonic counters per device/vault prevent mutation replay.
+- Tests added (file + test names):
+  - `crates/shellumi-server/tests/auth_and_devices.rs`:
+    - `test_rest_endpoints_enforce_session_revocation_after_logout`
+    - `test_device_registration_rejects_missing_challenge_pop`
+  - `crates/shellumi-server/tests/sync_and_vaults.rs`:
+    - `test_get_changes_rejects_malformed_cursors_with_400_invalid_cursor`
+    - `test_snapshot_bounded_revision_and_watermark`
+  - `crates/shellumi-server-crypto/src/lib.rs`:
+    - `test_compute_ciphertext_digest_binds_whole_envelope`
+- Verification executed (exact commands, OS, counts, pass/fail/skip):
+  - `cargo fmt --all -- --check` on macOS: PASSED (clean formatting).
+  - `CARGO_TARGET_DIR=/tmp/shellumi-target cargo clippy --locked --workspace --all-targets --all-features -- -D warnings` on macOS: PASSED (0 warnings, 0 errors).
+  - `CARGO_TARGET_DIR=/tmp/shellumi-target cargo test --locked --workspace --all-targets --all-features` on macOS: PASSED (92 passed, 0 failed, 0 ignored across 7 workspace crates and 7 integration test suites).
+  - `CARGO_TARGET_DIR=/tmp/shellumi-target cargo test --locked --doc --workspace` on macOS: PASSED (0 failed).
+  - `CARGO_TARGET_DIR=/tmp/shellumi-target cargo build --locked --workspace --all-features` on macOS: PASSED (clean build).
+- Known limitations / failed attempts:
+  - Live PostgreSQL integration testing in CI requires running PostgreSQL container (covered via `deploy/test/compose.yml`).
+- Next precise step:
+  - Commit all changes directly to `main` branch and push to `origin/main`.
+- Issue / PR / CI evidence:
+  - Baseline commit: `500d3b3d0f63aee11697b2d64bd0b2b5dac238f4`.
+

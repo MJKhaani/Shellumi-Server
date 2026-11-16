@@ -84,7 +84,19 @@ async fn team_metadata_change_sends_hint() {
     .await;
     let token = boot["access_token"].as_str().unwrap();
 
-    let signing_key = BASE64_STANDARD.encode([1u8; 32]);
+    let (keypair, public_key_b64) =
+        shellumi_server_crypto::generate_test_ed25519_keypair().unwrap();
+    let chal = call(
+        &app,
+        "POST",
+        "/api/v1/devices/challenge",
+        Some(token),
+        json!({}),
+    )
+    .await;
+    let challenge_str = chal["challenge"].as_str().unwrap();
+    let sig = shellumi_server_crypto::sign_message(&keypair, challenge_str.as_bytes());
+
     let agreement_key = BASE64_STANDARD.encode([2u8; 32]);
     let device = call(
         &app,
@@ -93,8 +105,10 @@ async fn team_metadata_change_sends_hint() {
         Some(token),
         json!({
             "device_name": "test_device",
-            "signing_public_key": signing_key,
-            "agreement_public_key": agreement_key
+            "signing_public_key": public_key_b64,
+            "agreement_public_key": agreement_key,
+            "challenge": challenge_str,
+            "challenge_signature": sig,
         }),
     )
     .await;

@@ -80,7 +80,12 @@ pub fn create_router_with_store(config: ServerConfig, store: AnyStore) -> Router
     let token_secret = if let Some(key) = &config.token_signing_key {
         key.as_bytes().to_vec()
     } else {
-        format!("shellumi-secret:{}", config.server_instance_id).into_bytes()
+        use ring::rand::SecureRandom;
+        let mut key = vec![0u8; 32];
+        let rng = ring::rand::SystemRandom::new();
+        rng.fill(&mut key)
+            .expect("Cryptographically secure random key generation failed");
+        key
     };
     let auth = Arc::new(AuthService::new(
         store_arc.clone(),
@@ -116,6 +121,39 @@ pub fn create_router_with_auth_and_sync(
     let metrics = Arc::new(MetricsRegistry::new());
     let collab = Arc::new(CollabHub::new(store.clone()));
     let (notifications, _) = broadcast::channel(256);
+
+    // If PostgreSQL database is configured, bridge cross-instance events via LISTEN/NOTIFY
+    if let Some(db_url) = config.database_url.clone() {
+        let notif_tx = notifications.clone();
+        tokio::spawn(async move {
+            if let Ok(mut listener) = sqlx::postgres::PgListener::connect(&db_url).await {
+                if listener.listen("shellumi_sync_events").await.is_ok() {
+                    while let Ok(notification) = listener.recv().await {
+                        if let Ok(val) =
+                            serde_json::from_str::<serde_json::Value>(notification.payload())
+                        {
+                            if let Some(event_type) = val.get("type").and_then(|v| v.as_str()) {
+                                if event_type == "vault_changed" {
+                                    if let (Some(vid_str), Some(seq)) = (
+                                        val.get("vault_id").and_then(|v| v.as_str()),
+                                        val.get("latest_sequence").and_then(|v| v.as_u64()),
+                                    ) {
+                                        if let Ok(vault_id) = Uuid::parse_str(vid_str) {
+                                            let _ = notif_tx.send(SyncEvent::VaultChanged {
+                                                vault_id,
+                                                latest_sequence: seq,
+                                                notification_id: Uuid::new_v4(),
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     let state = AppState {
         config: Arc::new(config),
@@ -168,9 +206,10 @@ pub fn create_router_with_auth_and_sync(
         )
         .route("/api/v1/vaults/:id/commits", post(commit_batch_handler))
         .route("/api/v1/vaults/:id/changes", get(get_changes_handler))
+        .route("/api/v1/vaults/:id/snapshots", get(get_snapshot_handler))
         .route(
             "/api/v1/vaults/:id/snapshots/:revision",
-            get(get_snapshot_handler),
+            get(get_snapshot_with_revision_handler),
         )
         // Team Members
         .route(
@@ -470,7 +509,7 @@ async fn logout_handler(
     headers: HeaderMap,
     Json(req): Json<LogoutRequest>,
 ) -> impl IntoResponse {
-    let claims = match extract_auth_claims(&state.auth, &headers) {
+    let claims = match extract_auth_claims(&state.auth, &headers).await {
         Ok(c) => c,
         Err(err) => {
             let (status, err_resp) = map_domain_error(err);
@@ -494,7 +533,7 @@ async fn logout_handler(
 }
 
 async fn me_handler(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    let claims = match extract_auth_claims(&state.auth, &headers) {
+    let claims = match extract_auth_claims(&state.auth, &headers).await {
         Ok(c) => c,
         Err(err) => {
             let (status, err_resp) = map_domain_error(err);
@@ -519,7 +558,7 @@ async fn list_devices_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let claims = match extract_auth_claims(&state.auth, &headers) {
+    let claims = match extract_auth_claims(&state.auth, &headers).await {
         Ok(c) => c,
         Err(err) => {
             let (status, err_resp) = map_domain_error(err);
@@ -541,7 +580,7 @@ async fn register_device_handler(
     headers: HeaderMap,
     Json(req): Json<RegisterDeviceRequest>,
 ) -> impl IntoResponse {
-    let claims = match extract_auth_claims(&state.auth, &headers) {
+    let claims = match extract_auth_claims(&state.auth, &headers).await {
         Ok(c) => c,
         Err(err) => {
             let (status, err_resp) = map_domain_error(err);
@@ -566,7 +605,7 @@ async fn revoke_device_handler(
     headers: HeaderMap,
     Path(device_id): Path<Uuid>,
 ) -> impl IntoResponse {
-    let claims = match extract_auth_claims(&state.auth, &headers) {
+    let claims = match extract_auth_claims(&state.auth, &headers).await {
         Ok(c) => c,
         Err(err) => {
             let (status, err_resp) = map_domain_error(err);
@@ -600,7 +639,7 @@ async fn list_recipient_devices_handler(
     Path(vault_id): Path<Uuid>,
     headers: HeaderMap,
 ) -> Response {
-    let claims = match extract_auth_claims(&state.auth, &headers) {
+    let claims = match extract_auth_claims(&state.auth, &headers).await {
         Ok(claims) => claims,
         Err(err) => return map_domain_error(err).into_response(),
     };
@@ -619,7 +658,7 @@ async fn events_ws_handler(
     headers: HeaderMap,
     ws: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Response {
-    let claims = match extract_auth_claims(&state.auth, &headers) {
+    let claims = match extract_auth_claims(&state.auth, &headers).await {
         Ok(claims) => claims,
         Err(err) => return map_domain_error(err).into_response(),
     };
@@ -659,7 +698,7 @@ async fn sync_session_valid(state: &AppState, claims: &AccessTokenClaims, device
 }
 
 async fn sync_poll_handler(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let claims = match extract_auth_claims(&state.auth, &headers) {
+    let claims = match extract_auth_claims(&state.auth, &headers).await {
         Ok(claims) => claims,
         Err(err) => return map_domain_error(err).into_response(),
     };
@@ -968,7 +1007,7 @@ async fn list_vaults_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let claims = match extract_auth_claims(&state.auth, &headers) {
+    let claims = match extract_auth_claims(&state.auth, &headers).await {
         Ok(c) => c,
         Err(err) => {
             let (status, err_resp) = map_domain_error(err);
@@ -990,7 +1029,7 @@ async fn create_vault_handler(
     headers: HeaderMap,
     Json(req): Json<CreateVaultRequest>,
 ) -> impl IntoResponse {
-    let claims = match extract_auth_claims(&state.auth, &headers) {
+    let claims = match extract_auth_claims(&state.auth, &headers).await {
         Ok(c) => c,
         Err(err) => {
             let (status, err_resp) = map_domain_error(err);
@@ -1033,7 +1072,7 @@ async fn get_vault_handler(
     headers: HeaderMap,
     Path(vault_id): Path<Uuid>,
 ) -> impl IntoResponse {
-    let claims = match extract_auth_claims(&state.auth, &headers) {
+    let claims = match extract_auth_claims(&state.auth, &headers).await {
         Ok(c) => c,
         Err(err) => {
             let (status, err_resp) = map_domain_error(err);
@@ -1056,7 +1095,7 @@ async fn update_vault_handler(
     Path(vault_id): Path<Uuid>,
     Json(req): Json<UpdateVaultRequest>,
 ) -> impl IntoResponse {
-    let claims = match extract_auth_claims(&state.auth, &headers) {
+    let claims = match extract_auth_claims(&state.auth, &headers).await {
         Ok(c) => c,
         Err(err) => {
             let (status, err_resp) = map_domain_error(err);
@@ -1086,7 +1125,7 @@ async fn delete_vault_handler(
     headers: HeaderMap,
     Path(vault_id): Path<Uuid>,
 ) -> impl IntoResponse {
-    let claims = match extract_auth_claims(&state.auth, &headers) {
+    let claims = match extract_auth_claims(&state.auth, &headers).await {
         Ok(c) => c,
         Err(err) => {
             let (status, err_resp) = map_domain_error(err);
@@ -1120,7 +1159,7 @@ async fn commit_batch_handler(
     Path(path_vault_id): Path<Uuid>,
     Json(req): Json<CommitBatchRequest>,
 ) -> impl IntoResponse {
-    let claims = match extract_auth_claims(&state.auth, &headers) {
+    let claims = match extract_auth_claims(&state.auth, &headers).await {
         Ok(c) => c,
         Err(err) => {
             let (status, err_resp) = map_domain_error(err);
@@ -1183,7 +1222,7 @@ async fn get_changes_handler(
     Path(vault_id): Path<Uuid>,
     Query(query): Query<ChangesQuery>,
 ) -> impl IntoResponse {
-    let claims = match extract_auth_claims(&state.auth, &headers) {
+    let claims = match extract_auth_claims(&state.auth, &headers).await {
         Ok(c) => c,
         Err(err) => {
             let (status, err_resp) = map_domain_error(err);
@@ -1193,9 +1232,21 @@ async fn get_changes_handler(
 
     let since_seq = if let Some(cursor_str) = query.cursor {
         if let Some(seq_part) = cursor_str.strip_prefix("seq:") {
-            seq_part.parse::<u64>().unwrap_or(0)
+            match seq_part.parse::<u64>() {
+                Ok(s) => s,
+                Err(_) => {
+                    let err = DomainError::InvalidCursor(format!(
+                        "Malformed sequence number in cursor: '{seq_part}'"
+                    ));
+                    let (status, err_resp) = map_domain_error(err);
+                    return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
+                }
+            }
         } else {
-            0
+            let err =
+                DomainError::InvalidCursor("Cursor must start with 'seq:' prefix".to_string());
+            let (status, err_resp) = map_domain_error(err);
+            return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
         }
     } else {
         query.since.unwrap_or(0)
@@ -1219,9 +1270,9 @@ async fn get_changes_handler(
 async fn get_snapshot_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path((vault_id, _revision)): Path<(Uuid, String)>,
+    Path(vault_id): Path<Uuid>,
 ) -> impl IntoResponse {
-    let claims = match extract_auth_claims(&state.auth, &headers) {
+    let claims = match extract_auth_claims(&state.auth, &headers).await {
         Ok(c) => c,
         Err(err) => {
             let (status, err_resp) = map_domain_error(err);
@@ -1229,7 +1280,44 @@ async fn get_snapshot_handler(
         }
     };
 
-    match state.sync.get_snapshot(claims.sub, vault_id).await {
+    match state.sync.get_snapshot(claims.sub, vault_id, None).await {
+        Ok(resp) => (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())),
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            (status, Json(serde_json::to_value(err_resp.0).unwrap()))
+        }
+    }
+}
+
+async fn get_snapshot_with_revision_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((vault_id, revision_str)): Path<(Uuid, String)>,
+) -> impl IntoResponse {
+    let claims = match extract_auth_claims(&state.auth, &headers).await {
+        Ok(c) => c,
+        Err(err) => {
+            let (status, err_resp) = map_domain_error(err);
+            return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
+        }
+    };
+
+    let req_rev = if revision_str == "latest" {
+        None
+    } else {
+        match revision_str.parse::<u64>() {
+            Ok(rev) => Some(rev),
+            Err(_) => {
+                let err = DomainError::InvalidInput(
+                    "Snapshot revision must be an integer sequence number or 'latest'".to_string(),
+                );
+                let (status, err_resp) = map_domain_error(err);
+                return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
+            }
+        }
+    };
+
+    match state.sync.get_snapshot(claims.sub, vault_id, req_rev).await {
         Ok(resp) => (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())),
         Err(err) => {
             let (status, err_resp) = map_domain_error(err);
@@ -1247,7 +1335,7 @@ async fn list_members_handler(
     headers: HeaderMap,
     Path(vault_id): Path<Uuid>,
 ) -> impl IntoResponse {
-    let claims = match extract_auth_claims(&state.auth, &headers) {
+    let claims = match extract_auth_claims(&state.auth, &headers).await {
         Ok(c) => c,
         Err(err) => {
             let (status, err_resp) = map_domain_error(err);
@@ -1270,7 +1358,7 @@ async fn add_member_handler(
     Path(vault_id): Path<Uuid>,
     Json(req): Json<AddVaultMemberRequest>,
 ) -> impl IntoResponse {
-    let claims = match extract_auth_claims(&state.auth, &headers) {
+    let claims = match extract_auth_claims(&state.auth, &headers).await {
         Ok(c) => c,
         Err(err) => {
             let (status, err_resp) = map_domain_error(err);
@@ -1304,7 +1392,7 @@ async fn remove_member_handler(
     headers: HeaderMap,
     Path((vault_id, target_user_id)): Path<(Uuid, Uuid)>,
 ) -> impl IntoResponse {
-    let claims = match extract_auth_claims(&state.auth, &headers) {
+    let claims = match extract_auth_claims(&state.auth, &headers).await {
         Ok(c) => c,
         Err(err) => {
             let (status, err_resp) = map_domain_error(err);
@@ -1343,7 +1431,7 @@ async fn create_invite_handler(
     Path(vault_id): Path<Uuid>,
     Json(req): Json<CreateInviteRequest>,
 ) -> impl IntoResponse {
-    let claims = match extract_auth_claims(&state.auth, &headers) {
+    let claims = match extract_auth_claims(&state.auth, &headers).await {
         Ok(c) => c,
         Err(err) => {
             let (status, err_resp) = map_domain_error(err);
@@ -1368,7 +1456,7 @@ async fn list_invites_handler(
     headers: HeaderMap,
     Path(vault_id): Path<Uuid>,
 ) -> impl IntoResponse {
-    let claims = match extract_auth_claims(&state.auth, &headers) {
+    let claims = match extract_auth_claims(&state.auth, &headers).await {
         Ok(c) => c,
         Err(err) => {
             let (status, err_resp) = map_domain_error(err);
@@ -1390,7 +1478,7 @@ async fn revoke_invite_handler(
     headers: HeaderMap,
     Path((vault_id, invite_id)): Path<(Uuid, Uuid)>,
 ) -> impl IntoResponse {
-    let claims = match extract_auth_claims(&state.auth, &headers) {
+    let claims = match extract_auth_claims(&state.auth, &headers).await {
         Ok(c) => c,
         Err(err) => {
             let (status, err_resp) = map_domain_error(err);
@@ -1419,7 +1507,7 @@ async fn accept_invite_handler(
     if let Some(resp) = check_rate_limit(&state, &headers, RateLimitCategory::InviteAccept) {
         return resp;
     }
-    let claims = match extract_auth_claims(&state.auth, &headers) {
+    let claims = match extract_auth_claims(&state.auth, &headers).await {
         Ok(c) => c,
         Err(err) => {
             let (status, err_resp) = map_domain_error(err);
@@ -1459,7 +1547,7 @@ async fn publish_key_envelopes_handler(
     Path(vault_id): Path<Uuid>,
     Json(req): Json<PublishKeyEnvelopesRequest>,
 ) -> impl IntoResponse {
-    let claims = match extract_auth_claims(&state.auth, &headers) {
+    let claims = match extract_auth_claims(&state.auth, &headers).await {
         Ok(c) => c,
         Err(err) => {
             let (status, err_resp) = map_domain_error(err);
@@ -1505,7 +1593,7 @@ async fn get_key_envelopes_handler(
     Path(vault_id): Path<Uuid>,
     Query(query): Query<KeyEnvelopesQuery>,
 ) -> impl IntoResponse {
-    let claims = match extract_auth_claims(&state.auth, &headers) {
+    let claims = match extract_auth_claims(&state.auth, &headers).await {
         Ok(c) => c,
         Err(err) => {
             let (status, err_resp) = map_domain_error(err);
@@ -1540,7 +1628,7 @@ async fn rotate_key_epoch_handler(
     Path(vault_id): Path<Uuid>,
     Json(req): Json<RotateKeyEpochRequest>,
 ) -> impl IntoResponse {
-    let claims = match extract_auth_claims(&state.auth, &headers) {
+    let claims = match extract_auth_claims(&state.auth, &headers).await {
         Ok(c) => c,
         Err(err) => {
             let (status, err_resp) = map_domain_error(err);
@@ -1593,7 +1681,7 @@ async fn get_audit_log_handler(
     Path(vault_id): Path<Uuid>,
     Query(query): Query<AuditLogQuery>,
 ) -> impl IntoResponse {
-    let claims = match extract_auth_claims(&state.auth, &headers) {
+    let claims = match extract_auth_claims(&state.auth, &headers).await {
         Ok(c) => c,
         Err(err) => {
             let (status, err_resp) = map_domain_error(err);
@@ -1640,7 +1728,7 @@ async fn create_collab_session_handler(
         return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
     }
 
-    let claims = match extract_auth_claims(&state.auth, &headers) {
+    let claims = match extract_auth_claims(&state.auth, &headers).await {
         Ok(c) => c,
         Err(err) => {
             let (status, err_resp) = map_domain_error(err);
@@ -1682,7 +1770,7 @@ async fn list_collab_sessions_handler(
         return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
     }
 
-    let claims = match extract_auth_claims(&state.auth, &headers) {
+    let claims = match extract_auth_claims(&state.auth, &headers).await {
         Ok(c) => c,
         Err(err) => {
             let (status, err_resp) = map_domain_error(err);
@@ -1712,7 +1800,7 @@ async fn get_collab_session_handler(
         return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
     }
 
-    let claims = match extract_auth_claims(&state.auth, &headers) {
+    let claims = match extract_auth_claims(&state.auth, &headers).await {
         Ok(c) => c,
         Err(err) => {
             let (status, err_resp) = map_domain_error(err);
@@ -1740,7 +1828,7 @@ async fn enroll_collab_participant_handler(
         return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
     }
 
-    let claims = match extract_auth_claims(&state.auth, &headers) {
+    let claims = match extract_auth_claims(&state.auth, &headers).await {
         Ok(c) => c,
         Err(err) => {
             let (status, err_resp) = map_domain_error(err);
@@ -1775,7 +1863,7 @@ async fn list_collab_participants_handler(
         return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
     }
 
-    let claims = match extract_auth_claims(&state.auth, &headers) {
+    let claims = match extract_auth_claims(&state.auth, &headers).await {
         Ok(c) => c,
         Err(err) => {
             let (status, err_resp) = map_domain_error(err);
@@ -1806,7 +1894,7 @@ async fn grant_collab_control_handler(
         return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
     }
 
-    let claims = match extract_auth_claims(&state.auth, &headers) {
+    let claims = match extract_auth_claims(&state.auth, &headers).await {
         Ok(c) => c,
         Err(err) => {
             let (status, err_resp) = map_domain_error(err);
@@ -1838,7 +1926,7 @@ async fn revoke_collab_control_handler(
         return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
     }
 
-    let claims = match extract_auth_claims(&state.auth, &headers) {
+    let claims = match extract_auth_claims(&state.auth, &headers).await {
         Ok(c) => c,
         Err(err) => {
             let (status, err_resp) = map_domain_error(err);
@@ -1870,7 +1958,7 @@ async fn terminate_collab_session_handler(
         return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
     }
 
-    let claims = match extract_auth_claims(&state.auth, &headers) {
+    let claims = match extract_auth_claims(&state.auth, &headers).await {
         Ok(c) => c,
         Err(err) => {
             let (status, err_resp) = map_domain_error(err);
@@ -1906,7 +1994,7 @@ async fn send_collab_frame_handler(
         return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
     }
 
-    let claims = match extract_auth_claims(&state.auth, &headers) {
+    let claims = match extract_auth_claims(&state.auth, &headers).await {
         Ok(c) => c,
         Err(err) => {
             let (status, err_resp) = map_domain_error(err);
@@ -1950,7 +2038,7 @@ async fn poll_collab_frames_handler(
         return (status, Json(serde_json::to_value(err_resp.0).unwrap()));
     }
 
-    let claims = match extract_auth_claims(&state.auth, &headers) {
+    let claims = match extract_auth_claims(&state.auth, &headers).await {
         Ok(c) => c,
         Err(err) => {
             let (status, err_resp) = map_domain_error(err);
@@ -1996,7 +2084,7 @@ async fn collab_events_sse_handler(
         return (status, Json(serde_json::to_value(err_resp.0).unwrap())).into_response();
     }
 
-    let claims = match extract_auth_claims(&state.auth, &headers) {
+    let claims = match extract_auth_claims(&state.auth, &headers).await {
         Ok(c) => c,
         Err(err) => {
             let (status, err_resp) = map_domain_error(err);
@@ -2053,7 +2141,7 @@ async fn not_found_handler() -> impl IntoResponse {
     )
 }
 
-fn extract_auth_claims(
+async fn extract_auth_claims(
     auth: &AuthService<AnyStore>,
     headers: &HeaderMap,
 ) -> Result<AccessTokenClaims, DomainError> {
@@ -2066,7 +2154,25 @@ fn extract_auth_claims(
         .strip_prefix("Bearer ")
         .ok_or_else(|| DomainError::InvalidToken("Expected Bearer token".to_string()))?;
 
-    auth.verify_token(token.trim())
+    let claims = auth.verify_token(token.trim())?;
+
+    let header_device_id = headers
+        .get("x-device-id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| Uuid::parse_str(v).ok());
+
+    if let (Some(token_dev), Some(req_dev)) = (claims.device_id, header_device_id) {
+        if token_dev != req_dev {
+            return Err(DomainError::PermissionDenied(
+                "Device mismatch between token and request".to_string(),
+            ));
+        }
+    }
+
+    let check_device = header_device_id.or(claims.device_id);
+    auth.validate_active_session(&claims, check_device).await?;
+
+    Ok(claims)
 }
 
 fn map_domain_error(err: DomainError) -> (StatusCode, Json<ErrorResponse>) {

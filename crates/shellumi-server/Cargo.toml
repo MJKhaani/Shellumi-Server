@@ -18,6 +18,7 @@ shellumi-server-store.workspace = true
 shellumi-server-auth.workspace = true
 shellumi-server-crypto.workspace = true
 shellumi-server-sync.workspace = true
+ring.workspace = true
 
 tokio.workspace = true
 axum.workspace = true

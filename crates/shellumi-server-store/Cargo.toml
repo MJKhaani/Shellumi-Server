@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 shellumi-server-protocol.workspace = true
 shellumi-server-domain.workspace = true
+shellumi-server-crypto.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
 uuid.workspace = true

@@ -7,8 +7,8 @@ use shellumi_server::config::ServerConfig;
 use shellumi_server::server::create_router;
 use shellumi_server_protocol::{
     BootstrapRequest, BootstrapResponse, DeviceChallengeResponse, DeviceResponse, ErrorResponse,
-    LoginRequest, LoginResponse, MeResponse, RefreshTokenRequest, RefreshTokenResponse,
-    RegisterDeviceRequest,
+    LoginRequest, LoginResponse, LogoutRequest, MeResponse, RefreshTokenRequest,
+    RefreshTokenResponse, RegisterDeviceRequest,
 };
 use tower::ServiceExt;
 
@@ -234,15 +234,31 @@ async fn test_device_registration_listing_and_revocation() {
     let boot_res: BootstrapResponse = serde_json::from_slice(&body).unwrap();
     let auth_header = format!("Bearer {}", boot_res.access_token);
 
-    // Register a device
-    let signing_pk = base64::engine::general_purpose::STANDARD.encode([1u8; 32]);
+    // Register a device with PoP challenge
+    let (keypair, signing_pk) = shellumi_server_crypto::generate_test_ed25519_keypair().unwrap();
     let agreement_pk = base64::engine::general_purpose::STANDARD.encode([2u8; 32]);
+
+    let chal_req = Request::builder()
+        .uri("/api/v1/devices/challenge")
+        .method("POST")
+        .header(header::AUTHORIZATION, &auth_header)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from("{}"))
+        .unwrap();
+    let chal_res = app.clone().oneshot(chal_req).await.unwrap();
+    assert_eq!(chal_res.status(), StatusCode::OK);
+    let chal_bytes = axum::body::to_bytes(chal_res.into_body(), 1024 * 64)
+        .await
+        .unwrap();
+    let chal_json: DeviceChallengeResponse = serde_json::from_slice(&chal_bytes).unwrap();
+    let sig = shellumi_server_crypto::sign_message(&keypair, chal_json.challenge.as_bytes());
+
     let dev_req = RegisterDeviceRequest {
         device_name: "Workstation-01".to_string(),
         signing_public_key: signing_pk,
         agreement_public_key: agreement_pk,
-        challenge: None,
-        challenge_signature: None,
+        challenge: Some(chal_json.challenge),
+        challenge_signature: Some(sig),
     };
 
     let req = Request::builder()
@@ -419,4 +435,142 @@ async fn test_device_challenge_and_pop_registration() {
     assert_eq!(status, StatusCode::CREATED);
     let dev_res: DeviceResponse = serde_json::from_slice(&body).unwrap();
     assert_eq!(dev_res.device_name, "Verified-Device");
+}
+
+#[tokio::test]
+async fn test_rest_endpoints_enforce_session_revocation_after_logout() {
+    let config = ServerConfig::default();
+    let app = create_router(config);
+
+    // 1. Bootstrap
+    let bootstrap_req = BootstrapRequest {
+        admin_username: "revocation_admin".to_string(),
+        admin_email: "revocation@example.com".to_string(),
+        admin_password: "SecurePassword123!".to_string(),
+        org_name: "Revocation Org".to_string(),
+        bootstrap_token: None,
+    };
+    let req = Request::builder()
+        .uri("/api/v1/bootstrap")
+        .method("POST")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&bootstrap_req).unwrap()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let body = axum::body::to_bytes(res.into_body(), 1024 * 64)
+        .await
+        .unwrap();
+    let boot_res: BootstrapResponse = serde_json::from_slice(&body).unwrap();
+    let access_token = boot_res.access_token;
+    let refresh_token = boot_res.refresh_token;
+
+    // 2. Verified access token works on /api/v1/me and /api/v1/vaults
+    let req = Request::builder()
+        .uri("/api/v1/me")
+        .method("GET")
+        .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let req = Request::builder()
+        .uri("/api/v1/vaults")
+        .method("GET")
+        .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // 3. Logout session
+    let logout_req = LogoutRequest {
+        refresh_token: Some(refresh_token),
+    };
+    let req = Request::builder()
+        .uri("/api/v1/auth/logout")
+        .method("POST")
+        .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&logout_req).unwrap()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // 4. Critical security check: The access token MUST be rejected immediately across REST routes
+    let req = Request::builder()
+        .uri("/api/v1/me")
+        .method("GET")
+        .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+    let req = Request::builder()
+        .uri("/api/v1/vaults")
+        .method("GET")
+        .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+    let req = Request::builder()
+        .uri("/api/v1/devices")
+        .method("GET")
+        .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_device_registration_rejects_missing_challenge_pop() {
+    let config = ServerConfig::default();
+    let app = create_router(config);
+
+    // Bootstrap
+    let bootstrap_req = BootstrapRequest {
+        admin_username: "pop_tester".to_string(),
+        admin_email: "pop@example.com".to_string(),
+        admin_password: "SecurePassword123!".to_string(),
+        org_name: "PoP Org".to_string(),
+        bootstrap_token: None,
+    };
+    let req = Request::builder()
+        .uri("/api/v1/bootstrap")
+        .method("POST")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&bootstrap_req).unwrap()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    let body = axum::body::to_bytes(res.into_body(), 1024 * 64)
+        .await
+        .unwrap();
+    let boot_res: BootstrapResponse = serde_json::from_slice(&body).unwrap();
+    let auth_header = format!("Bearer {}", boot_res.access_token);
+
+    // Missing challenge and signature must be rejected with 400 Bad Request
+    let signing_pk = base64::engine::general_purpose::STANDARD.encode([1u8; 32]);
+    let agreement_pk = base64::engine::general_purpose::STANDARD.encode([2u8; 32]);
+    let bad_dev_req = RegisterDeviceRequest {
+        device_name: "Unauthenticated-Device".to_string(),
+        signing_public_key: signing_pk,
+        agreement_public_key: agreement_pk,
+        challenge: None,
+        challenge_signature: None,
+    };
+
+    let req = Request::builder()
+        .uri("/api/v1/devices")
+        .method("POST")
+        .header(header::AUTHORIZATION, &auth_header)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&bad_dev_req).unwrap()))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
 }
