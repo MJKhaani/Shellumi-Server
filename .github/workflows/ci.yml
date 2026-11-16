@@ -64,3 +64,25 @@ jobs:
           context: .
           push: false
           tags: shellumi-server:test
+
+  postgres-acceptance:
+    name: PostgreSQL acceptance
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: testpassword
+          POSTGRES_DB: shellumi_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres -d shellumi_test"
+          --health-interval 2s --health-timeout 2s --health-retries 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run PostgreSQL acceptance
+        env:
+          SHELLUMI_TEST_DATABASE_URL: postgres://postgres:testpassword@localhost:5432/shellumi_test
+        run: cargo test --locked -p shellumi-server-store --test postgres_acceptance

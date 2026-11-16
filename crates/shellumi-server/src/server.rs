@@ -26,7 +26,9 @@ use shellumi_server_protocol::{
     UpdateVaultRequest, VaultWatermark, WsClientMessage, WsServerMessage, CURRENT_PROTOCOL_VERSION,
     MIN_PROTOCOL_VERSION,
 };
-use shellumi_server_store::{AnyStore, DeviceRepository, PgStore, UserRepository, VaultRepository};
+use shellumi_server_store::{
+    AnyStore, DeviceRepository, PgStore, SettingsRepository, UserRepository, VaultRepository,
+};
 use shellumi_server_sync::SyncEngine;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -69,6 +71,63 @@ pub struct AppState {
     pub metrics: Arc<MetricsRegistry>,
     notifications: broadcast::Sender<SyncEvent>,
     notification_connections: Arc<Semaphore>,
+}
+
+impl AppState {
+    /// Broadcast an event locally and via PostgreSQL NOTIFY for multi-instance fanout.
+    async fn broadcast_sync_event(&self, event: SyncEvent) {
+        let instance_id = self.config.server_instance_id;
+        let payload = match &event {
+            SyncEvent::VaultChanged {
+                vault_id,
+                latest_sequence,
+                ..
+            } => {
+                serde_json::json!({
+                    "type": "vault_changed",
+                    "vault_id": vault_id,
+                    "latest_sequence": latest_sequence,
+                    "source_instance": instance_id,
+                })
+            }
+            SyncEvent::KeyRotated {
+                vault_id, epoch, ..
+            } => {
+                serde_json::json!({
+                    "type": "key_rotated",
+                    "vault_id": vault_id,
+                    "epoch": epoch,
+                    "source_instance": instance_id,
+                })
+            }
+            SyncEvent::AccessRevoked {
+                vault_id, user_id, ..
+            } => {
+                serde_json::json!({
+                    "type": "access_revoked",
+                    "vault_id": vault_id,
+                    "user_id": user_id,
+                    "source_instance": instance_id,
+                })
+            }
+            SyncEvent::Logout(user_id) => {
+                serde_json::json!({
+                    "type": "logout",
+                    "user_id": user_id,
+                    "source_instance": instance_id,
+                })
+            }
+        };
+
+        // Local broadcast
+        let _ = self.notifications.send(event);
+
+        // Cross-instance via PostgreSQL NOTIFY (best-effort, non-blocking)
+        let _ = self
+            .store
+            .notify_sync_event("shellumi_sync_events", &payload.to_string())
+            .await;
+    }
 }
 
 pub fn create_router(config: ServerConfig) -> Router {
@@ -125,32 +184,133 @@ pub fn create_router_with_auth_and_sync(
     // If PostgreSQL database is configured, bridge cross-instance events via LISTEN/NOTIFY
     if let Some(db_url) = config.database_url.clone() {
         let notif_tx = notifications.clone();
+        let instance_id = config.server_instance_id;
         tokio::spawn(async move {
-            if let Ok(mut listener) = sqlx::postgres::PgListener::connect(&db_url).await {
-                if listener.listen("shellumi_sync_events").await.is_ok() {
-                    while let Ok(notification) = listener.recv().await {
-                        if let Ok(val) =
-                            serde_json::from_str::<serde_json::Value>(notification.payload())
-                        {
-                            if let Some(event_type) = val.get("type").and_then(|v| v.as_str()) {
-                                if event_type == "vault_changed" {
-                                    if let (Some(vid_str), Some(seq)) = (
-                                        val.get("vault_id").and_then(|v| v.as_str()),
-                                        val.get("latest_sequence").and_then(|v| v.as_u64()),
+            let mut backoff_secs = 1u64;
+            loop {
+                match sqlx::postgres::PgListener::connect(&db_url).await {
+                    Ok(mut listener) => {
+                        if listener.listen("shellumi_sync_events").await.is_err() {
+                            tracing::warn!(
+                                "PgListener: failed to LISTEN, retrying in {backoff_secs}s"
+                            );
+                            tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                            backoff_secs = (backoff_secs * 2).min(60);
+                            continue;
+                        }
+                        backoff_secs = 1; // reset on successful connect
+                        loop {
+                            match listener.recv().await {
+                                Ok(notification) => {
+                                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(
+                                        notification.payload(),
                                     ) {
-                                        if let Ok(vault_id) = Uuid::parse_str(vid_str) {
-                                            let _ = notif_tx.send(SyncEvent::VaultChanged {
-                                                vault_id,
-                                                latest_sequence: seq,
-                                                notification_id: Uuid::new_v4(),
-                                            });
+                                        // Skip self-echoed events
+                                        if let Some(src) =
+                                            val.get("source_instance").and_then(|v| v.as_str())
+                                        {
+                                            if src == instance_id.to_string() {
+                                                continue;
+                                            }
+                                        }
+                                        if let Some(event_type) =
+                                            val.get("type").and_then(|v| v.as_str())
+                                        {
+                                            match event_type {
+                                                "vault_changed" => {
+                                                    if let (Some(vid_str), Some(seq)) = (
+                                                        val.get("vault_id")
+                                                            .and_then(|v| v.as_str()),
+                                                        val.get("latest_sequence")
+                                                            .and_then(|v| v.as_u64()),
+                                                    ) {
+                                                        if let Ok(vault_id) =
+                                                            Uuid::parse_str(vid_str)
+                                                        {
+                                                            let _ = notif_tx.send(
+                                                                SyncEvent::VaultChanged {
+                                                                    vault_id,
+                                                                    latest_sequence: seq,
+                                                                    notification_id: Uuid::new_v4(),
+                                                                },
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                                "key_rotated" => {
+                                                    if let (Some(vid_str), Some(epoch)) = (
+                                                        val.get("vault_id")
+                                                            .and_then(|v| v.as_str()),
+                                                        val.get("epoch").and_then(|v| v.as_u64()),
+                                                    ) {
+                                                        if let Ok(vault_id) =
+                                                            Uuid::parse_str(vid_str)
+                                                        {
+                                                            let _ = notif_tx.send(
+                                                                SyncEvent::KeyRotated {
+                                                                    vault_id,
+                                                                    epoch: epoch as u32,
+                                                                    notification_id: Uuid::new_v4(),
+                                                                },
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                                "access_revoked" => {
+                                                    if let Some(vid_str) =
+                                                        val.get("vault_id").and_then(|v| v.as_str())
+                                                    {
+                                                        if let Ok(vault_id) =
+                                                            Uuid::parse_str(vid_str)
+                                                        {
+                                                            let user_id = val
+                                                                .get("user_id")
+                                                                .and_then(|v| v.as_str())
+                                                                .and_then(|s| {
+                                                                    Uuid::parse_str(s).ok()
+                                                                });
+                                                            let _ = notif_tx.send(
+                                                                SyncEvent::AccessRevoked {
+                                                                    vault_id,
+                                                                    user_id,
+                                                                    notification_id: Uuid::new_v4(),
+                                                                },
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                                "logout" => {
+                                                    if let Some(uid_str) =
+                                                        val.get("user_id").and_then(|v| v.as_str())
+                                                    {
+                                                        if let Ok(user_id) =
+                                                            Uuid::parse_str(uid_str)
+                                                        {
+                                                            let _ = notif_tx
+                                                                .send(SyncEvent::Logout(user_id));
+                                                        }
+                                                    }
+                                                }
+                                                _ => {}
+                                            }
                                         }
                                     }
+                                }
+                                Err(e) => {
+                                    tracing::warn!("PgListener: recv error: {e}, reconnecting in {backoff_secs}s");
+                                    break; // break inner loop to reconnect
                                 }
                             }
                         }
                     }
+                    Err(e) => {
+                        tracing::warn!(
+                            "PgListener: connect error: {e}, retrying in {backoff_secs}s"
+                        );
+                    }
                 }
+                tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                backoff_secs = (backoff_secs * 2).min(60);
             }
         });
     }
@@ -519,7 +679,9 @@ async fn logout_handler(
 
     match state.auth.logout(claims.sub, req).await {
         Ok(()) => {
-            let _ = state.notifications.send(SyncEvent::Logout(claims.sub));
+            state
+                .broadcast_sync_event(SyncEvent::Logout(claims.sub))
+                .await;
             (
                 StatusCode::OK,
                 Json(serde_json::json!({ "status": "logged_out" })),
@@ -2238,7 +2400,7 @@ fn map_domain_error(err: DomainError) -> (StatusCode, Json<ErrorResponse>) {
     )
 }
 
-pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run(mut config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
     let store = if let Some(ref db_url) = config.database_url {
         info!("Connecting to PostgreSQL database...");
         let pg = PgStore::connect(db_url).await?;
@@ -2250,6 +2412,20 @@ pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>>
         info!("No database URL configured; running with in-memory store.");
         AnyStore::memory()
     };
+
+    // Persist server identity and token signing key across restarts
+    if config.token_signing_key.is_none() {
+        match store.get_or_init_server_keys().await {
+            Ok((install_id, key_bytes)) => {
+                config.server_instance_id = install_id;
+                config.token_signing_key = Some(hex::encode(&key_bytes));
+                info!("Loaded persistent server identity: {}", install_id);
+            }
+            Err(e) => {
+                tracing::warn!("Could not persist server keys: {e}; using ephemeral key");
+            }
+        }
+    }
 
     let listen_addr = config.listen_addr;
     let app = create_router_with_store(config, store);

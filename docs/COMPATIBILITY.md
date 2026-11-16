@@ -147,3 +147,5 @@ the existing token format.
 
 The additive `/api/v1/sync/poll` endpoint supplies volatile hints to clients without
 WebSocket support; clients must reconcile via REST across polling gaps.
+
+Revision-specific snapshots accept only the current watermark and return HTTP 422 for historical or future revisions. Clients should request the latest snapshot and resume the change feed from its watermark. This pre-release protocol v1 adjustment does not change local-only or direct Google Drive sync.

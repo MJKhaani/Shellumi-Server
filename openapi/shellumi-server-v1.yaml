@@ -503,7 +503,7 @@ paths:
   /api/v1/vaults/{id}/snapshots/{revision}:
     get:
       summary: Get full recovery snapshot
-      description: Returns active encrypted records for full resynchronization.
+      description: Returns active encrypted records only when revision equals the current watermark; historical and future revisions are rejected.
       security:
         - BearerAuth: []
       parameters:
@@ -519,6 +519,8 @@ paths:
           schema:
             type: string
       responses:
+        '422':
+          description: Requested revision is not the current watermark
         '200':
           description: Recovery snapshot
           content:

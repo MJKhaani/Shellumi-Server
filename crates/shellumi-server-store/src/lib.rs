@@ -16,6 +16,10 @@ use uuid::Uuid;
 pub mod pg;
 pub use pg::{run_migrations, AnyStore, PgStore, MIGRATOR};
 
+pub const SERVER_SETTINGS_SINGLETON_ID: Uuid = Uuid::from_bytes([
+    0x73, 0x68, 0x65, 0x6c, 0x6c, 0x75, 0x6d, 0x69, 0x5f, 0x73, 0x65, 0x74, 0x74, 0x69, 0x6e, 0x67,
+]);
+
 #[async_trait]
 pub trait SettingsRepository: Send + Sync {
     async fn get_settings(&self) -> Result<ServerSettings, DomainError>;
@@ -31,6 +35,7 @@ pub trait SettingsRepository: Send + Sync {
         org: &Organization,
         session: &Session,
     ) -> Result<(), DomainError>;
+    async fn get_or_init_server_keys(&self) -> Result<(Uuid, Vec<u8>), DomainError>;
 }
 
 #[async_trait]
@@ -360,11 +365,12 @@ impl SettingsRepository for InMemoryStore {
             // Default initial settings if not explicitly seeded
             let now = chrono::Utc::now().timestamp();
             Ok(ServerSettings {
-                id: Uuid::new_v4(),
+                id: SERVER_SETTINGS_SINGLETON_ID,
                 install_id: Uuid::new_v4(),
                 schema_version: 1,
                 bootstrap_consumed: false,
                 bootstrap_token_hash: None,
+                token_signing_key: None,
                 created_at: now,
                 updated_at: now,
             })
@@ -387,11 +393,12 @@ impl SettingsRepository for InMemoryStore {
         } else {
             let now = chrono::Utc::now().timestamp();
             ServerSettings {
-                id: Uuid::new_v4(),
+                id: SERVER_SETTINGS_SINGLETON_ID,
                 install_id: Uuid::new_v4(),
                 schema_version: 1,
                 bootstrap_consumed: false,
                 bootstrap_token_hash: None,
+                token_signing_key: None,
                 created_at: now,
                 updated_at: now,
             }
@@ -427,11 +434,12 @@ impl SettingsRepository for InMemoryStore {
         } else {
             let now = chrono::Utc::now().timestamp();
             ServerSettings {
-                id: Uuid::new_v4(),
+                id: SERVER_SETTINGS_SINGLETON_ID,
                 install_id: Uuid::new_v4(),
                 schema_version: 1,
                 bootstrap_consumed: false,
                 bootstrap_token_hash: None,
+                token_signing_key: None,
                 created_at: now,
                 updated_at: now,
             }
@@ -484,6 +492,50 @@ impl SettingsRepository for InMemoryStore {
             .insert(session.refresh_token_hash.clone(), session.id);
 
         Ok(())
+    }
+
+    async fn get_or_init_server_keys(&self) -> Result<(Uuid, Vec<u8>), DomainError> {
+        let mut lock = self.state.write().await;
+        if let Some(ref mut settings) = lock.settings {
+            if let Some(ref key_hex) = settings.token_signing_key {
+                if let Ok(bytes) = hex::decode(key_hex) {
+                    if !bytes.is_empty() {
+                        return Ok((settings.install_id, bytes));
+                    }
+                }
+            }
+            use ring::rand::SecureRandom;
+            let rng = ring::rand::SystemRandom::new();
+            let mut key = vec![0u8; 32];
+            rng.fill(&mut key)
+                .map_err(|_| DomainError::Internal("Entropy failure".into()))?;
+            let hex_key = hex::encode(&key);
+            settings.token_signing_key = Some(hex_key);
+            settings.updated_at = chrono::Utc::now().timestamp();
+            return Ok((settings.install_id, key));
+        }
+
+        let now = chrono::Utc::now().timestamp();
+        let install_id = Uuid::new_v4();
+        use ring::rand::SecureRandom;
+        let rng = ring::rand::SystemRandom::new();
+        let mut key = vec![0u8; 32];
+        rng.fill(&mut key)
+            .map_err(|_| DomainError::Internal("Entropy failure".into()))?;
+        let hex_key = hex::encode(&key);
+
+        let settings = ServerSettings {
+            id: SERVER_SETTINGS_SINGLETON_ID,
+            install_id,
+            schema_version: 1,
+            bootstrap_consumed: false,
+            bootstrap_token_hash: None,
+            token_signing_key: Some(hex_key),
+            created_at: now,
+            updated_at: now,
+        };
+        lock.settings = Some(settings);
+        Ok((install_id, key))
     }
 }
 
@@ -1441,12 +1493,17 @@ impl SyncRepository for InMemoryStore {
             .get(&vault_id)
             .ok_or(DomainError::VaultNotFound(vault_id))?;
         let watermark = vault.server_sequence;
-        if let Some(rev) = requested_revision {
-            if rev > watermark {
+        if let Some(target_seq) = requested_revision {
+            if target_seq > watermark {
                 return Err(DomainError::InvalidInput(format!(
                     "Requested snapshot revision {} exceeds current watermark {}",
-                    rev, watermark
+                    target_seq, watermark
                 )));
+            }
+            if target_seq < watermark {
+                return Err(DomainError::InvalidInput(
+                    "Historical snapshots are not supported; request the current watermark".into(),
+                ));
             }
         }
         let mut list: Vec<Record> = lock

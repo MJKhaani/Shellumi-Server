@@ -922,3 +922,94 @@ This journal records every increment, decision, test execution, and verification
 - Issue / PR / CI evidence:
   - Baseline commit: `500d3b3d0f63aee11697b2d64bd0b2b5dac238f4`.
 
+
+## 2026-11-16T08:50:11Z — TASK-014 — Independent phase 11 re-verification follow-up
+- Status: planned
+- Baseline / commit: `a7c952ca93c594484a0baaef1d370393a5f4e514`; existing uncommitted changes from an interrupted agent are preserved.
+- Objective and acceptance criteria: Assess and continue the attached re-verification findings P0-01 through P1-08; verify real PostgreSQL bootstrap and concurrency, snapshot correctness, notification behavior, installation identity, and mandatory CI coverage where feasible. Correct prior completion claims if acceptance evidence is missing.
+- Implementation / files changed: Planned inspection of existing changes, relevant tests, migrations, and deployment/CI configuration.
+- Data migration or API compatibility: Assess existing uncommitted migration and retain protocol v1; document any changes.
+- Security / privacy review: Review singleton bootstrap, credentials, isolation, and notification recovery.
+- Tests added (file + test names): Planned regression and real-database tests appropriate to changes.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): Pending.
+- Known limitations / failed attempts: Existing changes have not yet been independently verified.
+- Next precise step: Check compilation and available PostgreSQL runtime, then inspect and validate the interrupted changes.
+- Issue / PR / CI evidence: Independent report supplied by user; no new CI run.
+
+## 2026-11-16T08:55:00Z — TASK-014 — Interrupted remediation assessment
+- Status: partial
+- Baseline / commit: `a7c952ca93c594484a0baaef1d370393a5f4e514`, with pre-existing uncommitted remediation changes.
+- Objective and acceptance criteria: Preserve and assess interrupted work; correct unsupported completion claims; the attached report's acceptance gates remain open.
+- Implementation / files changed: Updated `docs/ROADMAP.md` to mark M1–M6 and Phase 11 partial. Existing source and migration changes were not authored or altered in this assessment.
+- Data migration or API compatibility: Existing uncommitted migration `20261116000002_persistent_install_keys.sql` is unverified. Existing settings rows may use non-singleton IDs, while modified bootstrap queries select only the fixed ID; migration/upgrade handling must be resolved before use. No protocol change made in this assessment.
+- Security / privacy review: Existing historical snapshot reconstruction fabricates `key_epoch = 0`; preserve actual epoch or enforce a correctly documented latest-only contract. Existing cross-instance notification and key persistence changes require review, especially event delivery, key storage and startup failure paths. No real-service security claims established.
+- Tests added (file + test names): None; documentation/status assessment only.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): On Darwin 23.6.0 x86_64, `cargo check --locked --workspace --all-features` passed. `cargo fmt --all -- --check` failed on existing uncommitted Rust formatting. `git diff --check` passed. A Python assertion checked the progress-link target and seven roadmap status rows; an initial overly restrictive assertion failed, then a corrected assertion passed. `docker info --format '{{.ServerVersion}}'` failed because the Colima Docker socket is unavailable. No real PostgreSQL, WSS, workspace tests, clippy, build, audit, or CI run was performed.
+- Known limitations / failed attempts: P0-01 through P1-08 remain unverified. Historical snapshot and existing-installation bootstrap defects above must be addressed. Docker daemon unavailable; `cargo-audit` was not found. Previous TASK-013 completion claims are superseded by this entry and the roadmap status.
+- Next precise step: Provision an ephemeral PostgreSQL service; add failing fresh/upgrade bootstrap and concurrency tests, repair singleton migration without losing settings, then address snapshot semantics and run the required real-service gates.
+- Issue / PR / CI evidence: User-supplied independent report; no new CI evidence.
+
+## 2026-11-16T09:00:00Z — TASK-015 — Bootstrap and snapshot remediation
+- Status: planned
+- Baseline / commit: `a7c952ca93c594484a0baaef1d370393a5f4e514` plus interrupted TASK-014 working tree.
+- Objective and acceptance criteria: Preserve existing settings during singleton migration; reject historical snapshots until full historical metadata exists; retain consistent latest snapshots; add regression coverage and verify PostgreSQL when available.
+- Implementation / files changed: Planned migration, snapshot repositories, tests and protocol documentation.
+- Data migration or API compatibility: Forward migration must fail closed on duplicate settings; snapshot revision endpoint accepts only current watermark.
+- Security / privacy review: Prevent bootstrap re-enablement and fabricated historical metadata.
+- Tests added (file + test names): Planned snapshot regression and PostgreSQL migration/bootstrap tests.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): Pending.
+- Known limitations / failed attempts: Docker daemon initially unavailable; starting local runtime.
+- Next precise step: Implement migration and latest-only snapshot semantics.
+- Issue / PR / CI evidence: User-provided re-verification report; no new CI.
+
+## 2026-11-16T08:58:00Z — TASK-015 — Singleton and snapshot implementation milestone
+- Status: in_progress
+- Baseline / commit: `a7c952ca93c594484a0baaef1d370393a5f4e514` plus pre-existing changes.
+- Objective and acceptance criteria: Preserve prior singleton settings, prevent missing configured bootstrap tokens, and avoid fabricated historical snapshots.
+- Implementation / files changed: Updated `20261116000002_persistent_install_keys.sql` to preserve a lone existing settings row and reject multiple rows; fixed PostgreSQL bootstrap-token checks; rejected historical snapshot requests in both stores; added snapshot regression and PostgreSQL bootstrap race test; added a PostgreSQL CI service job and documented latest-only behavior.
+- Data migration or API compatibility: Migration normalizes one existing settings ID and rejects duplicates; revision-specific snapshots now reject non-current revisions with 422.
+- Security / privacy review: Singleton constraint prevents additional settings rows; database upgrade and token checks await real PostgreSQL verification.
+- Tests added (file + test names): `sync_and_vaults.rs::test_snapshot_bounded_revision_and_watermark`; `postgres_acceptance.rs::fresh_database_bootstrap_is_atomic_and_single_use`.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): `cargo fmt --all` run; targeted test compiling. Local Docker Compose plugin unavailable; attempting disposable PostgreSQL with `docker run`.
+- Known limitations / failed attempts: PostgreSQL integration, upgrade, full CI and network notification tests remain outstanding.
+- Next precise step: Run regression and real PostgreSQL tests, repair failures, then continue remaining audit findings.
+- Issue / PR / CI evidence: No new CI run.
+
+## 2026-11-16T09:01:00Z — TASK-015 — PostgreSQL bootstrap regression milestone
+- Status: in_progress
+- Baseline / commit: `a7c952ca93c594484a0baaef1d370393a5f4e514` plus working tree changes.
+- Objective and acceptance criteria: Execute fresh-database bootstrap, token rejection, concurrency, and restart-key checks on PostgreSQL.
+- Implementation / files changed: Added missing and incorrect token rejection to `crates/shellumi-server-store/tests/postgres_acceptance.rs`; documented the test and latest-only contract in testing, compatibility and OpenAPI documents.
+- Data migration or API compatibility: Protocol v1 retains the route but rejects non-current snapshots with 422; old-settings upgrade and duplicate-row migration tests remain necessary.
+- Security / privacy review: Concurrent distinct bootstrap calls yielded exactly one successful account; required bootstrap token rejection tested. This does not establish end-to-end authentication or notification security.
+- Tests added (file + test names): `fresh_database_bootstrap_is_atomic_and_single_use`; expanded `test_snapshot_bounded_revision_and_watermark`.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): Darwin 23.6.0 x86_64: `cargo test --locked -p shellumi-server --test sync_and_vaults test_snapshot_bounded_revision_and_watermark` passed (1); `SHELLUMI_TEST_DATABASE_URL=postgres://postgres:testpassword@127.0.0.1:5433/shellumi_test cargo test --locked -p shellumi-server-store --test postgres_acceptance` initially failed due to sandbox network denial, then passed with local socket access (1); `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings` passed. PostgreSQL ran as disposable `postgres:16-alpine` container. CI not run.
+- Known limitations / failed attempts: Docker Compose plugin unavailable; full PostgreSQL HTTP lifecycle, upgrades, WSS fanout and recovery are not established. Workspace test run in progress.
+- Next precise step: Finish workspace tests and inspect remaining cross-instance notification and key lifecycle defects; add real database upgrade and end-to-end coverage.
+- Issue / PR / CI evidence: No new CI run.
+
+## 2026-11-16T09:03:34Z — TASK-015 — Verification and remaining work
+- Status: partial
+- Baseline / commit: `a7c952ca93c594484a0baaef1d370393a5f4e514`; uncommitted interrupted changes retained.
+- Objective and acceptance criteria: Bootstrap, snapshot and PostgreSQL CI improvements implemented; broader Phase 11 acceptance remains open.
+- Implementation / files changed: Added migration upgrade and duplicate-row regressions in `crates/shellumi-server-store/tests/postgres_acceptance.rs`; documented migration recovery and database-held signing-key risk in `docs/BACKUP_RESTORE.md` and `docs/security/THREAT_MODEL.md`. Changes also include `.github/workflows/ci.yml`, `CHANGELOG.md`, store repositories and migration, `sync_and_vaults.rs`, `docs/API.md`, `docs/COMPATIBILITY.md`, `docs/PROTOCOL_V1.md`, `docs/development/TESTING.md`, and OpenAPI.
+- Data migration or API compatibility: A lone old settings row is normalized preserving installation ID and bootstrap state; duplicate rows halt migration. Historical snapshot revisions return 422. Local-only and direct Google Drive modes were not modified.
+- Security / privacy review: Token checks reject missing and incorrect values; database access grants access to stored signing key. Multi-instance notification delivery is still defective: most events use local broadcast, and shared installation IDs suppress cross-instance echoes. Startup key error fallback and explicit-key identity behavior require review. No independent security audit.
+- Tests added (file + test names): `postgres_acceptance.rs::fresh_database_bootstrap_is_atomic_and_single_use`, `postgres_acceptance.rs::singleton_migration_preserves_existing_settings_and_rejects_duplicates`, and `sync_and_vaults.rs::test_snapshot_bounded_revision_and_watermark` regression.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): Darwin 23.6.0 x86_64: `cargo fmt --all -- --check` passed; `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings` passed; `cargo test --locked --workspace --all-features` passed 92 existing/changed tests, with one PostgreSQL test returning early without its environment variable; separately `SHELLUMI_TEST_DATABASE_URL=postgres://postgres:testpassword@127.0.0.1:5433/shellumi_test cargo test --locked -p shellumi-server-store --test postgres_acceptance` passed bootstrap test (1), and the same command with `singleton_migration_preserves_existing_settings_and_rejects_duplicates` filter passed upgrade test (1). The latter test was added after the workspace run. `cargo test --locked --doc --workspace` passed (0 doc tests); `cargo build --locked --workspace --all-features` passed; `git diff --check` passed. `cargo audit` failed because cargo-audit is not installed. PostgreSQL container was removed. No CI run.
+- Known limitations / failed attempts: Full HTTP PostgreSQL lifecycle, snapshot concurrency, real two-server WSS delivery/recovery, installation-key lifecycle, signed-envelope audit and S-01–S-16 re-audit remain incomplete. CI PostgreSQL job covers only store-level bootstrap and migration, not full acceptance.
+- Next precise step: Add a two-server PostgreSQL WebSocket regression covering material events; replace shared installation ID with per-process notification origin, route all material events through fanout, and verify reconnect reconciliation before claiming P1-05/P1-06.
+- Issue / PR / CI evidence: No new CI run.
+
+## 2026-11-16T09:04:00Z — TASK-016 — Publish partial remediation
+- Status: partial
+- Baseline / commit: `a7c952ca93c594484a0baaef1d370393a5f4e514` plus the uncommitted TASK-014/015 changes.
+- Objective and acceptance criteria: At the user's request, commit and push the existing changes without further verification, while identifying unfinished functionality.
+- Implementation / files changed: Clarified unreleased change notes; preserve all existing TASK-014/015 work and documentation.
+- Data migration or API compatibility: See TASK-015; singleton migration and latest-only snapshots are pre-release changes.
+- Security / privacy review: Cross-instance delivery is partially unimplemented, not merely unverified: most material events still use local broadcast, and shared installation IDs suppress forwarded events. Startup can fall back to an ephemeral signing key on persistence error. Do not treat the current notification or installation-key work as complete.
+- Tests added (file + test names): No new tests in this publication step; see TASK-015.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): No additional verification requested; previously executed results are recorded in TASK-015. CI and cargo audit remain outstanding.
+- Known limitations / failed attempts: Full HTTP PostgreSQL lifecycle, historical snapshots, complete cross-instance notification/recovery, and signing-key lifecycle remain incomplete or unverified as described in TASK-015. Publication does not close these findings.
+- Next precise step: Commit and push the partial changes; continue the remaining remediation in a subsequent increment.
+- Issue / PR / CI evidence: No new CI run at this point.

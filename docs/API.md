@@ -1172,3 +1172,5 @@ session or device is invalid, 429 when the shared connection limit is reached,
 and 409 with `RESYNC_REQUIRED` if its broadcast receiver falls behind. Hints are
 volatile and polling has gaps: reconcile through REST before beginning or
 resuming polling and after every 204, disconnect, error, or overflow.
+
+Historical snapshots are not available: `GET /api/v1/vaults/{id}/snapshots/{revision}` accepts only the current watermark; older and future revisions return 422. Use the latest snapshot and resume from its watermark.

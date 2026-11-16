@@ -926,6 +926,16 @@ async fn test_snapshot_bounded_revision_and_watermark() {
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
+    // A historical revision must not return current or fabricated record state.
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("/api/v1/vaults/{vault_id}/snapshots/0"))
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
     // 3. Snapshot with requested revision > watermark (e.g. 99) -> 422 Unprocessable Entity
     let req = Request::builder()
         .method("GET")

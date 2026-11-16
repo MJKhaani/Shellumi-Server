@@ -56,15 +56,15 @@ The test suite spans unit, component, repository, integration, and wire contract
 
 ## 3. Database Integration Testing (PostgreSQL)
 
-To run integration tests against a live PostgreSQL database:
+The PostgreSQL acceptance job runs on every CI push and pull request. The test requires an empty disposable database; without the environment variable it skips locally. It currently covers bootstrap and key persistence only, not the full end-to-end flow. To run it locally:
 
 ```bash
 # Launch ephemeral PostgreSQL container
 docker compose -f deploy/test/compose.yml up -d
 
 # Run migrations and integration tests
-export SHELLUMI_SERVER_DATABASE_URL="postgres://postgres:testpassword@127.0.0.1:5433/shellumi_test"
-cargo test --test ops_and_resilience -- --nocapture
+export SHELLUMI_TEST_DATABASE_URL="postgres://postgres:testpassword@127.0.0.1:5433/shellumi_test"
+cargo test --locked -p shellumi-server-store --test postgres_acceptance -- --nocapture
 
 # Tear down test database
 docker compose -f deploy/test/compose.yml down -v

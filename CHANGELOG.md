@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Historical snapshot revision requests return 422 rather than incorrect state; the PostgreSQL singleton migration preserves one prior installation and rejects duplicate settings rows.
+- PostgreSQL acceptance coverage now exercises bootstrap and settings migration, but the complete HTTP and cross-instance WebSocket paths remain unfinished.
+
 ### Added
 - **Milestone M0: Repository foundations and project hygiene**
   - Modular Rust workspace layout (`shellumi-server`, `shellumi-server-protocol`, `shellumi-server-domain`).

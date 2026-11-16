@@ -187,3 +187,5 @@ Once the server is restored:
 - All migrations in `migrations/` are strictly forward-only.
 - If upgrading a server binary introduces issues, operators can safely downgrade to the previous minor server binary **provided the database schema version is supported**.
 - Check `docs/COMPATIBILITY.md` for the server binary and database migration compatibility matrix before rolling back binaries.
+
+The pending `20261116000002_persistent_install_keys.sql` migration normalizes a single existing settings row to the singleton ID. It fails if multiple settings rows exist. Before upgrading, take and verify a database backup; if duplicates exist, stop the server and reconcile the rows with operator review, preserving the correct installation ID, bootstrap state, and token policy. Restore the verified backup if reconciliation fails. Never discard rows automatically. The migration and recovery procedure require upgrade testing before release.

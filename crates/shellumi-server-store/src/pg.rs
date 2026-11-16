@@ -19,6 +19,7 @@ use crate::{
     compute_audit_hash, AuditRepository, CollabRepository, DeviceRepository, InMemoryStore,
     InviteRepository, KeyEnvelopeRepository, OrgRepository, SessionRepository, SettingsRepository,
     Store, SyncRepository, UserRepository, VaultRepository, GENESIS_AUDIT_HASH,
+    SERVER_SETTINGS_SINGLETON_ID,
 };
 
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
@@ -95,6 +96,16 @@ impl PgStore {
     pub async fn run_migrations(&self) -> Result<(), DomainError> {
         run_migrations(&self.pool).await
     }
+
+    pub async fn notify_sync_event(&self, channel: &str, payload: &str) -> Result<(), DomainError> {
+        sqlx::query("SELECT pg_notify($1, $2)")
+            .bind(channel)
+            .bind(payload)
+            .execute(&self.pool)
+            .await
+            .map_err(map_db_error)?;
+        Ok(())
+    }
 }
 
 impl Store for PgStore {}
@@ -107,7 +118,7 @@ impl Store for PgStore {}
 impl SettingsRepository for PgStore {
     async fn get_settings(&self) -> Result<ServerSettings, DomainError> {
         let row = sqlx::query(
-            "SELECT id, install_id, schema_version, bootstrap_consumed, bootstrap_token_hash, created_at, updated_at FROM server_settings LIMIT 1"
+            "SELECT id, install_id, schema_version, bootstrap_consumed, bootstrap_token_hash, token_signing_key, created_at, updated_at FROM server_settings ORDER BY created_at ASC LIMIT 1"
         )
         .fetch_optional(&self.pool)
         .await
@@ -120,17 +131,19 @@ impl SettingsRepository for PgStore {
                 schema_version: r.get::<i32, _>("schema_version") as u32,
                 bootstrap_consumed: r.get("bootstrap_consumed"),
                 bootstrap_token_hash: r.get("bootstrap_token_hash"),
+                token_signing_key: r.get("token_signing_key"),
                 created_at: r.get("created_at"),
                 updated_at: r.get("updated_at"),
             })
         } else {
             let now = Utc::now().timestamp();
             let settings = ServerSettings {
-                id: Uuid::new_v4(),
+                id: SERVER_SETTINGS_SINGLETON_ID,
                 install_id: Uuid::new_v4(),
                 schema_version: 1,
                 bootstrap_consumed: false,
                 bootstrap_token_hash: None,
+                token_signing_key: None,
                 created_at: now,
                 updated_at: now,
             };
@@ -142,13 +155,14 @@ impl SettingsRepository for PgStore {
     async fn update_settings(&self, settings: &ServerSettings) -> Result<(), DomainError> {
         sqlx::query(
             r#"
-            INSERT INTO server_settings (id, install_id, schema_version, bootstrap_consumed, bootstrap_token_hash, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            INSERT INTO server_settings (id, install_id, schema_version, bootstrap_consumed, bootstrap_token_hash, token_signing_key, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             ON CONFLICT (id) DO UPDATE SET
                 install_id = EXCLUDED.install_id,
                 schema_version = EXCLUDED.schema_version,
                 bootstrap_consumed = EXCLUDED.bootstrap_consumed,
                 bootstrap_token_hash = EXCLUDED.bootstrap_token_hash,
+                token_signing_key = EXCLUDED.token_signing_key,
                 updated_at = EXCLUDED.updated_at
             "#
         )
@@ -157,6 +171,7 @@ impl SettingsRepository for PgStore {
         .bind(settings.schema_version as i32)
         .bind(settings.bootstrap_consumed)
         .bind(&settings.bootstrap_token_hash)
+        .bind(&settings.token_signing_key)
         .bind(settings.created_at)
         .bind(settings.updated_at)
         .execute(&self.pool)
@@ -172,9 +187,15 @@ impl SettingsRepository for PgStore {
     ) -> Result<(), DomainError> {
         let mut tx = self.pool.begin().await.map_err(map_db_error)?;
 
+        sqlx::query("SELECT pg_advisory_xact_lock(714263)")
+            .execute(&mut *tx)
+            .await
+            .map_err(map_db_error)?;
+
         let row = sqlx::query(
-            "SELECT id, bootstrap_consumed, bootstrap_token_hash FROM server_settings LIMIT 1 FOR UPDATE"
+            "SELECT id, bootstrap_consumed, bootstrap_token_hash FROM server_settings WHERE id = $1 FOR UPDATE"
         )
+        .bind(SERVER_SETTINGS_SINGLETON_ID)
         .fetch_optional(&mut *tx)
         .await
         .map_err(map_db_error)?;
@@ -187,28 +208,25 @@ impl SettingsRepository for PgStore {
             )
         } else {
             let now = Utc::now().timestamp();
-            let new_id = Uuid::new_v4();
             sqlx::query(
-                "INSERT INTO server_settings (id, install_id, schema_version, bootstrap_consumed, bootstrap_token_hash, created_at, updated_at) VALUES ($1, $2, 1, false, NULL, $3, $3)"
+                "INSERT INTO server_settings (id, install_id, schema_version, bootstrap_consumed, bootstrap_token_hash, token_signing_key, created_at, updated_at) VALUES ($1, $2, 1, false, NULL, NULL, $3, $3) ON CONFLICT (id) DO NOTHING"
             )
-            .bind(new_id)
+            .bind(SERVER_SETTINGS_SINGLETON_ID)
             .bind(Uuid::new_v4())
             .bind(now)
             .execute(&mut *tx)
             .await
             .map_err(map_db_error)?;
-            (new_id, false, None)
+            (SERVER_SETTINGS_SINGLETON_ID, false, None)
         };
 
         if consumed {
             return Err(DomainError::BootstrapAlreadyConsumed);
         }
 
-        if let Some(expected_hash) = expected_token_hash {
-            if let Some(actual_hash) = &stored_token_hash {
-                if actual_hash != expected_hash {
-                    return Err(DomainError::InvalidBootstrapToken);
-                }
+        if let Some(required_hash) = stored_token_hash.as_deref() {
+            if expected_token_hash != Some(required_hash) {
+                return Err(DomainError::InvalidBootstrapToken);
             }
         }
 
@@ -235,9 +253,16 @@ impl SettingsRepository for PgStore {
     ) -> Result<(), DomainError> {
         let mut tx = self.pool.begin().await.map_err(map_db_error)?;
 
+        // Acquire advisory transaction lock for bootstrap singleton guarantee
+        sqlx::query("SELECT pg_advisory_xact_lock(714263)")
+            .execute(&mut *tx)
+            .await
+            .map_err(map_db_error)?;
+
         let row = sqlx::query(
-            "SELECT id, bootstrap_consumed, bootstrap_token_hash FROM server_settings LIMIT 1 FOR UPDATE",
+            "SELECT id, bootstrap_consumed, bootstrap_token_hash FROM server_settings WHERE id = $1 FOR UPDATE",
         )
+        .bind(SERVER_SETTINGS_SINGLETON_ID)
         .fetch_optional(&mut *tx)
         .await
         .map_err(map_db_error)?;
@@ -250,28 +275,25 @@ impl SettingsRepository for PgStore {
             )
         } else {
             let now = Utc::now().timestamp();
-            let new_id = Uuid::new_v4();
             sqlx::query(
-                "INSERT INTO server_settings (id, install_id, schema_version, bootstrap_consumed, bootstrap_token_hash, created_at, updated_at) VALUES ($1, $2, 1, false, NULL, $3, $3)",
+                "INSERT INTO server_settings (id, install_id, schema_version, bootstrap_consumed, bootstrap_token_hash, token_signing_key, created_at, updated_at) VALUES ($1, $2, 1, false, NULL, NULL, $3, $3) ON CONFLICT (id) DO NOTHING",
             )
-            .bind(new_id)
+            .bind(SERVER_SETTINGS_SINGLETON_ID)
             .bind(Uuid::new_v4())
             .bind(now)
             .execute(&mut *tx)
             .await
             .map_err(map_db_error)?;
-            (new_id, false, None)
+            (SERVER_SETTINGS_SINGLETON_ID, false, None)
         };
 
         if consumed {
             return Err(DomainError::BootstrapAlreadyConsumed);
         }
 
-        if let Some(expected_hash) = expected_token_hash {
-            if let Some(actual_hash) = &stored_token_hash {
-                if actual_hash != expected_hash {
-                    return Err(DomainError::InvalidBootstrapToken);
-                }
+        if let Some(required_hash) = stored_token_hash.as_deref() {
+            if expected_token_hash != Some(required_hash) {
+                return Err(DomainError::InvalidBootstrapToken);
             }
         }
 
@@ -285,7 +307,7 @@ impl SettingsRepository for PgStore {
         .await
         .map_err(map_db_error)?;
 
-        // Insert User
+        // Insert User - bind raw i64 Unix timestamps
         sqlx::query(
             r#"
             INSERT INTO users (id, username, email, password_hash, is_active, created_at, updated_at)
@@ -297,13 +319,13 @@ impl SettingsRepository for PgStore {
         .bind(&user.email)
         .bind(&user.password_hash)
         .bind(user.is_active)
-        .bind(to_timestamptz(user.created_at))
-        .bind(to_timestamptz(user.updated_at))
+        .bind(user.created_at)
+        .bind(user.updated_at)
         .execute(&mut *tx)
         .await
         .map_err(map_db_error)?;
 
-        // Insert Org
+        // Insert Org - bind raw i64 Unix timestamp
         sqlx::query(
             r#"
             INSERT INTO organizations (id, name, created_at)
@@ -312,26 +334,26 @@ impl SettingsRepository for PgStore {
         )
         .bind(org.id)
         .bind(&org.name)
-        .bind(to_timestamptz(org.created_at))
+        .bind(org.created_at)
         .execute(&mut *tx)
         .await
         .map_err(map_db_error)?;
 
-        // Insert Org Membership
+        // Insert Org Membership - table organization_memberships, column created_at, raw i64
         sqlx::query(
             r#"
-            INSERT INTO org_memberships (org_id, user_id, role, joined_at)
+            INSERT INTO organization_memberships (org_id, user_id, role, created_at)
             VALUES ($1, $2, 'owner', $3)
             "#,
         )
         .bind(org.id)
         .bind(user.id)
-        .bind(to_timestamptz(user.created_at))
+        .bind(user.created_at)
         .execute(&mut *tx)
         .await
         .map_err(map_db_error)?;
 
-        // Insert Session
+        // Insert Session - bind raw i64 Unix timestamps
         sqlx::query(
             r#"
             INSERT INTO sessions (id, user_id, device_id, refresh_token_hash, expires_at, created_at)
@@ -342,14 +364,95 @@ impl SettingsRepository for PgStore {
         .bind(session.user_id)
         .bind(session.device_id)
         .bind(&session.refresh_token_hash)
-        .bind(to_timestamptz(session.expires_at))
-        .bind(to_timestamptz(session.created_at))
+        .bind(session.expires_at)
+        .bind(session.created_at)
         .execute(&mut *tx)
         .await
         .map_err(map_db_error)?;
 
         tx.commit().await.map_err(map_db_error)?;
         Ok(())
+    }
+
+    async fn get_or_init_server_keys(&self) -> Result<(Uuid, Vec<u8>), DomainError> {
+        let mut tx = self.pool.begin().await.map_err(map_db_error)?;
+
+        sqlx::query("SELECT pg_advisory_xact_lock(714263)")
+            .execute(&mut *tx)
+            .await
+            .map_err(map_db_error)?;
+
+        let row = sqlx::query(
+            "SELECT id, install_id, token_signing_key FROM server_settings ORDER BY created_at ASC LIMIT 1 FOR UPDATE",
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_db_error)?;
+
+        if let Some(r) = row {
+            let id: Uuid = r.get("id");
+            let install_id: Uuid = r.get("install_id");
+            let stored_key: Option<String> = r.get("token_signing_key");
+
+            if let Some(key_hex) = stored_key {
+                if let Ok(bytes) = hex::decode(&key_hex) {
+                    if !bytes.is_empty() {
+                        tx.commit().await.map_err(map_db_error)?;
+                        return Ok((install_id, bytes));
+                    }
+                }
+            }
+
+            use ring::rand::SecureRandom;
+            let rng = ring::rand::SystemRandom::new();
+            let mut key = vec![0u8; 32];
+            rng.fill(&mut key)
+                .map_err(|_| DomainError::Internal("Entropy failure".into()))?;
+            let hex_key = hex::encode(&key);
+            let now = Utc::now().timestamp();
+
+            sqlx::query(
+                "UPDATE server_settings SET token_signing_key = $1, updated_at = $2 WHERE id = $3",
+            )
+            .bind(&hex_key)
+            .bind(now)
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_db_error)?;
+
+            tx.commit().await.map_err(map_db_error)?;
+            Ok((install_id, key))
+        } else {
+            let install_id = Uuid::new_v4();
+            use ring::rand::SecureRandom;
+            let rng = ring::rand::SystemRandom::new();
+            let mut key = vec![0u8; 32];
+            rng.fill(&mut key)
+                .map_err(|_| DomainError::Internal("Entropy failure".into()))?;
+            let hex_key = hex::encode(&key);
+            let now = Utc::now().timestamp();
+
+            sqlx::query(
+                r#"
+                INSERT INTO server_settings (id, install_id, schema_version, bootstrap_consumed, bootstrap_token_hash, token_signing_key, created_at, updated_at)
+                VALUES ($1, $2, 1, false, NULL, $3, $4, $4)
+                ON CONFLICT (id) DO UPDATE SET
+                    token_signing_key = COALESCE(server_settings.token_signing_key, EXCLUDED.token_signing_key),
+                    updated_at = EXCLUDED.updated_at
+                "#,
+            )
+            .bind(SERVER_SETTINGS_SINGLETON_ID)
+            .bind(install_id)
+            .bind(&hex_key)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_db_error)?;
+
+            tx.commit().await.map_err(map_db_error)?;
+            Ok((install_id, key))
+        }
     }
 }
 
@@ -1993,18 +2096,6 @@ impl SyncRepository for PgStore {
         .await
         .map_err(map_db_error)?;
 
-        // 9. Send PostgreSQL NOTIFY for multi-instance event fanout
-        let notif_payload = serde_json::json!({
-            "type": "vault_changed",
-            "vault_id": vault_id,
-            "latest_sequence": final_sequence,
-        })
-        .to_string();
-        let _ = sqlx::query("SELECT pg_notify('shellumi_sync_events', $1)")
-            .bind(&notif_payload)
-            .execute(&mut *tx)
-            .await;
-
         tx.commit().await.map_err(map_db_error)?;
 
         Ok(response)
@@ -2094,6 +2185,11 @@ impl SyncRepository for PgStore {
     ) -> Result<(u64, Vec<Record>), DomainError> {
         let mut tx = self.pool.begin().await.map_err(map_db_error)?;
 
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            .execute(&mut *tx)
+            .await
+            .map_err(map_db_error)?;
+
         let row = sqlx::query("SELECT server_sequence FROM vaults WHERE id = $1")
             .bind(vault_id)
             .fetch_optional(&mut *tx)
@@ -2105,12 +2201,18 @@ impl SyncRepository for PgStore {
             None => return Err(DomainError::VaultNotFound(vault_id)),
         };
 
-        if let Some(rev) = requested_revision {
-            if rev > watermark {
+        if let Some(target_seq) = requested_revision {
+            if target_seq > watermark {
                 return Err(DomainError::InvalidInput(format!(
                     "Requested snapshot revision {} exceeds current watermark {}",
-                    rev, watermark
+                    target_seq, watermark
                 )));
+            }
+
+            if target_seq < watermark {
+                return Err(DomainError::InvalidInput(
+                    "Historical snapshots are not supported; request the current watermark".into(),
+                ));
             }
         }
 
@@ -2533,6 +2635,13 @@ impl AnyStore {
             Self::Postgres(pg) => pg.is_ready().await,
         }
     }
+
+    pub async fn notify_sync_event(&self, channel: &str, payload: &str) -> Result<(), DomainError> {
+        match self {
+            Self::Memory(_) => Ok(()),
+            Self::Postgres(pg) => pg.notify_sync_event(channel, payload).await,
+        }
+    }
 }
 
 impl Store for AnyStore {}
@@ -2579,6 +2688,13 @@ impl SettingsRepository for AnyStore {
                 s.complete_bootstrap(expected_token_hash, user, org, session)
                     .await
             }
+        }
+    }
+
+    async fn get_or_init_server_keys(&self) -> Result<(Uuid, Vec<u8>), DomainError> {
+        match self {
+            Self::Memory(s) => s.get_or_init_server_keys().await,
+            Self::Postgres(s) => s.get_or_init_server_keys().await,
         }
     }
 }

@@ -224,6 +224,7 @@ pub struct ServerSettings {
     pub schema_version: u32,
     pub bootstrap_consumed: bool,
     pub bootstrap_token_hash: Option<String>,
+    pub token_signing_key: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
