@@ -88,9 +88,40 @@ pub fn print_migration_status(report: &MigrationStatusReport) {
     }
 }
 
+/// Runs database migrations against the configured database URL.
+pub async fn run_database_migrations(config: &ServerConfig) -> Result<(), String> {
+    if let Some(ref db_url) = config.database_url {
+        println!("Connecting to PostgreSQL database...");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(5)
+            .acquire_timeout(std::time::Duration::from_secs(5))
+            .connect(db_url)
+            .await
+            .map_err(|e| format!("Database connection error: {e}"))?;
+
+        println!("Applying forward migrations...");
+        shellumi_server_store::run_migrations(&pool)
+            .await
+            .map_err(|e| format!("Migration execution failed: {e}"))?;
+
+        println!("[ OK ] All database migrations applied successfully.");
+        Ok(())
+    } else {
+        println!("[ OK ] In-memory storage active; schema automatically initialized.");
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_run_database_migrations_on_in_memory_config() {
+        let config = ServerConfig::default();
+        let res = run_database_migrations(&config).await;
+        assert!(res.is_ok());
+    }
 
     #[test]
     fn test_migration_status_reports_migrations() {

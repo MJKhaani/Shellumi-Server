@@ -3,18 +3,22 @@
 use argon2::password_hash::rand_core::OsRng;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine;
 use rand::RngCore;
+use ring::hmac;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use shellumi_server_domain::{Device, DomainError, Organization, Session, User};
 use shellumi_server_protocol::{
-    BootstrapRequest, BootstrapResponse, DeviceResponse, LoginRequest, LoginResponse,
-    LogoutRequest, MeResponse, RefreshTokenRequest, RefreshTokenResponse, RegisterDeviceRequest,
-    UserOrgSummary,
+    BootstrapRequest, BootstrapResponse, DeviceChallengeResponse, DeviceResponse, LoginRequest,
+    LoginResponse, LogoutRequest, MeResponse, RefreshTokenRequest, RefreshTokenResponse,
+    RegisterDeviceRequest, UserOrgSummary,
 };
 use shellumi_server_store::Store;
+use std::collections::HashMap;
 use std::sync::Arc;
-use subtle::ConstantTimeEq;
+use tokio::sync::RwLock;
 use uuid::Uuid;
 
 /// Claims embedded within a signed bearer access token.
@@ -26,6 +30,10 @@ pub struct AccessTokenClaims {
     pub iat: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iss: Option<Uuid>,
 }
 
 // ---------------------------------------------------------------------------
@@ -104,6 +112,8 @@ fn create_session_access_token(
         exp,
         iat: now,
         session_id,
+        device_id: None,
+        iss: None,
     };
 
     let claims_json = serde_json::to_string(&claims)
@@ -111,12 +121,9 @@ fn create_session_access_token(
 
     let encoded_claims = base64_url_encode(claims_json.as_bytes());
 
-    let mut hasher = Sha256::new();
-    hasher.update(secret);
-    hasher.update(b".");
-    hasher.update(encoded_claims.as_bytes());
-    let signature = hasher.finalize();
-    let encoded_sig = base64_url_encode(&signature);
+    let key = hmac::Key::new(hmac::HMAC_SHA256, secret);
+    let signature = hmac::sign(&key, encoded_claims.as_bytes());
+    let encoded_sig = base64_url_encode(signature.as_ref());
 
     Ok(format!("{encoded_claims}.{encoded_sig}"))
 }
@@ -131,20 +138,11 @@ pub fn verify_access_token(token: &str, secret: &[u8]) -> Result<AccessTokenClai
     let encoded_claims = parts[0];
     let encoded_sig = parts[1];
 
-    let mut hasher = Sha256::new();
-    hasher.update(secret);
-    hasher.update(b".");
-    hasher.update(encoded_claims.as_bytes());
-    let expected_sig = hasher.finalize();
-    let expected_encoded_sig = base64_url_encode(&expected_sig);
+    let sig_bytes = base64_url_decode(encoded_sig)
+        .map_err(|_| DomainError::InvalidToken("Failed to decode token signature".to_string()))?;
 
-    // Constant-time signature comparison to prevent timing attacks
-    if encoded_sig
-        .as_bytes()
-        .ct_eq(expected_encoded_sig.as_bytes())
-        .unwrap_u8()
-        != 1
-    {
+    let key = hmac::Key::new(hmac::HMAC_SHA256, secret);
+    if hmac::verify(&key, encoded_claims.as_bytes(), &sig_bytes).is_err() {
         return Err(DomainError::InvalidToken(
             "Invalid token signature".to_string(),
         ));
@@ -257,6 +255,7 @@ pub struct AuthService<S: Store> {
     token_secret: Vec<u8>,
     access_token_ttl_secs: u64,
     refresh_token_ttl_secs: u64,
+    challenges: Arc<RwLock<HashMap<String, i64>>>,
 }
 
 impl<S: Store> AuthService<S> {
@@ -271,6 +270,7 @@ impl<S: Store> AuthService<S> {
             token_secret,
             access_token_ttl_secs,
             refresh_token_ttl_secs,
+            challenges: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -280,6 +280,63 @@ impl<S: Store> AuthService<S> {
 
     pub fn verify_token(&self, token: &str) -> Result<AccessTokenClaims, DomainError> {
         verify_access_token(token, &self.token_secret)
+    }
+
+    /// Generates a fresh device enrollment challenge nonce with 5-minute expiry.
+    pub async fn create_device_challenge(&self) -> DeviceChallengeResponse {
+        let challenge = shellumi_server_crypto::generate_challenge_nonce();
+        let expires_at = chrono::Utc::now().timestamp() + 300;
+        let mut lock = self.challenges.write().await;
+        let now = chrono::Utc::now().timestamp();
+        lock.retain(|_, exp| *exp > now);
+        lock.insert(challenge.clone(), expires_at);
+        DeviceChallengeResponse {
+            challenge,
+            expires_at,
+        }
+    }
+
+    /// Validates that user, session, and device (if specified) remain active and not revoked.
+    pub async fn validate_active_session(
+        &self,
+        claims: &AccessTokenClaims,
+        device_id: Option<Uuid>,
+    ) -> Result<(), DomainError> {
+        let user = self
+            .store
+            .find_user_by_id(claims.sub)
+            .await?
+            .ok_or(DomainError::Unauthenticated)?;
+        if !user.is_active {
+            return Err(DomainError::Unauthenticated);
+        }
+
+        if let Some(did) = device_id {
+            let device = self
+                .store
+                .find_device_by_id(did)
+                .await?
+                .ok_or(DomainError::DeviceNotFound)?;
+            if device.user_id != claims.sub || device.revoked_at.is_some() {
+                return Err(DomainError::DeviceRevoked);
+            }
+        }
+
+        if let Some(sid) = claims.session_id {
+            let session = self
+                .store
+                .find_session_by_id(sid)
+                .await?
+                .ok_or(DomainError::Unauthenticated)?;
+            if session.revoked_at.is_some() {
+                return Err(DomainError::Unauthenticated);
+            }
+            if session.expires_at < chrono::Utc::now().timestamp() {
+                return Err(DomainError::TokenExpired);
+            }
+        }
+
+        Ok(())
     }
 
     /// One-time interactive bootstrap creating the initial organization and admin account.
@@ -535,15 +592,44 @@ impl<S: Store> AuthService<S> {
                 "Device name cannot be empty".to_string(),
             ));
         }
-        if req.signing_public_key.trim().is_empty() {
-            return Err(DomainError::InvalidPublicKey(
-                "Signing public key cannot be empty".to_string(),
-            ));
+
+        let signing_b64 = req.signing_public_key.trim();
+        let signing_bytes = BASE64_STANDARD.decode(signing_b64).map_err(|e| {
+            DomainError::InvalidPublicKey(format!("Invalid base64 in signing key: {e}"))
+        })?;
+        if signing_bytes.len() != 32 {
+            return Err(DomainError::InvalidPublicKey(format!(
+                "Signing public key must be exactly 32 bytes, got {}",
+                signing_bytes.len()
+            )));
         }
-        if req.agreement_public_key.trim().is_empty() {
-            return Err(DomainError::InvalidPublicKey(
-                "Agreement public key cannot be empty".to_string(),
-            ));
+
+        let agreement_b64 = req.agreement_public_key.trim();
+        let agreement_bytes = BASE64_STANDARD.decode(agreement_b64).map_err(|e| {
+            DomainError::InvalidPublicKey(format!("Invalid base64 in agreement key: {e}"))
+        })?;
+        if agreement_bytes.len() != 32 {
+            return Err(DomainError::InvalidPublicKey(format!(
+                "Agreement public key must be exactly 32 bytes, got {}",
+                agreement_bytes.len()
+            )));
+        }
+
+        if let Some(challenge) = &req.challenge {
+            let mut lock = self.challenges.write().await;
+            let now = chrono::Utc::now().timestamp();
+            match lock.remove(challenge) {
+                Some(exp) if exp >= now => {
+                    let sig = req
+                        .challenge_signature
+                        .as_deref()
+                        .ok_or(DomainError::InvalidChallenge)?;
+                    shellumi_server_crypto::verify_device_challenge(signing_b64, challenge, sig)
+                        .map_err(|_| DomainError::InvalidChallenge)?;
+                }
+                Some(_) => return Err(DomainError::ChallengeExpired),
+                None => return Err(DomainError::InvalidChallenge),
+            }
         }
 
         let now = chrono::Utc::now().timestamp();
@@ -552,9 +638,9 @@ impl<S: Store> AuthService<S> {
         let device = Device {
             id: device_id,
             user_id,
-            device_name: req.device_name,
-            signing_public_key: req.signing_public_key,
-            agreement_public_key: req.agreement_public_key,
+            device_name: req.device_name.trim().to_string(),
+            signing_public_key: signing_b64.to_string(),
+            agreement_public_key: agreement_b64.to_string(),
             created_at: now,
             last_seen_at: Some(now),
             revoked_at: None,
@@ -602,6 +688,7 @@ impl<S: Store> AuthService<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ring::signature::KeyPair;
     use shellumi_server_store::{InMemoryStore, UserRepository};
 
     #[test]
@@ -690,10 +777,26 @@ mod tests {
         };
         store.create_user(&user).await.unwrap();
 
+        // Invalid key length rejected
+        let bad_dev_req = RegisterDeviceRequest {
+            device_name: "Carol's Laptop".to_string(),
+            signing_public_key: "short_key".to_string(),
+            agreement_public_key: "short_key".to_string(),
+            challenge: None,
+            challenge_signature: None,
+        };
+        assert!(auth.register_device(user_id, bad_dev_req).await.is_err());
+
+        // Valid 32-byte base64 keys
+        let signing_pk = BASE64_STANDARD.encode([10u8; 32]);
+        let agreement_pk = BASE64_STANDARD.encode([20u8; 32]);
+
         let dev_req = RegisterDeviceRequest {
             device_name: "Carol's Laptop".to_string(),
-            signing_public_key: "ed25519-public-key-carol".to_string(),
-            agreement_public_key: "x25519-public-key-carol".to_string(),
+            signing_public_key: signing_pk.clone(),
+            agreement_public_key: agreement_pk.clone(),
+            challenge: None,
+            challenge_signature: None,
         };
 
         let device = auth.register_device(user_id, dev_req).await.unwrap();
@@ -705,5 +808,58 @@ mod tests {
         auth.revoke_device(user_id, device.device_id).await.unwrap();
         let devices = auth.list_devices(user_id).await.unwrap();
         assert!(devices[0].revoked_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_device_registration_with_challenge_pop() {
+        let store = Arc::new(InMemoryStore::new());
+        let secret = b"secret_key_for_testing_1234567890".to_vec();
+        let auth = AuthService::new(store.clone(), secret, 900, 2_592_000);
+
+        let user_id = Uuid::new_v4();
+        let user = User {
+            id: user_id,
+            username: "dave".to_string(),
+            email: "dave@example.com".to_string(),
+            password_hash: hash_password("pass12345!").unwrap(),
+            created_at: 100,
+            updated_at: 100,
+            is_active: true,
+        };
+        store.create_user(&user).await.unwrap();
+
+        let (signing_kp, _) = shellumi_server_crypto::generate_test_ed25519_keypair().unwrap();
+        let signing_pk_b64 = BASE64_STANDARD.encode(signing_kp.public_key().as_ref());
+        let agreement_pk_b64 = BASE64_STANDARD.encode([25u8; 32]);
+
+        // Get challenge
+        let challenge_resp = auth.create_device_challenge().await;
+        assert_eq!(challenge_resp.challenge.len(), 64);
+
+        // Sign challenge
+        let challenge_msg = format!("shellumi-device-challenge:{}", challenge_resp.challenge);
+        let sig = signing_kp.sign(challenge_msg.as_bytes());
+        let sig_b64 = BASE64_STANDARD.encode(sig.as_ref());
+
+        // Register with valid challenge and signature
+        let dev_req = RegisterDeviceRequest {
+            device_name: "Dave's Phone".to_string(),
+            signing_public_key: signing_pk_b64.clone(),
+            agreement_public_key: agreement_pk_b64.clone(),
+            challenge: Some(challenge_resp.challenge.clone()),
+            challenge_signature: Some(sig_b64),
+        };
+        let device = auth.register_device(user_id, dev_req).await.unwrap();
+        assert_eq!(device.device_name, "Dave's Phone");
+
+        // Challenge is consumed; replay must fail
+        let dev_req_replay = RegisterDeviceRequest {
+            device_name: "Dave's Other Phone".to_string(),
+            signing_public_key: signing_pk_b64,
+            agreement_public_key: agreement_pk_b64,
+            challenge: Some(challenge_resp.challenge),
+            challenge_signature: Some("fake_sig".to_string()),
+        };
+        assert!(auth.register_device(user_id, dev_req_replay).await.is_err());
     }
 }

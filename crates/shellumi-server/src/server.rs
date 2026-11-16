@@ -6,7 +6,7 @@ use crate::metrics::MetricsRegistry;
 use crate::rate_limit::{extract_client_ip, rate_limit_response, RateLimitCategory, RateLimiter};
 use axum::{
     extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
+        ws::{rejection::WebSocketUpgradeRejection, Message, WebSocket, WebSocketUpgrade},
         DefaultBodyLimit, Path, Query, State,
     },
     http::{header, HeaderMap, HeaderValue, StatusCode},
@@ -20,14 +20,13 @@ use shellumi_server_protocol::{
     AcceptInviteRequest, AddVaultMemberRequest, BootstrapRequest, CapabilitiesResponse,
     CollabParticipantListResponse, CollabPollQuery, CollabPollResponse, CollabSessionListResponse,
     CommitBatchRequest, CreateCollabSessionRequest, CreateInviteRequest, CreateVaultRequest,
-    EnrollParticipantRequest, ErrorResponse, GrantControlRequest, HealthResponse, LoginRequest,
-    LogoutRequest, PublishKeyEnvelopesRequest, RefreshTokenRequest, RegisterDeviceRequest,
-    RotateKeyEpochRequest, SendCollabFrameRequest, ServerLimits, UpdateVaultRequest,
-    CURRENT_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION,
+    DeviceChallengeRequest, EnrollParticipantRequest, ErrorResponse, GrantControlRequest,
+    HealthResponse, LoginRequest, LogoutRequest, PublishKeyEnvelopesRequest, RefreshTokenRequest,
+    RegisterDeviceRequest, RotateKeyEpochRequest, SendCollabFrameRequest, ServerLimits,
+    UpdateVaultRequest, VaultWatermark, WsClientMessage, WsServerMessage, CURRENT_PROTOCOL_VERSION,
+    MIN_PROTOCOL_VERSION,
 };
-use shellumi_server_store::{
-    DeviceRepository, InMemoryStore, SessionRepository, UserRepository, VaultRepository,
-};
+use shellumi_server_store::{AnyStore, DeviceRepository, PgStore, UserRepository, VaultRepository};
 use shellumi_server_sync::SyncEngine;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -41,17 +40,31 @@ use uuid::Uuid;
 
 #[derive(Clone, Debug)]
 enum SyncEvent {
-    Vault(Uuid),
-    Deleted(Uuid),
+    VaultChanged {
+        vault_id: Uuid,
+        latest_sequence: u64,
+        notification_id: Uuid,
+    },
+    KeyRotated {
+        vault_id: Uuid,
+        epoch: u32,
+        notification_id: Uuid,
+    },
+    AccessRevoked {
+        vault_id: Uuid,
+        user_id: Option<Uuid>,
+        notification_id: Uuid,
+    },
     Logout(Uuid),
 }
 
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<ServerConfig>,
-    pub auth: Arc<AuthService<InMemoryStore>>,
-    pub sync: Arc<SyncEngine<InMemoryStore>>,
-    pub collab: Arc<CollabHub<InMemoryStore>>,
+    pub store: Arc<AnyStore>,
+    pub auth: Arc<AuthService<AnyStore>>,
+    pub sync: Arc<SyncEngine<AnyStore>>,
+    pub collab: Arc<CollabHub<AnyStore>>,
     pub rate_limiter: Arc<RateLimiter>,
     pub metrics: Arc<MetricsRegistry>,
     notifications: broadcast::Sender<SyncEvent>,
@@ -59,23 +72,28 @@ pub struct AppState {
 }
 
 pub fn create_router(config: ServerConfig) -> Router {
-    let store = Arc::new(InMemoryStore::new());
-    let token_secret = b"shellumi_server_hmac_secret_key_32bytes!!".to_vec();
+    create_router_with_store(config, AnyStore::memory())
+}
+
+pub fn create_router_with_store(config: ServerConfig, store: AnyStore) -> Router {
+    let store_arc = Arc::new(store);
+    let token_secret = if let Some(key) = &config.token_signing_key {
+        key.as_bytes().to_vec()
+    } else {
+        format!("shellumi-secret:{}", config.server_instance_id).into_bytes()
+    };
     let auth = Arc::new(AuthService::new(
-        store.clone(),
+        store_arc.clone(),
         token_secret,
         config.access_token_ttl_secs,
         config.refresh_token_ttl_secs,
     ));
-    let sync = Arc::new(SyncEngine::new(store, config.max_record_bytes));
+    let sync = Arc::new(SyncEngine::new(store_arc, config.max_record_bytes));
 
     create_router_with_auth_and_sync(config, auth, sync)
 }
 
-pub fn create_router_with_auth(
-    config: ServerConfig,
-    auth: Arc<AuthService<InMemoryStore>>,
-) -> Router {
+pub fn create_router_with_auth(config: ServerConfig, auth: Arc<AuthService<AnyStore>>) -> Router {
     let sync = Arc::new(SyncEngine::new(
         auth.store().clone(),
         config.max_record_bytes,
@@ -85,9 +103,10 @@ pub fn create_router_with_auth(
 
 pub fn create_router_with_auth_and_sync(
     config: ServerConfig,
-    auth: Arc<AuthService<InMemoryStore>>,
-    sync: Arc<SyncEngine<InMemoryStore>>,
+    auth: Arc<AuthService<AnyStore>>,
+    sync: Arc<SyncEngine<AnyStore>>,
 ) -> Router {
+    let store = auth.store().clone();
     let limits_max_request = config.max_request_bytes;
     let allowed_origins = config.allowed_origins.clone();
     let rate_limiter = Arc::new(RateLimiter::new(
@@ -95,11 +114,12 @@ pub fn create_router_with_auth_and_sync(
         Duration::from_secs(60),
     ));
     let metrics = Arc::new(MetricsRegistry::new());
-    let collab = Arc::new(CollabHub::new(auth.store().clone()));
+    let collab = Arc::new(CollabHub::new(store.clone()));
     let (notifications, _) = broadcast::channel(256);
 
     let state = AppState {
         config: Arc::new(config),
+        store,
         auth,
         sync,
         collab,
@@ -121,13 +141,15 @@ pub fn create_router_with_auth_and_sync(
         .route("/api/v1/auth/refresh", post(refresh_handler))
         .route("/api/v1/auth/logout", post(logout_handler))
         .route("/api/v1/me", get(me_handler))
-        .route("/api/v1/sync/events", get(sync_events_handler))
+        .route("/api/v1/events/ws", get(events_ws_handler))
+        .route("/api/v1/sync/events", get(events_ws_handler))
         .route("/api/v1/sync/poll", get(sync_poll_handler))
         // Devices
         .route(
             "/api/v1/devices",
             get(list_devices_handler).post(register_device_handler),
         )
+        .route("/api/v1/devices/challenge", post(device_challenge_handler))
         .route("/api/v1/devices/:id", delete(revoke_device_handler))
         // Vaults & Synchronization
         .route(
@@ -139,6 +161,10 @@ pub fn create_router_with_auth_and_sync(
             get(get_vault_handler)
                 .patch(update_vault_handler)
                 .delete(delete_vault_handler),
+        )
+        .route(
+            "/api/v1/vaults/:id/recipient-devices",
+            get(list_recipient_devices_handler),
         )
         .route("/api/v1/vaults/:id/commits", post(commit_batch_handler))
         .route("/api/v1/vaults/:id/changes", get(get_changes_handler))
@@ -318,7 +344,19 @@ async fn health_live_handler() -> impl IntoResponse {
     )
 }
 
-async fn health_ready_handler() -> impl IntoResponse {
+async fn health_ready_handler(State(state): State<AppState>) -> impl IntoResponse {
+    if !state.store.is_ready().await {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(HealthResponse {
+                status: "degraded".to_string(),
+                service: "shellumi-server".to_string(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                details: Some("Storage backend is unreachable or degraded".to_string()),
+            }),
+        );
+    }
+
     (
         StatusCode::OK,
         Json(HealthResponse {
@@ -335,26 +373,37 @@ async fn capabilities_handler(State(state): State<AppState>) -> impl IntoRespons
         max_request_bytes: state.config.max_request_bytes,
         max_record_bytes: state.config.max_record_bytes,
         max_mutations_per_commit: 100,
+        max_change_page: 500,
     };
 
     let mut supported_features = vec![
         "vault_sync_v1".to_string(),
-        "device_auth".to_string(),
-        "team_sharing".to_string(),
+        "device_auth_v1".to_string(),
+        "device_wrapped_keys_v1".to_string(),
+        "signed_mutations_v1".to_string(),
+        "delta_sync_v1".to_string(),
+        "websocket_notifications_v1".to_string(),
+        "team_sharing_v1".to_string(),
     ];
     if state.config.collab_enabled {
         supported_features.push("terminal_collab_v1".to_string());
     }
 
     let capabilities = CapabilitiesResponse {
+        server_instance_id: state.config.server_instance_id,
         server_version: env!("CARGO_PKG_VERSION").to_string(),
         protocol_version: CURRENT_PROTOCOL_VERSION,
         min_protocol_version: MIN_PROTOCOL_VERSION,
         supported_features,
         supported_e2ee_suites: vec![
-            "x25519_hkdf_aes256gcm".to_string(),
+            "aes256gcm_dek_v1".to_string(),
+            "hpke_x25519_hkdfsha256_aes256gcm_v1".to_string(),
             "argon2id_aes256gcm_legacy".to_string(),
         ],
+        websocket: Some(shellumi_server_protocol::WebSocketCapability {
+            endpoint: "/api/v1/events/ws".to_string(),
+            heartbeat_seconds: 25,
+        }),
         limits,
     };
 
@@ -538,10 +587,37 @@ async fn revoke_device_handler(
 // Vault & Sync Handlers
 // ---------------------------------------------------------------------------
 
-async fn sync_events_handler(
+async fn device_challenge_handler(
+    State(state): State<AppState>,
+    _req: Option<Json<DeviceChallengeRequest>>,
+) -> Response {
+    let res = state.auth.create_device_challenge().await;
+    (StatusCode::OK, Json(res)).into_response()
+}
+
+async fn list_recipient_devices_handler(
+    State(state): State<AppState>,
+    Path(vault_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Response {
+    let claims = match extract_auth_claims(&state.auth, &headers) {
+        Ok(claims) => claims,
+        Err(err) => return map_domain_error(err).into_response(),
+    };
+    match state
+        .sync
+        .list_recipient_devices(claims.sub, vault_id)
+        .await
+    {
+        Ok(res) => (StatusCode::OK, Json(res)).into_response(),
+        Err(err) => map_domain_error(err).into_response(),
+    }
+}
+
+async fn events_ws_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
-    ws: WebSocketUpgrade,
+    ws: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Response {
     let claims = match extract_auth_claims(&state.auth, &headers) {
         Ok(claims) => claims,
@@ -558,24 +634,28 @@ async fn sync_events_handler(
         Ok(Some(device)) if device.user_id == claims.sub && device.revoked_at.is_none() => {}
         _ => return map_domain_error(DomainError::Unauthenticated).into_response(),
     }
+    let ws = match ws {
+        Ok(ws) => ws,
+        Err(rejection) => return rejection.into_response(),
+    };
     let permit = match state.notification_connections.clone().try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => return StatusCode::TOO_MANY_REQUESTS.into_response(),
     };
     let rx = state.notifications.subscribe();
-    ws.max_message_size(1024)
+    ws.max_message_size(4096)
         .on_upgrade(move |socket| async move {
             let _permit = permit;
-            sync_events_socket(socket, state, claims, device_id, rx).await;
+            events_ws_socket(socket, state, claims, device_id, rx).await;
         })
 }
 
 async fn sync_session_valid(state: &AppState, claims: &AccessTokenClaims, device_id: Uuid) -> bool {
-    let Some(id) = claims.session_id else {
-        return false;
-    };
-    matches!(state.auth.store().list_sessions_for_user(claims.sub).await,
-        Ok(sessions) if sessions.iter().any(|session| session.id == id && session.revoked_at.is_none() && session.expires_at > chrono::Utc::now().timestamp() && session.device_id.map_or(true, |bound| bound == device_id)))
+    state
+        .auth
+        .validate_active_session(claims, Some(device_id))
+        .await
+        .is_ok()
 }
 
 async fn sync_poll_handler(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -598,35 +678,80 @@ async fn sync_poll_handler(State(state): State<AppState>, headers: HeaderMap) ->
     let result = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             match rx.recv().await {
-                Ok(SyncEvent::Logout(user)) if user == claims.sub => return StatusCode::UNAUTHORIZED.into_response(),
+                Ok(SyncEvent::Logout(user)) if user == claims.sub => {
+                    return StatusCode::UNAUTHORIZED.into_response()
+                }
                 Ok(SyncEvent::Logout(_)) => continue,
-                Err(_) => return (StatusCode::CONFLICT, Json(serde_json::json!({"code":"RESYNC_REQUIRED"}))).into_response(),
+                Err(_) => {
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({"code":"RESYNC_REQUIRED"})),
+                    )
+                        .into_response()
+                }
                 Ok(event) => {
                     if !notification_access_valid(&state, &claims, device_id).await {
                         return StatusCode::UNAUTHORIZED.into_response();
                     }
-                    let (vault_id, deleted) = match event {
-                        SyncEvent::Vault(id) => (id, false),
-                        SyncEvent::Deleted(id) => (id, true),
-                        SyncEvent::Logout(_) => continue,
-                    };
-                    if deleted {
-                        let vault = state.auth.store().find_vault_by_id(vault_id).await;
-                        let role = state.auth.store().get_vault_member_role(vault_id, claims.sub).await;
-                        if let (Ok(Some(vault)), Ok(Some(_))) = (vault, role) {
-                            if vault.vault_type.as_str() == "team" {
-                                return Json(serde_json::json!({"type":"vault_deleted", "vault_id":vault_id})).into_response();
+                    match event {
+                        SyncEvent::VaultChanged {
+                            vault_id,
+                            latest_sequence,
+                            ..
+                        } => {
+                            if let Ok(role) = state
+                                .auth
+                                .store()
+                                .get_vault_member_role(vault_id, claims.sub)
+                                .await
+                            {
+                                if role.is_some() {
+                                    return Json(serde_json::json!({
+                                        "type": "vault_changed",
+                                        "vault_id": vault_id,
+                                        "latest_sequence": latest_sequence,
+                                    }))
+                                    .into_response();
+                                }
                             }
                         }
-                    } else if let Ok(vault) = state.sync.get_vault(claims.sub, vault_id).await {
-                        if vault.vault_type == "team" {
-                            return Json(serde_json::json!({"type":"vault_changed", "vault_id":vault_id, "latest_sequence":vault.server_sequence})).into_response();
+                        SyncEvent::AccessRevoked {
+                            vault_id, user_id, ..
+                        } => {
+                            if user_id.is_none() || user_id == Some(claims.sub) {
+                                return Json(serde_json::json!({
+                                    "type": "vault_deleted",
+                                    "vault_id": vault_id,
+                                }))
+                                .into_response();
+                            }
                         }
+                        SyncEvent::KeyRotated {
+                            vault_id, epoch, ..
+                        } => {
+                            if let Ok(role) = state
+                                .auth
+                                .store()
+                                .get_vault_member_role(vault_id, claims.sub)
+                                .await
+                            {
+                                if role.is_some() {
+                                    return Json(serde_json::json!({
+                                        "type": "key_rotated",
+                                        "vault_id": vault_id,
+                                        "epoch": epoch,
+                                    }))
+                                    .into_response();
+                                }
+                            }
+                        }
+                        SyncEvent::Logout(_) => continue,
                     }
                 }
             }
         }
-    }).await;
+    })
+    .await;
     match result {
         Ok(response) => response,
         Err(_) if notification_access_valid(&state, &claims, device_id).await => {
@@ -646,59 +771,194 @@ async fn notification_access_valid(
         && matches!(state.auth.store().find_device_by_id(device_id).await, Ok(Some(device)) if device.user_id == claims.sub && device.revoked_at.is_none())
 }
 
-async fn sync_events_socket(
+async fn events_ws_socket(
     mut socket: WebSocket,
     state: AppState,
     claims: AccessTokenClaims,
     device_id: Uuid,
     mut rx: broadcast::Receiver<SyncEvent>,
 ) {
+    use std::collections::HashSet;
+
+    let mut subscribed_vaults: HashSet<Uuid> = HashSet::new();
     let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
+
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
-                let device = state.auth.store().find_device_by_id(device_id).await;
-                if chrono::Utc::now().timestamp() >= claims.exp || !sync_session_valid(&state, &claims, device_id).await ||
-                    !matches!(device, Ok(Some(d)) if d.user_id == claims.sub && d.revoked_at.is_none()) {
+                if chrono::Utc::now().timestamp() >= claims.exp {
                     break;
                 }
-                if socket.send(Message::Ping(Vec::new())).await.is_err() { break; }
+                if state.auth.validate_active_session(&claims, Some(device_id)).await.is_err() {
+                    break;
+                }
+                if socket.send(Message::Ping(Vec::new())).await.is_err() {
+                    break;
+                }
             }
-            event = rx.recv() => {
-                let (vault_id, deleted) = match event {
-                    Ok(SyncEvent::Vault(id)) => (id, false),
-                    Ok(SyncEvent::Deleted(id)) => (id, true),
-                    Ok(SyncEvent::Logout(user)) if user == claims.sub => break,
-                    Ok(SyncEvent::Logout(_)) => continue,
-                    // A lagging client must reconnect and pull its changes.
-                    Err(_) => break,
-                };
-                let device = state.auth.store().find_device_by_id(device_id).await;
-                if chrono::Utc::now().timestamp() >= claims.exp || !sync_session_valid(&state, &claims, device_id).await ||
-                    !matches!(device, Ok(Some(d)) if d.user_id == claims.sub && d.revoked_at.is_none()) { break; }
-                if deleted {
-                    let vault = state.auth.store().find_vault_by_id(vault_id).await;
-                    let role = state.auth.store().get_vault_member_role(vault_id, claims.sub).await;
-                    if let (Ok(Some(vault)), Ok(Some(_))) = (vault, role) {
-                        if vault.vault_type.as_str() == "team" {
-                            let event = serde_json::json!({"type":"vault_deleted", "vault_id":vault_id});
-                            if socket.send(Message::Text(event.to_string())).await.is_err() { break; }
+            msg = socket.recv() => {
+                match msg {
+                    Some(Ok(Message::Text(text))) => {
+                        let parsed: Result<WsClientMessage, _> = serde_json::from_str(&text);
+                        match parsed {
+                            Ok(WsClientMessage::Subscribe { request_id, vault_ids }) => {
+                                let mut watermarks = Vec::with_capacity(vault_ids.len());
+                                let mut error_occurred = false;
+
+                                for vid in vault_ids {
+                                    let role = state.auth.store().get_vault_member_role(vid, claims.sub).await;
+                                    let vault = state.auth.store().find_vault_by_id(vid).await;
+
+                                    match (role, vault) {
+                                        (Ok(Some(_)), Ok(Some(v))) if v.deleted_at.is_none() => {
+                                            subscribed_vaults.insert(vid);
+                                            watermarks.push(VaultWatermark {
+                                                vault_id: vid,
+                                                latest_sequence: v.server_sequence,
+                                            });
+                                        }
+                                        _ => {
+                                            let err_msg = WsServerMessage::Error {
+                                                code: "SUBSCRIPTION_DENIED".to_string(),
+                                                message: format!("User is not an active member of vault {vid}"),
+                                                request_id: Some(request_id.clone()),
+                                            };
+                                            if let Ok(json) = serde_json::to_string(&err_msg) {
+                                                let _ = socket.send(Message::Text(json)).await;
+                                            }
+                                            error_occurred = true;
+                                            break;
+                                        }
+                                    }
+                                }
+
+                                if !error_occurred {
+                                    let conf = WsServerMessage::Subscribed {
+                                        request_id,
+                                        vaults: watermarks,
+                                    };
+                                    if let Ok(json) = serde_json::to_string(&conf) {
+                                        if socket.send(Message::Text(json)).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(WsClientMessage::Unsubscribe { request_id: _, vault_ids }) => {
+                                for vid in vault_ids {
+                                    subscribed_vaults.remove(&vid);
+                                }
+                            }
+                            Ok(WsClientMessage::Ping) => {
+                                let pong = WsServerMessage::Pong;
+                                if let Ok(json) = serde_json::to_string(&pong) {
+                                    if socket.send(Message::Text(json)).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                let err_msg = WsServerMessage::Error {
+                                    code: "INVALID_MESSAGE".to_string(),
+                                    message: "Malformed WebSocket message payload".to_string(),
+                                    request_id: None,
+                                };
+                                if let Ok(json) = serde_json::to_string(&err_msg) {
+                                    let _ = socket.send(Message::Text(json)).await;
+                                }
+                            }
                         }
                     }
-                    continue;
-                }
-                if let Ok(vault) = state.sync.get_vault(claims.sub, vault_id).await {
-                    if vault.vault_type == "team" {
-                        let event = serde_json::json!({"type":"vault_changed", "vault_id":vault_id, "latest_sequence":vault.server_sequence});
-                        if socket.send(Message::Text(event.to_string())).await.is_err() { break; }
+                    Some(Ok(Message::Ping(payload))) => {
+                        if socket.send(Message::Pong(payload)).await.is_err() {
+                            break;
+                        }
                     }
+                    Some(Ok(Message::Pong(_))) => {}
+                    Some(Ok(Message::Close(_))) | None => {
+                        break;
+                    }
+                    Some(Err(_)) => {
+                        break;
+                    }
+                    _ => {}
                 }
             }
-            message = socket.recv() => match message {
-                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
-                Some(Ok(Message::Ping(data))) => if socket.send(Message::Pong(data)).await.is_err() { break; },
-                Some(Ok(Message::Pong(_))) => {},
-                Some(Ok(_)) => break,
+            event = rx.recv() => {
+                match event {
+                    Ok(SyncEvent::VaultChanged { vault_id, latest_sequence, notification_id }) => {
+                        if subscribed_vaults.contains(&vault_id) {
+                            let role = state.auth.store().get_vault_member_role(vault_id, claims.sub).await;
+                            if matches!(role, Ok(Some(_))) {
+                                let msg = WsServerMessage::VaultChanged {
+                                    vault_id,
+                                    latest_sequence,
+                                    notification_id,
+                                };
+                                if let Ok(json) = serde_json::to_string(&msg) {
+                                    if socket.send(Message::Text(json)).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Ok(SyncEvent::KeyRotated { vault_id, epoch, notification_id }) => {
+                        if subscribed_vaults.contains(&vault_id) {
+                            let role = state.auth.store().get_vault_member_role(vault_id, claims.sub).await;
+                            if matches!(role, Ok(Some(_))) {
+                                let msg = WsServerMessage::VaultKeyRotated {
+                                    vault_id,
+                                    epoch,
+                                    notification_id,
+                                };
+                                if let Ok(json) = serde_json::to_string(&msg) {
+                                    if socket.send(Message::Text(json)).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Ok(SyncEvent::AccessRevoked {
+                        vault_id,
+                        user_id,
+                        notification_id,
+                    }) => {
+                        if subscribed_vaults.contains(&vault_id)
+                            && (user_id.is_none() || user_id == Some(claims.sub))
+                        {
+                            subscribed_vaults.remove(&vault_id);
+                            let msg = WsServerMessage::VaultAccessRevoked {
+                                vault_id,
+                                notification_id,
+                            };
+                            if let Ok(json) = serde_json::to_string(&msg) {
+                                if socket.send(Message::Text(json)).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Ok(SyncEvent::Logout(user_id)) => {
+                        if user_id == claims.sub {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        let err_msg = WsServerMessage::Error {
+                            code: "RESYNC_REQUIRED".to_string(),
+                            message: "Notification queue lagged, please re-synchronize vaults".to_string(),
+                            request_id: None,
+                        };
+                        if let Ok(json) = serde_json::to_string(&err_msg) {
+                            let _ = socket.send(Message::Text(json)).await;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        break;
+                    }
+                }
             }
         }
     }
@@ -806,7 +1066,12 @@ async fn update_vault_handler(
 
     match state.sync.update_vault(claims.sub, vault_id, req).await {
         Ok(resp) => {
-            let _ = state.notifications.send(SyncEvent::Vault(vault_id));
+            let notif_id = Uuid::new_v4();
+            let _ = state.notifications.send(SyncEvent::VaultChanged {
+                vault_id,
+                latest_sequence: resp.server_sequence,
+                notification_id: notif_id,
+            });
             (StatusCode::OK, Json(serde_json::to_value(resp).unwrap()))
         }
         Err(err) => {
@@ -831,7 +1096,12 @@ async fn delete_vault_handler(
 
     match state.sync.delete_vault(claims.sub, vault_id).await {
         Ok(()) => {
-            let _ = state.notifications.send(SyncEvent::Deleted(vault_id));
+            let notif_id = Uuid::new_v4();
+            let _ = state.notifications.send(SyncEvent::AccessRevoked {
+                vault_id,
+                user_id: None,
+                notification_id: notif_id,
+            });
             (
                 StatusCode::OK,
                 Json(serde_json::json!({ "status": "deleted" })),
@@ -885,7 +1155,12 @@ async fn commit_batch_handler(
 
     match state.sync.commit_batch(claims.sub, device_id, req).await {
         Ok(resp) => {
-            let _ = state.notifications.send(SyncEvent::Vault(path_vault_id));
+            let notif_id = Uuid::new_v4();
+            let _ = state.notifications.send(SyncEvent::VaultChanged {
+                vault_id: path_vault_id,
+                latest_sequence: resp.commit_sequence,
+                notification_id: notif_id,
+            });
             (StatusCode::OK, Json(serde_json::to_value(resp).unwrap()))
         }
         Err(err) => {
@@ -1009,7 +1284,12 @@ async fn add_member_handler(
         .await
     {
         Ok(resp) => {
-            let _ = state.notifications.send(SyncEvent::Vault(vault_id));
+            let notif_id = Uuid::new_v4();
+            let _ = state.notifications.send(SyncEvent::VaultChanged {
+                vault_id,
+                latest_sequence: 0,
+                notification_id: notif_id,
+            });
             (StatusCode::OK, Json(serde_json::to_value(resp).unwrap()))
         }
         Err(err) => {
@@ -1038,7 +1318,12 @@ async fn remove_member_handler(
         .await
     {
         Ok(()) => {
-            let _ = state.notifications.send(SyncEvent::Vault(vault_id));
+            let notif_id = Uuid::new_v4();
+            let _ = state.notifications.send(SyncEvent::AccessRevoked {
+                vault_id,
+                user_id: Some(target_user_id),
+                notification_id: notif_id,
+            });
             (StatusCode::NO_CONTENT, Json(serde_json::Value::Null))
         }
         Err(err) => {
@@ -1144,7 +1429,12 @@ async fn accept_invite_handler(
 
     match state.sync.accept_invite(claims.sub, req).await {
         Ok(resp) => {
-            let _ = state.notifications.send(SyncEvent::Vault(resp.vault_id));
+            let notif_id = Uuid::new_v4();
+            let _ = state.notifications.send(SyncEvent::VaultChanged {
+                vault_id: resp.vault_id,
+                latest_sequence: 0,
+                notification_id: notif_id,
+            });
             (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())).into_response()
         }
         Err(err) => {
@@ -1191,7 +1481,12 @@ async fn publish_key_envelopes_handler(
         .await
     {
         Ok(count) => {
-            let _ = state.notifications.send(SyncEvent::Vault(vault_id));
+            let notif_id = Uuid::new_v4();
+            let _ = state.notifications.send(SyncEvent::KeyRotated {
+                vault_id,
+                epoch: 0,
+                notification_id: notif_id,
+            });
             (
                 StatusCode::CREATED,
                 Json(serde_json::json!({ "published": count })),
@@ -1267,7 +1562,12 @@ async fn rotate_key_epoch_handler(
         .await
     {
         Ok(resp) => {
-            let _ = state.notifications.send(SyncEvent::Vault(vault_id));
+            let notif_id = Uuid::new_v4();
+            let _ = state.notifications.send(SyncEvent::KeyRotated {
+                vault_id,
+                epoch: resp.active_key_epoch,
+                notification_id: notif_id,
+            });
             (StatusCode::OK, Json(serde_json::to_value(resp).unwrap()))
         }
         Err(err) => {
@@ -1754,7 +2054,7 @@ async fn not_found_handler() -> impl IntoResponse {
 }
 
 fn extract_auth_claims(
-    auth: &AuthService<InMemoryStore>,
+    auth: &AuthService<AnyStore>,
     headers: &HeaderMap,
 ) -> Result<AccessTokenClaims, DomainError> {
     let auth_header = headers
@@ -1795,6 +2095,14 @@ fn map_domain_error(err: DomainError) -> (StatusCode, Json<ErrorResponse>) {
         DomainError::InviteRevoked => (StatusCode::FORBIDDEN, "INVITE_REVOKED"),
         DomainError::CannotRevokeLastOwner => (StatusCode::CONFLICT, "CANNOT_REVOKE_LAST_OWNER"),
         DomainError::StaleKeyEpoch { .. } => (StatusCode::CONFLICT, "STALE_KEY_EPOCH"),
+        DomainError::FutureKeyEpoch { .. } => (StatusCode::CONFLICT, "FUTURE_KEY_EPOCH"),
+        DomainError::InvalidCursor(_) => (StatusCode::BAD_REQUEST, "INVALID_CURSOR"),
+        DomainError::CursorExpired => (StatusCode::GONE, "CURSOR_EXPIRED"),
+        DomainError::ChallengeExpired => (StatusCode::GONE, "CHALLENGE_EXPIRED"),
+        DomainError::InvalidChallenge => (StatusCode::FORBIDDEN, "INVALID_CHALLENGE"),
+        DomainError::UnsupportedSuite(_) => (StatusCode::UNPROCESSABLE_ENTITY, "UNSUPPORTED_SUITE"),
+        DomainError::InvalidEnvelope(_) => (StatusCode::UNPROCESSABLE_ENTITY, "INVALID_ENVELOPE"),
+        DomainError::MembershipRevoked => (StatusCode::FORBIDDEN, "MEMBERSHIP_REVOKED"),
         DomainError::InvalidInput(_) | DomainError::InvalidPublicKey(_) => {
             (StatusCode::UNPROCESSABLE_ENTITY, "INVALID_INPUT")
         }
@@ -1825,8 +2133,20 @@ fn map_domain_error(err: DomainError) -> (StatusCode, Json<ErrorResponse>) {
 }
 
 pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let store = if let Some(ref db_url) = config.database_url {
+        info!("Connecting to PostgreSQL database...");
+        let pg = PgStore::connect(db_url).await?;
+        info!("Applying database migrations...");
+        pg.run_migrations().await?;
+        info!("PostgreSQL database migrations applied successfully.");
+        AnyStore::postgres(pg)
+    } else {
+        info!("No database URL configured; running with in-memory store.");
+        AnyStore::memory()
+    };
+
     let listen_addr = config.listen_addr;
-    let app = create_router(config);
+    let app = create_router_with_store(config, store);
 
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;
     info!("Shellumi Server listening on {}", listen_addr);

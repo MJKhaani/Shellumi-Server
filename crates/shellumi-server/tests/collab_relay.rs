@@ -26,7 +26,7 @@ use shellumi_server_protocol::{
     CollabFrameType, CreateCollabSessionRequest, EnrollParticipantRequest, GrantControlRequest,
     SendCollabFrameRequest,
 };
-use shellumi_server_store::{DeviceRepository, InMemoryStore, OrgRepository, UserRepository};
+use shellumi_server_store::{AnyStore, DeviceRepository, OrgRepository, UserRepository};
 use shellumi_server_sync::SyncEngine;
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -46,7 +46,7 @@ struct TestContext {
 }
 
 async fn setup_collab_context(collab_enabled: bool) -> TestContext {
-    let store = Arc::new(InMemoryStore::new());
+    let store = Arc::new(AnyStore::memory());
     let token_secret = b"shellumi_server_test_hmac_secret_key_32bytes!!".to_vec();
     let auth = Arc::new(AuthService::new(
         store.clone(),

@@ -63,8 +63,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Authored ADR `docs/adr/0007-m6-self-hosting-and-client-compatibility.md` formalizing client provider boundaries, zero-knowledge constraints, and CAS conflict semantics.
   - Synchronized and updated documentation deliverables across Architecture, Key Management, Threat Model, Testing, Releases, and Roadmap.
 
-- Experimental server WebSocket endpoint for advisory team vault change hints;
-  clients must reconcile via REST. WebSocket tokens are session-bound and logout
-  closes the user’s connections. Client integration remains outstanding.
+- **Phase 11: Protocol v1 Completion, PostgreSQL Persistence, and Live Sync Notifications**
+  - Production PostgreSQL persistence layer (`PgStore` and `AnyStore`) implementing all 11 repository traits (`SettingsRepository`, `UserRepository`, `OrgRepository`, `DeviceRepository`, `SessionRepository`, `VaultRepository`, `InviteRepository`, `KeyEnvelopeRepository`, `AuditRepository`, `SyncRepository`, `CollabRepository`).
+  - Executable forward-only database schema migration runner (`shellumi-server migrate run`) executing embedded SQL migrations transactionally with idempotency tracking.
+  - Active database readiness probe (`/health/ready`) and self-check diagnostics (`shellumi-server doctor`) probing real PostgreSQL connection and queries.
+  - Standard RFC 2104 HMAC-SHA256 token verification with dynamic per-instance signing keys and active session introspection.
+  - Cryptographic device proof-of-possession challenge endpoint (`POST /api/v1/devices/challenge`) validating single-use challenge signatures, 32-byte Ed25519 signing keys, and 32-byte X25519 key-agreement keys.
+  - Direct-DEK encrypted record envelope support (`aes256gcm_dek_v1`) without mandatory PBKDF2 iterations, length-delimited canonical binary mutation preimage formatting, and strict rejection of past and future key epochs (`FutureKeyEpoch`).
+  - Scoped recipient device discovery (`GET /api/v1/vaults/:id/recipient-devices`) restricted to active vault members.
+  - Monotonic transaction sequence allocation assigning a unique ordered sequence to each mutation in atomic batch commits.
+  - Standard WebSocket instant notifications endpoint (`GET /api/v1/events/ws`) supporting `subscribe`, `subscribed`, `vault.changed`, `vault.key_rotated`, `vault.access_revoked`, `ping`, and `pong` frames with post-commit fan-out.
 
-- Added an authenticated, bounded long-poll fallback for volatile team-vault hints.

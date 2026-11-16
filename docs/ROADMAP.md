@@ -7,12 +7,13 @@ This document outlines the milestones and progress of Shellumi Server.
 | Milestone | Title | Status | Primary Gates & Acceptance Criteria |
 | :--- | :--- | :--- | :--- |
 | **M0** | Repository Foundations & Hygiene | **Complete** | Workspace skeleton, configuration parser, `/health/live`, `/health/ready`, `/api/v1/capabilities`, strict config validation, unit/integration tests, CI workflow, docs. |
-| **M1** | Storage, Migrations, Tenants & Auth | **Complete** | PostgreSQL schema, admin bootstrap, accounts, sessions, device key registration, organizations, token revocation, cross-tenant isolation tests. |
-| **M2** | Encrypted Private Vault & Sync v1 | **Complete** | Stable UUIDs, opaque ciphertext envelopes, device signatures, transactional change feed, conditional `expected_revision` writes, conflict resolution (409), tombstones. |
-| **M3** | Team Vaults, Invites, RBAC & E2EE Keys | **Complete** | Owner/Admin/Editor/Viewer permission matrix, one-time invitations, per-device recipient-wrapped DEKs, epoch rotation, audit trail. |
-| **M4** | Resilience, Operations & Releases | **Complete** | CLI admin commands, backup/restore verification, metrics, rate limits, multi-arch Docker image, reproducible release automation. |
-| **M5** | Optional Live Terminal Collaboration | **Complete** | Signaling relay, ephemeral E2EE session keys, single-writer fencing token, owner emergency revocation, bounded queues, SSE & polling. |
-| **M6** | Advanced Self-Hosting & Client Polish | **Complete** | Contract fixtures, client compatibility matrix, legacy migration paths, disaster recovery, ADRs, zero-knowledge threat validation. |
+| **M1** | Storage, Migrations, Tenants & Auth | **Remediation / In Progress** | Real PostgreSQL `PgStore` runtime, executed migrations, durable bootstrap, HMAC session tokens, device challenge PoP, token revocation. |
+| **M2** | Encrypted Private Vault & Sync v1 | **Remediation / In Progress** | Transactional CAS, direct-DEK record envelope (`aes256gcm_dek_v1`), unambiguous canonical preimages, unique sequence per mutation, consistent snapshot watermarks. |
+| **M3** | Team Vaults, Invites, RBAC & E2EE Keys | **Remediation / In Progress** | Scoped recipient device discovery (`GET /api/v1/vaults/:id/recipient-devices`), strict epoch bounds (reject future and past), atomic invite redemption. |
+| **M4** | Resilience, Operations & Releases | **Remediation / In Progress** | Database-backed readiness probe, doctor DB check, CLI admin commands backed by real storage, Prometheus telemetry. |
+| **M5** | Optional Live Terminal Collaboration | **Complete (Isolated)** | Terminal collaboration SSE & polling relay (opt-in, separate from vault sync notifications). |
+| **M6** | Advanced Self-Hosting & Client Polish | **Remediation / In Progress** | Golden contract fixtures, client compatibility matrix alignment, pre-release v1 contract finalization. |
+| **Phase 11** | Live Sync Notifications & WSS | **In Progress** | Standard WSS `/api/v1/events/ws` with `subscribe`/`subscribed`/`vault.changed`/`vault.key_rotated`/`vault.access_revoked` frames, post-commit dispatch. |
 | **M7** | Enterprise Integrations (Post-v1) | Planned | OIDC/SSO, optional SMTP notification delivery, S3-compatible large encrypted attachment storage, horizontal PostgreSQL cluster coordination. |
 
 ---

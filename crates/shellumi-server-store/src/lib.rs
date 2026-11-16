@@ -13,6 +13,9 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
+pub mod pg;
+pub use pg::{run_migrations, AnyStore, PgStore, MIGRATOR};
+
 #[async_trait]
 pub trait SettingsRepository: Send + Sync {
     async fn get_settings(&self) -> Result<ServerSettings, DomainError>;
@@ -65,6 +68,7 @@ pub trait DeviceRepository: Send + Sync {
 #[async_trait]
 pub trait SessionRepository: Send + Sync {
     async fn create_session(&self, session: &Session) -> Result<(), DomainError>;
+    async fn find_session_by_id(&self, session_id: Uuid) -> Result<Option<Session>, DomainError>;
     async fn find_active_by_token_hash(&self, hash: &str) -> Result<Option<Session>, DomainError>;
     async fn rotate_refresh_token(
         &self,
@@ -623,6 +627,11 @@ impl SessionRepository for InMemoryStore {
             .insert(session.refresh_token_hash.clone(), session.id);
         lock.sessions.insert(session.id, session.clone());
         Ok(())
+    }
+
+    async fn find_session_by_id(&self, session_id: Uuid) -> Result<Option<Session>, DomainError> {
+        let lock = self.state.read().await;
+        Ok(lock.sessions.get(&session_id).cloned())
     }
 
     async fn find_active_by_token_hash(&self, hash: &str) -> Result<Option<Session>, DomainError> {
@@ -2006,5 +2015,28 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(terminated.terminated_at, Some(now + 10));
+    }
+
+    #[tokio::test]
+    async fn test_any_store_delegation_and_readiness() {
+        let store = AnyStore::memory();
+        assert!(store.is_ready().await);
+
+        let settings = store.get_settings().await.unwrap();
+        assert_eq!(settings.schema_version, 1);
+        assert!(!settings.bootstrap_consumed);
+
+        let user = User {
+            id: Uuid::new_v4(),
+            username: "anystore_user".to_string(),
+            email: "anystore@example.com".to_string(),
+            password_hash: "argon2id_hash".to_string(),
+            created_at: 100,
+            updated_at: 100,
+            is_active: true,
+        };
+        store.create_user(&user).await.unwrap();
+        let fetched = store.find_user_by_id(user.id).await.unwrap().unwrap();
+        assert_eq!(fetched.username, "anystore_user");
     }
 }

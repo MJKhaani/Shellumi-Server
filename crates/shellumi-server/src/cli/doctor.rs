@@ -21,7 +21,7 @@ pub struct DoctorReport {
 }
 
 /// Executes all system diagnostic checks against the provided configuration.
-pub fn run_diagnostics(config: &ServerConfig) -> DoctorReport {
+pub async fn run_diagnostics(config: &ServerConfig) -> DoctorReport {
     let mut checks = Vec::new();
 
     // 1. Configuration Validation
@@ -83,14 +83,7 @@ pub fn run_diagnostics(config: &ServerConfig) -> DoctorReport {
 
     // 3. Storage & Database URL
     if let Some(db_url) = &config.database_url {
-        if db_url.starts_with("postgres://") || db_url.starts_with("postgresql://") {
-            checks.push(DiagnosticCheck {
-                name: "Database Configuration",
-                passed: true,
-                message: "Valid PostgreSQL connection string configured".to_string(),
-                is_warning: false,
-            });
-        } else {
+        if !db_url.starts_with("postgres://") && !db_url.starts_with("postgresql://") {
             checks.push(DiagnosticCheck {
                 name: "Database Configuration",
                 passed: false,
@@ -98,6 +91,36 @@ pub fn run_diagnostics(config: &ServerConfig) -> DoctorReport {
                     .to_string(),
                 is_warning: false,
             });
+        } else {
+            // Attempt real database connection and query
+            match sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .acquire_timeout(std::time::Duration::from_secs(3))
+                .connect(db_url)
+                .await
+            {
+                Ok(pool) => match sqlx::query("SELECT 1").execute(&pool).await {
+                    Ok(_) => checks.push(DiagnosticCheck {
+                        name: "Database Configuration",
+                        passed: true,
+                        message: "Successfully connected to PostgreSQL and executed probe query"
+                            .to_string(),
+                        is_warning: false,
+                    }),
+                    Err(e) => checks.push(DiagnosticCheck {
+                        name: "Database Configuration",
+                        passed: false,
+                        message: format!("PostgreSQL probe query failed: {e}"),
+                        is_warning: false,
+                    }),
+                },
+                Err(e) => checks.push(DiagnosticCheck {
+                    name: "Database Configuration",
+                    passed: false,
+                    message: format!("PostgreSQL connection failed: {e}"),
+                    is_warning: false,
+                }),
+            }
         }
     } else {
         checks.push(DiagnosticCheck {
@@ -163,12 +186,31 @@ pub fn run_diagnostics(config: &ServerConfig) -> DoctorReport {
             });
         }
         Err(err) => {
-            checks.push(DiagnosticCheck {
-                name: "Filesystem Permissions",
-                passed: false,
-                message: format!("Working directory write probe failed: {err}"),
-                is_warning: false,
-            });
+            // In read-only container rootfs or restricted environments, check if temp directory is writable
+            let temp_probe = std::env::temp_dir().join(".shellumi-doctor-probe");
+            match fs::write(&temp_probe, b"probe") {
+                Ok(_) => {
+                    let _ = fs::remove_file(temp_probe);
+                    checks.push(DiagnosticCheck {
+                        name: "Filesystem Permissions",
+                        passed: true,
+                        message: format!(
+                            "Working directory is read-only ({err}); temporary directory is writable"
+                        ),
+                        is_warning: true,
+                    });
+                }
+                Err(temp_err) => {
+                    checks.push(DiagnosticCheck {
+                        name: "Filesystem Permissions",
+                        passed: false,
+                        message: format!(
+                            "Working directory ({err}) and temporary directory ({temp_err}) write probes failed"
+                        ),
+                        is_warning: false,
+                    });
+                }
+            }
         }
     }
 
@@ -202,10 +244,10 @@ pub fn print_doctor_report(report: &DoctorReport) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_diagnostics_on_default_config_passes() {
+    #[tokio::test]
+    async fn test_diagnostics_on_default_config_passes() {
         let config = ServerConfig::default();
-        let report = run_diagnostics(&config);
+        let report = run_diagnostics(&config).await;
         assert!(report.all_passed);
         assert_eq!(report.checks.len(), 6);
     }

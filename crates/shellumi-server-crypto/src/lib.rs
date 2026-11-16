@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 pub const SALT_LEN: usize = 16;
 pub const NONCE_LEN: usize = 12;
+pub const GCM_TAG_LEN: usize = 16;
 pub const MIN_KDF_ITERATIONS: u32 = 10_000;
 
 #[derive(Debug, Error)]
@@ -33,6 +34,9 @@ pub enum CryptoError {
     #[error("Invalid nonce length: expected {NONCE_LEN} bytes, got {0}")]
     InvalidNonceLength(usize),
 
+    #[error("Ciphertext too small: expected at least {GCM_TAG_LEN} bytes, got {0}")]
+    CiphertextTooSmall(usize),
+
     #[error("Ciphertext too large: max {max_bytes} bytes, got {actual_bytes} bytes")]
     CiphertextTooLarge {
         max_bytes: usize,
@@ -42,8 +46,39 @@ pub enum CryptoError {
     #[error("KDF iterations too low: minimum {MIN_KDF_ITERATIONS}, got {0}")]
     KdfIterationsTooLow(u32),
 
+    #[error("Unsupported cryptographic suite: {0}")]
+    UnsupportedSuite(String),
+
     #[error("Key generation failed: {0}")]
     KeyGen(String),
+}
+
+/// Generates unambiguous length-prefixed binary preimage encoding for a mutation signature.
+#[allow(clippy::too_many_arguments)]
+pub fn canonical_mutation_preimage_bytes(
+    vault_id: Uuid,
+    object_id: &str,
+    entity_type: &str,
+    expected_revision: u64,
+    deleted: bool,
+    key_epoch: u32,
+    device_counter: u64,
+    ciphertext_digest: &str,
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(128);
+    buf.extend_from_slice(b"shellumi-v1-mutation\0");
+    buf.extend_from_slice(vault_id.as_bytes());
+    buf.extend_from_slice(&(object_id.len() as u32).to_be_bytes());
+    buf.extend_from_slice(object_id.as_bytes());
+    buf.extend_from_slice(&(entity_type.len() as u32).to_be_bytes());
+    buf.extend_from_slice(entity_type.as_bytes());
+    buf.extend_from_slice(&expected_revision.to_be_bytes());
+    buf.push(if deleted { 1 } else { 0 });
+    buf.extend_from_slice(&key_epoch.to_be_bytes());
+    buf.extend_from_slice(&device_counter.to_be_bytes());
+    buf.extend_from_slice(&(ciphertext_digest.len() as u32).to_be_bytes());
+    buf.extend_from_slice(ciphertext_digest.as_bytes());
+    buf
 }
 
 /// Generates the canonical UTF-8 preimage string for a mutation signature per ADR 0003.
@@ -89,17 +124,6 @@ pub fn validate_envelope(
     envelope: &EncryptedEnvelope,
     max_record_bytes: usize,
 ) -> Result<(), CryptoError> {
-    if envelope.kdf_iterations < MIN_KDF_ITERATIONS {
-        return Err(CryptoError::KdfIterationsTooLow(envelope.kdf_iterations));
-    }
-
-    let salt_bytes = BASE64_STANDARD
-        .decode(&envelope.salt)
-        .map_err(|e| CryptoError::InvalidBase64(e.to_string()))?;
-    if salt_bytes.len() != SALT_LEN {
-        return Err(CryptoError::InvalidSaltLength(salt_bytes.len()));
-    }
-
     let nonce_bytes = BASE64_STANDARD
         .decode(&envelope.nonce)
         .map_err(|e| CryptoError::InvalidBase64(e.to_string()))?;
@@ -110,6 +134,9 @@ pub fn validate_envelope(
     let ciphertext_bytes = BASE64_STANDARD
         .decode(&envelope.ciphertext)
         .map_err(|e| CryptoError::InvalidBase64(e.to_string()))?;
+    if ciphertext_bytes.len() < GCM_TAG_LEN {
+        return Err(CryptoError::CiphertextTooSmall(ciphertext_bytes.len()));
+    }
     if ciphertext_bytes.len() > max_record_bytes {
         return Err(CryptoError::CiphertextTooLarge {
             max_bytes: max_record_bytes,
@@ -117,7 +144,71 @@ pub fn validate_envelope(
         });
     }
 
-    Ok(())
+    // Direct-DEK record envelope: suite is aes256gcm_dek_v1 or no KDF/salt
+    if envelope.suite == "aes256gcm_dek_v1"
+        && envelope.kdf_iterations == 0
+        && envelope.salt.is_empty()
+    {
+        return Ok(());
+    }
+
+    // Passphrase/recovery envelope: validate salt and iterations
+    if envelope.suite == "argon2id_aes256gcm_legacy"
+        || envelope.kdf_iterations > 0
+        || !envelope.salt.is_empty()
+    {
+        if envelope.kdf_iterations < MIN_KDF_ITERATIONS {
+            return Err(CryptoError::KdfIterationsTooLow(envelope.kdf_iterations));
+        }
+        let salt_bytes = BASE64_STANDARD
+            .decode(&envelope.salt)
+            .map_err(|e| CryptoError::InvalidBase64(e.to_string()))?;
+        if salt_bytes.len() != SALT_LEN {
+            return Err(CryptoError::InvalidSaltLength(salt_bytes.len()));
+        }
+        return Ok(());
+    }
+
+    if envelope.suite == "aes256gcm_dek_v1" {
+        return Ok(());
+    }
+
+    Err(CryptoError::UnsupportedSuite(envelope.suite.clone()))
+}
+
+/// Verifies a base64-encoded challenge signature against a device's Ed25519 signing public key.
+pub fn verify_device_challenge(
+    public_key_b64: &str,
+    challenge_nonce: &str,
+    signature_b64: &str,
+) -> Result<(), CryptoError> {
+    let message = format!("shellumi-device-challenge:{challenge_nonce}");
+    if verify_device_signature(public_key_b64, message.as_bytes(), signature_b64).is_ok() {
+        return Ok(());
+    }
+    verify_device_signature(public_key_b64, challenge_nonce.as_bytes(), signature_b64)
+}
+
+/// Generates a secure random 32-byte hex challenge nonce.
+pub fn generate_challenge_nonce() -> String {
+    use ring::rand::SecureRandom;
+    let rng = SystemRandom::new();
+    let mut bytes = [0u8; 32];
+    rng.fill(&mut bytes).expect("system randomness");
+    hex::encode(bytes)
+}
+
+/// Computes SHA-256 key fingerprint (hex encoded) for a public key.
+pub fn compute_key_fingerprint(public_key_b64: &str) -> Result<String, CryptoError> {
+    let bytes = BASE64_STANDARD
+        .decode(public_key_b64)
+        .map_err(|e| CryptoError::InvalidBase64(e.to_string()))?;
+    if bytes.len() != 32 {
+        return Err(CryptoError::InvalidPublicKeyLength(bytes.len()));
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    Ok(hex::encode(hasher.finalize()))
 }
 
 /// Verifies a base64-encoded Ed25519 signature against a base64-encoded public key.
@@ -209,7 +300,10 @@ mod tests {
 
     #[test]
     fn test_envelope_validation() {
-        let valid_envelope = EncryptedEnvelope {
+        let legacy_envelope = EncryptedEnvelope {
+            format_version: 1,
+            suite: "argon2id_aes256gcm_legacy".to_string(),
+            key_epoch: 1,
             salt: BASE64_STANDARD.encode([1u8; SALT_LEN]),
             nonce: BASE64_STANDARD.encode([2u8; NONCE_LEN]),
             ciphertext: BASE64_STANDARD.encode(vec![3u8; 100]),
@@ -217,18 +311,31 @@ mod tests {
             kdf_iterations: 600_000,
         };
 
-        assert!(validate_envelope(&valid_envelope, 1024).is_ok());
+        assert!(validate_envelope(&legacy_envelope, 1024).is_ok());
 
-        // Too low iterations
-        let mut low_iter = valid_envelope.clone();
+        // Direct-DEK envelope (no salt, no kdf_iterations)
+        let direct_dek_envelope = EncryptedEnvelope {
+            format_version: 1,
+            suite: "aes256gcm_dek_v1".to_string(),
+            key_epoch: 1,
+            salt: String::new(),
+            nonce: BASE64_STANDARD.encode([4u8; NONCE_LEN]),
+            ciphertext: BASE64_STANDARD.encode(vec![5u8; 64]),
+            associated_data: String::new(),
+            kdf_iterations: 0,
+        };
+        assert!(validate_envelope(&direct_dek_envelope, 1024).is_ok());
+
+        // Too low iterations on legacy envelope
+        let mut low_iter = legacy_envelope.clone();
         low_iter.kdf_iterations = 100;
         assert!(matches!(
             validate_envelope(&low_iter, 1024),
             Err(CryptoError::KdfIterationsTooLow(_))
         ));
 
-        // Invalid salt length
-        let mut bad_salt = valid_envelope.clone();
+        // Invalid salt length on legacy envelope
+        let mut bad_salt = legacy_envelope.clone();
         bad_salt.salt = BASE64_STANDARD.encode([1u8; 8]);
         assert!(matches!(
             validate_envelope(&bad_salt, 1024),
@@ -237,8 +344,34 @@ mod tests {
 
         // Oversized ciphertext
         assert!(matches!(
-            validate_envelope(&valid_envelope, 50),
+            validate_envelope(&direct_dek_envelope, 50),
             Err(CryptoError::CiphertextTooLarge { .. })
         ));
+
+        // Undersized ciphertext (less than GCM tag 16 bytes)
+        let mut tiny_cipher = direct_dek_envelope.clone();
+        tiny_cipher.ciphertext = BASE64_STANDARD.encode(vec![1u8; 8]);
+        assert!(matches!(
+            validate_envelope(&tiny_cipher, 1024),
+            Err(CryptoError::CiphertextTooSmall(8))
+        ));
+    }
+
+    #[test]
+    fn test_device_challenge_and_fingerprint() {
+        let (signing_kp, _agreement_kp) = generate_test_ed25519_keypair().unwrap();
+        let pk_b64 = BASE64_STANDARD.encode(signing_kp.public_key().as_ref());
+        let challenge = generate_challenge_nonce();
+        assert_eq!(challenge.len(), 64); // 32 bytes hex
+
+        let message = format!("shellumi-device-challenge:{challenge}");
+        let sig = signing_kp.sign(message.as_bytes());
+        let sig_b64 = BASE64_STANDARD.encode(sig.as_ref());
+
+        assert!(verify_device_challenge(&pk_b64, &challenge, &sig_b64).is_ok());
+        assert!(verify_device_challenge(&pk_b64, "wrong-challenge", &sig_b64).is_err());
+
+        let fingerprint = compute_key_fingerprint(&pk_b64).unwrap();
+        assert_eq!(fingerprint.len(), 64);
     }
 }

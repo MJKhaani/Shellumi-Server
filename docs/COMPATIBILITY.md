@@ -18,6 +18,7 @@ Clients query `/api/v1/capabilities` upon connecting to discover supported featu
 
 ```json
 {
+  "server_instance_id": "019abcde-0001-7000-8000-000000000001",
   "server_version": "0.1.0",
   "protocol_version": 1,
   "min_protocol_version": 1,
@@ -25,17 +26,24 @@ Clients query `/api/v1/capabilities` upon connecting to discover supported featu
     "argon2id_auth_v1",
     "device_keys_v1",
     "delta_sync_v1",
-    "shared_vaults_v1",
+    "websocket_notifications_v1",
+    "team_sharing_v1",
     "terminal_collab_v1"
   ],
   "supported_e2ee_suites": [
-    "x25519_hkdf_aes256gcm",
+    "aes256gcm_dek_v1",
+    "hpke_x25519_hkdfsha256_aes256gcm_v1",
     "argon2id_aes256gcm_legacy"
   ],
+  "websocket": {
+    "endpoint": "/api/v1/events/ws",
+    "heartbeat_seconds": 25
+  },
   "limits": {
     "max_request_bytes": 10485760,
     "max_record_bytes": 1048576,
-    "max_mutations_per_commit": 1000
+    "max_mutations_per_commit": 1000,
+    "max_change_page": 500
   }
 }
 ```
@@ -49,12 +57,13 @@ The table below maps Shellumi desktop client domain models (`crates/shellumi-cor
 | Desktop Client Entity | Wire Representation | Wire Structure / Endpoint | Notes |
 | :--- | :--- | :--- | :--- |
 | `SyncVault` | `VaultResponse` | `GET /api/v1/vaults`, `POST /api/v1/vaults` | Distinguishes `personal` vs `team` vaults. |
-| `SyncRecord` | `MutationItem` / `SyncChangeItem` | `POST /api/v1/vaults/{id}/commits`, `GET /api/v1/vaults/{id}/changes` | Binds `expected_revision` for CAS. |
-| `EncryptedEnvelope` | `EncryptedEnvelope` | JSON object embedded in mutations/changes | Client-sealed AEAD ciphertext; opaque to server. |
+| `SyncRecord` | `MutationItem` / `SyncChangeItem` | `POST /api/v1/vaults/{id}/commits`, `GET /api/v1/vaults/{id}/changes` | Binds `expected_revision` for CAS. Monotonic per-mutation sequences. |
+| `EncryptedEnvelope` | `EncryptedEnvelope` | JSON object embedded in mutations/changes | Direct-DEK (`aes256gcm_dek_v1`) or legacy passphrase envelope. |
 | `TeamRole` | `String` enum | `owner`, `admin`, `editor`, `viewer` | Enforced server-side on all endpoints. |
 | `SharedVault` | `VaultResponse` (type: `team`) | `POST /api/v1/vaults` (`vault_type: "team"`) | Requires recipient-wrapped DEKs. |
 | `TeamMember` | `VaultMemberResponse` | `GET /api/v1/vaults/{id}/members` | Scoped to active organization & vault. |
 | `KeyEnvelope` | `KeyEnvelopeResponse` | `GET/POST /api/v1/vaults/{id}/keys/envelopes` | Wrapped DEKs targeted to recipient device X25519 public keys. |
+| `RecipientDevice` | `RecipientDeviceResponse` | `GET /api/v1/vaults/{id}/recipient-devices` | Discovers active vault member devices with X25519 keys & fingerprints. |
 | `CollabSession` | `CollabSessionResponse` | `/api/v1/collab/sessions` | Ephemeral live terminal sharing. |
 | `CollabFrame` | `CollabFrame` | `/api/v1/collab/sessions/{id}/frames` | Encrypted keystrokes and PTY output. |
 
@@ -66,11 +75,14 @@ Ciphertext payloads are encapsulated in the canonical `EncryptedEnvelope`:
 
 ```json
 {
-  "salt": "<base64_encoded_salt>",
+  "format_version": 1,
+  "suite": "aes256gcm_dek_v1",
+  "key_epoch": 1,
+  "salt": "",
   "nonce": "<base64_encoded_nonce>",
   "ciphertext": "<base64_encoded_ciphertext_and_tag>",
   "associated_data": "<canonical_aad_string>",
-  "kdf_iterations": 3
+  "kdf_iterations": 0
 }
 ```
 

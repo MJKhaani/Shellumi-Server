@@ -4,7 +4,7 @@ use clap::Parser;
 use shellumi_server::cli::{admin, backup, doctor, migrate, BackupAction, Commands, MigrateAction};
 use shellumi_server::config::{CliArgs, ServerConfig};
 use shellumi_server::server;
-use shellumi_server_store::InMemoryStore;
+use shellumi_server_store::{AnyStore, PgStore};
 use std::process::ExitCode;
 use std::sync::Arc;
 use tracing::{error, info};
@@ -25,7 +25,7 @@ async fn main() -> ExitCode {
     // Subcommand dispatch
     match &cli.command {
         Some(Commands::Doctor) => {
-            let report = doctor::run_diagnostics(&config);
+            let report = doctor::run_diagnostics(&config).await;
             doctor::print_doctor_report(&report);
             if report.all_passed {
                 return ExitCode::SUCCESS;
@@ -59,18 +59,27 @@ async fn main() -> ExitCode {
             MigrateAction::Run => {
                 let report = migrate::get_migration_status(&config);
                 migrate::print_migration_status(&report);
-                if report.database_configured {
-                    println!("\nApplying forward migrations to configured PostgreSQL database...");
-                    // Schema migration runner applies forward migrations
-                    println!("[ OK ] Database schema is up to date.");
-                } else {
-                    println!("\n[ OK ] In-memory schema initialized.");
+                match migrate::run_database_migrations(&config).await {
+                    Ok(_) => return ExitCode::SUCCESS,
+                    Err(err) => {
+                        eprintln!("\n[ FAIL ] Migration failed: {err}");
+                        return ExitCode::FAILURE;
+                    }
                 }
-                return ExitCode::SUCCESS;
             }
         },
         Some(Commands::Admin(admin_args)) => {
-            let store = Arc::new(InMemoryStore::new());
+            let store = if let Some(ref db_url) = config.database_url {
+                match PgStore::connect(db_url).await {
+                    Ok(pg) => Arc::new(AnyStore::postgres(pg)),
+                    Err(e) => {
+                        eprintln!("Failed to connect to database: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            } else {
+                Arc::new(AnyStore::memory())
+            };
             match admin::run_admin_command(store, admin_args).await {
                 Ok(_) => return ExitCode::SUCCESS,
                 Err(err) => {

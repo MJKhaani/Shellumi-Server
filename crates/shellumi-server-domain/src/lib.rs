@@ -85,6 +85,30 @@ pub enum DomainError {
     #[error("Stale key epoch: active vault epoch is {current}, commit used epoch {provided}")]
     StaleKeyEpoch { current: u32, provided: u32 },
 
+    #[error("Future key epoch: active vault epoch is {current}, commit used epoch {provided}")]
+    FutureKeyEpoch { current: u32, provided: u32 },
+
+    #[error("Invalid cursor: {0}")]
+    InvalidCursor(String),
+
+    #[error("Cursor has expired")]
+    CursorExpired,
+
+    #[error("Device challenge has expired")]
+    ChallengeExpired,
+
+    #[error("Invalid device challenge signature or nonce")]
+    InvalidChallenge,
+
+    #[error("Unsupported cryptographic suite: {0}")]
+    UnsupportedSuite(String),
+
+    #[error("Invalid cryptographic envelope: {0}")]
+    InvalidEnvelope(String),
+
+    #[error("Membership has been revoked")]
+    MembershipRevoked,
+
     #[error("Payload too large: limit {limit} bytes, actual {actual} bytes")]
     PayloadTooLarge { limit: usize, actual: usize },
 

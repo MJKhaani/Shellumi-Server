@@ -13,6 +13,7 @@ use std::fs;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -66,9 +67,11 @@ impl FromStr for RegistrationMode {
 /// Fully resolved and validated server runtime configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerConfig {
+    pub server_instance_id: Uuid,
     pub listen_addr: SocketAddr,
     pub public_url: String,
     pub database_url: Option<String>,
+    pub token_signing_key: Option<String>,
     pub log_level: String,
     pub log_format: String,
     pub registration: RegistrationMode,
@@ -87,9 +90,11 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
+            server_instance_id: Uuid::from_u128(0x3b21741a_0f47_490f_ac7b_2cedaf8e0ebc),
             listen_addr: SocketAddr::from(([127, 0, 0, 1], 8080)),
             public_url: "http://127.0.0.1:8080".to_string(),
             database_url: None,
+            token_signing_key: None,
             log_level: "info".to_string(),
             log_format: "json".to_string(),
             registration: RegistrationMode::InviteOnly,
@@ -166,9 +171,11 @@ impl ServerConfig {
 /// Optional file configuration schema.
 #[derive(Debug, Default, Deserialize)]
 pub struct ConfigFile {
+    pub server_instance_id: Option<Uuid>,
     pub listen_addr: Option<SocketAddr>,
     pub public_url: Option<String>,
     pub database_url: Option<String>,
+    pub token_signing_key: Option<String>,
     pub log_level: Option<String>,
     pub log_format: Option<String>,
     pub registration: Option<RegistrationMode>,
@@ -269,6 +276,14 @@ pub struct CliArgs {
     #[arg(long, env = "SHELLUMI_SERVER_RATE_LIMIT_PER_MINUTE")]
     pub rate_limit_per_minute: Option<usize>,
 
+    /// Server installation identity UUID
+    #[arg(long, env = "SHELLUMI_SERVER_INSTANCE_ID")]
+    pub server_instance_id: Option<uuid::Uuid>,
+
+    /// Secret key used for signing session tokens
+    #[arg(long, env = "SHELLUMI_SERVER_TOKEN_SIGNING_KEY")]
+    pub token_signing_key: Option<String>,
+
     /// Developer mode bypasses certain non-loopback security checks (for tests only)
     #[arg(long, env = "SHELLUMI_SERVER_DEV_MODE")]
     pub dev_mode: Option<bool>,
@@ -295,7 +310,15 @@ impl ServerConfig {
             })
             .or(file_cfg.database_url);
 
+        let server_instance_id = cli
+            .server_instance_id
+            .or(file_cfg.server_instance_id)
+            .unwrap_or(defaults.server_instance_id);
+
+        let token_signing_key = cli.token_signing_key.clone().or(file_cfg.token_signing_key);
+
         let config = ServerConfig {
+            server_instance_id,
             listen_addr: cli
                 .listen_addr
                 .or(file_cfg.listen_addr)
@@ -306,6 +329,7 @@ impl ServerConfig {
                 .or(file_cfg.public_url)
                 .unwrap_or(defaults.public_url),
             database_url,
+            token_signing_key,
             log_level: cli
                 .log_level
                 .clone()
@@ -446,6 +470,8 @@ mod tests {
         let cli = CliArgs {
             command: None,
             config: None,
+            server_instance_id: None,
+            token_signing_key: None,
             listen_addr: Some("127.0.0.1:9090".parse().unwrap()),
             public_url: Some("http://127.0.0.1:9090".to_string()),
             database_url: None,

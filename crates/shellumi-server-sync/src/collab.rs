@@ -10,7 +10,8 @@ use shellumi_server_protocol::{
     AcceptInviteRequest, AcceptInviteResponse, AddVaultMemberRequest, AuditEventResponse,
     AuditLogResponse, CreateInviteRequest, InviteListResponse, InviteResponse,
     KeyEnvelopeListResponse, KeyEnvelopeResponse, PublishKeyEnvelopesRequest,
-    RotateKeyEpochRequest, RotateKeyEpochResponse, VaultMemberListResponse, VaultMemberResponse,
+    RecipientDeviceResponse, RecipientDevicesResponse, RotateKeyEpochRequest,
+    RotateKeyEpochResponse, VaultMemberListResponse, VaultMemberResponse,
 };
 use shellumi_server_store::Store;
 use uuid::Uuid;
@@ -571,6 +572,16 @@ impl<S: Store> SyncEngine<S> {
             if recipient.revoked_at.is_some() {
                 return Err(DomainError::DeviceRevoked);
             }
+            let recipient_role = self
+                .store
+                .get_vault_member_role(vault_id, recipient.user_id)
+                .await?;
+            if recipient_role.is_none() {
+                return Err(DomainError::PermissionDenied(
+                    "Recipient device does not belong to an active member of this vault"
+                        .to_string(),
+                ));
+            }
             if item.wrapped_dek.trim().is_empty() {
                 return Err(DomainError::InvalidInput(
                     "wrapped_dek must not be empty".to_string(),
@@ -669,6 +680,50 @@ impl<S: Store> SyncEngine<S> {
         })
     }
 
+    /// Lists active recipient devices belonging to members of the vault for key wrapping.
+    pub async fn list_recipient_devices(
+        &self,
+        caller_user_id: Uuid,
+        vault_id: Uuid,
+    ) -> Result<RecipientDevicesResponse, DomainError> {
+        let vault = self
+            .store
+            .find_vault_by_id(vault_id)
+            .await?
+            .ok_or(DomainError::NotFound)?;
+        if vault.deleted_at.is_some() {
+            return Err(DomainError::NotFound);
+        }
+
+        let _caller_role = self
+            .store
+            .get_vault_member_role(vault_id, caller_user_id)
+            .await?
+            .ok_or(DomainError::NotFound)?;
+
+        let members = self.store.list_vault_members(vault_id).await?;
+        let mut devices = Vec::new();
+        for member in members {
+            let user_devices = self.store.list_for_user(member.user_id).await?;
+            for d in user_devices {
+                if d.revoked_at.is_none() {
+                    let key_fingerprint =
+                        shellumi_server_crypto::compute_key_fingerprint(&d.agreement_public_key)
+                            .map_err(|e| DomainError::Internal(e.to_string()))?;
+                    devices.push(RecipientDeviceResponse {
+                        device_id: d.id,
+                        user_id: d.user_id,
+                        device_name: d.device_name,
+                        agreement_public_key: d.agreement_public_key,
+                        key_fingerprint,
+                    });
+                }
+            }
+        }
+
+        Ok(RecipientDevicesResponse { vault_id, devices })
+    }
+
     /// Rotates the vault key epoch.
     /// Validates that new_epoch > current_epoch, stores wraps, updates active epoch, and audits.
     pub async fn rotate_key_epoch(
@@ -719,6 +774,12 @@ impl<S: Store> SyncEngine<S> {
                 provided: req.new_epoch,
             });
         }
+        if req.new_epoch > vault.active_key_epoch + 1 {
+            return Err(DomainError::FutureKeyEpoch {
+                current: vault.active_key_epoch,
+                provided: req.new_epoch,
+            });
+        }
 
         let now = chrono::Utc::now().timestamp();
         let mut envelopes = Vec::with_capacity(req.envelopes.len());
@@ -730,6 +791,16 @@ impl<S: Store> SyncEngine<S> {
                 .ok_or(DomainError::DeviceNotFound)?;
             if recipient.revoked_at.is_some() {
                 return Err(DomainError::DeviceRevoked);
+            }
+            let recipient_role = self
+                .store
+                .get_vault_member_role(vault_id, recipient.user_id)
+                .await?;
+            if recipient_role.is_none() {
+                return Err(DomainError::PermissionDenied(
+                    "Recipient device does not belong to an active member of this vault"
+                        .to_string(),
+                ));
             }
             envelopes.push(VaultKeyEnvelope {
                 vault_id,
@@ -827,5 +898,191 @@ impl<S: Store> SyncEngine<S> {
             vault_id,
             events: responses,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+    use base64::Engine;
+    use shellumi_server_domain::{Device, Organization, User};
+    use shellumi_server_protocol::{CreateVaultRequest, KeyEnvelopeItem};
+    use shellumi_server_store::{DeviceRepository, InMemoryStore, OrgRepository, UserRepository};
+    use std::sync::Arc;
+
+    async fn setup_collab_context() -> (
+        Arc<InMemoryStore>,
+        SyncEngine<InMemoryStore>,
+        Uuid,
+        Uuid,
+        Uuid,
+    ) {
+        let store = Arc::new(InMemoryStore::new());
+        let engine = SyncEngine::new(store.clone(), 1024 * 1024);
+        let user_id = Uuid::new_v4();
+        let org_id = Uuid::new_v4();
+        let now = chrono::Utc::now().timestamp();
+
+        let user = User {
+            id: user_id,
+            username: "collab_tester".to_string(),
+            email: "collab@example.com".to_string(),
+            password_hash: "hash".to_string(),
+            created_at: now,
+            updated_at: now,
+            is_active: true,
+        };
+        store.create_user(&user).await.unwrap();
+
+        let org = Organization {
+            id: org_id,
+            name: "Collab Org".to_string(),
+            created_at: now,
+        };
+        store.create_org(&org, user_id).await.unwrap();
+
+        let device_id = Uuid::new_v4();
+        let device = Device {
+            id: device_id,
+            user_id,
+            device_name: "Collab Device".to_string(),
+            signing_public_key: BASE64_STANDARD.encode([1u8; 32]),
+            agreement_public_key: BASE64_STANDARD.encode([2u8; 32]),
+            created_at: now,
+            last_seen_at: None,
+            revoked_at: None,
+        };
+        store.create_device(&device).await.unwrap();
+
+        (store, engine, user_id, org_id, device_id)
+    }
+
+    #[tokio::test]
+    async fn test_publish_key_envelopes_rejects_non_member_device() {
+        let (store, engine, user_id, org_id, device_id) = setup_collab_context().await;
+        let vault = engine
+            .create_vault(
+                user_id,
+                org_id,
+                CreateVaultRequest {
+                    name: Some("Collab Vault".to_string()),
+                    vault_type: "team".to_string(),
+                    encrypted_name: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Register a third-party non-member device
+        let non_member_id = Uuid::new_v4();
+        let non_member_device_id = Uuid::new_v4();
+        let now = chrono::Utc::now().timestamp();
+        store
+            .create_user(&User {
+                id: non_member_id,
+                username: "outsider".to_string(),
+                email: "outsider@example.com".to_string(),
+                password_hash: "hash".to_string(),
+                created_at: now,
+                updated_at: now,
+                is_active: true,
+            })
+            .await
+            .unwrap();
+        store
+            .create_device(&Device {
+                id: non_member_device_id,
+                user_id: non_member_id,
+                device_name: "Outsider Device".to_string(),
+                signing_public_key: BASE64_STANDARD.encode([4u8; 32]),
+                agreement_public_key: BASE64_STANDARD.encode([5u8; 32]),
+                created_at: now,
+                last_seen_at: None,
+                revoked_at: None,
+            })
+            .await
+            .unwrap();
+
+        let req = PublishKeyEnvelopesRequest {
+            epoch: 1,
+            envelopes: vec![KeyEnvelopeItem {
+                recipient_device_id: non_member_device_id,
+                wrapped_dek: "wrapped-secret".to_string(),
+                key_agreement_ephemeral_pk: Some("ephem-pk".to_string()),
+            }],
+        };
+
+        let err = engine
+            .publish_key_envelopes(user_id, device_id, vault.vault_id, req)
+            .await
+            .unwrap_err();
+
+        match err {
+            DomainError::PermissionDenied(msg) => {
+                assert!(msg.contains("active member"));
+            }
+            other => panic!("expected PermissionDenied, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rotate_key_epoch_enforces_monotonic_advancement() {
+        let (_store, engine, user_id, org_id, device_id) = setup_collab_context().await;
+        let vault = engine
+            .create_vault(
+                user_id,
+                org_id,
+                CreateVaultRequest {
+                    name: Some("Monotonic Vault".to_string()),
+                    vault_type: "team".to_string(),
+                    encrypted_name: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(vault.active_key_epoch, 1);
+
+        // Attempt to skip from epoch 1 to epoch 3 (future key epoch)
+        let req_skip = RotateKeyEpochRequest {
+            new_epoch: 3,
+            envelopes: vec![KeyEnvelopeItem {
+                recipient_device_id: device_id,
+                wrapped_dek: "wrapped-epoch-3".to_string(),
+                key_agreement_ephemeral_pk: Some("ephem-3".to_string()),
+            }],
+        };
+
+        let err = engine
+            .rotate_key_epoch(user_id, device_id, vault.vault_id, req_skip)
+            .await
+            .unwrap_err();
+
+        match err {
+            DomainError::FutureKeyEpoch { current, provided } => {
+                assert_eq!(current, 1);
+                assert_eq!(provided, 3);
+            }
+            other => panic!("expected FutureKeyEpoch, got {other:?}"),
+        }
+
+        // Monotonic epoch 2 succeeds
+        let req_valid = RotateKeyEpochRequest {
+            new_epoch: 2,
+            envelopes: vec![KeyEnvelopeItem {
+                recipient_device_id: device_id,
+                wrapped_dek: "wrapped-epoch-2".to_string(),
+                key_agreement_ephemeral_pk: Some("ephem-2".to_string()),
+            }],
+        };
+
+        let resp = engine
+            .rotate_key_epoch(user_id, device_id, vault.vault_id, req_valid)
+            .await
+            .unwrap();
+
+        assert_eq!(resp.active_key_epoch, 2);
+        assert_eq!(resp.enrolled_envelopes, 1);
     }
 }

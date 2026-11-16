@@ -2,11 +2,13 @@ use axum::{
     body::Body,
     http::{header, Request, StatusCode},
 };
+use base64::Engine;
 use shellumi_server::config::ServerConfig;
 use shellumi_server::server::create_router;
 use shellumi_server_protocol::{
-    BootstrapRequest, BootstrapResponse, DeviceResponse, ErrorResponse, LoginRequest,
-    LoginResponse, MeResponse, RefreshTokenRequest, RefreshTokenResponse, RegisterDeviceRequest,
+    BootstrapRequest, BootstrapResponse, DeviceChallengeResponse, DeviceResponse, ErrorResponse,
+    LoginRequest, LoginResponse, MeResponse, RefreshTokenRequest, RefreshTokenResponse,
+    RegisterDeviceRequest,
 };
 use tower::ServiceExt;
 
@@ -233,10 +235,14 @@ async fn test_device_registration_listing_and_revocation() {
     let auth_header = format!("Bearer {}", boot_res.access_token);
 
     // Register a device
+    let signing_pk = base64::engine::general_purpose::STANDARD.encode([1u8; 32]);
+    let agreement_pk = base64::engine::general_purpose::STANDARD.encode([2u8; 32]);
     let dev_req = RegisterDeviceRequest {
         device_name: "Workstation-01".to_string(),
-        signing_public_key: "ed25519-pk-base64-string".to_string(),
-        agreement_public_key: "x25519-pk-base64-string".to_string(),
+        signing_public_key: signing_pk,
+        agreement_public_key: agreement_pk,
+        challenge: None,
+        challenge_signature: None,
     };
 
     let req = Request::builder()
@@ -302,4 +308,115 @@ async fn test_device_registration_listing_and_revocation() {
         .unwrap();
     let err: ErrorResponse = serde_json::from_slice(&body).unwrap();
     assert_eq!(err.error_code, "DEVICE_REVOKED");
+}
+
+#[tokio::test]
+async fn test_device_challenge_and_pop_registration() {
+    use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+    use shellumi_server_crypto::generate_test_ed25519_keypair;
+
+    let config = ServerConfig::default();
+    let app = create_router(config);
+
+    // Bootstrap initial admin
+    let bootstrap_req = BootstrapRequest {
+        admin_username: "challenge_tester".to_string(),
+        admin_email: "challenge@example.com".to_string(),
+        admin_password: "ChallengeSecurePass123!".to_string(),
+        org_name: "Challenge Org".to_string(),
+        bootstrap_token: None,
+    };
+    let req = Request::builder()
+        .uri("/api/v1/bootstrap")
+        .method("POST")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&bootstrap_req).unwrap()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let body = axum::body::to_bytes(res.into_body(), 1024 * 64)
+        .await
+        .unwrap();
+    let boot_res: BootstrapResponse = serde_json::from_slice(&body).unwrap();
+    let auth_header = format!("Bearer {}", boot_res.access_token);
+
+    // Request challenge nonce
+    let req = Request::builder()
+        .uri("/api/v1/devices/challenge")
+        .method("POST")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from("{}"))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), 1024 * 64)
+        .await
+        .unwrap();
+    let challenge_res: DeviceChallengeResponse = serde_json::from_slice(&body).unwrap();
+    assert!(!challenge_res.challenge.is_empty());
+    assert!(challenge_res.expires_at > chrono::Utc::now().timestamp());
+
+    // Generate real Ed25519 keypair
+    let (keypair, pk_b64) = generate_test_ed25519_keypair().unwrap();
+    let agreement_pk = BASE64_STANDARD.encode([5u8; 32]);
+
+    // Negative case: Register device with invalid challenge signature -> 401 Unauthorized
+    let bad_dev_req = RegisterDeviceRequest {
+        device_name: "Tampered-Device".to_string(),
+        signing_public_key: pk_b64.clone(),
+        agreement_public_key: agreement_pk.clone(),
+        challenge: Some(challenge_res.challenge.clone()),
+        challenge_signature: Some(BASE64_STANDARD.encode([9u8; 64])),
+    };
+    let req = Request::builder()
+        .uri("/api/v1/devices")
+        .method("POST")
+        .header(header::AUTHORIZATION, &auth_header)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&bad_dev_req).unwrap()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+    // Positive case: Request a fresh challenge nonce
+    let req = Request::builder()
+        .uri("/api/v1/devices/challenge")
+        .method("POST")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from("{}"))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), 1024 * 64)
+        .await
+        .unwrap();
+    let fresh_challenge_res: DeviceChallengeResponse = serde_json::from_slice(&body).unwrap();
+
+    // Sign fresh challenge nonce correctly
+    let sig = keypair.sign(fresh_challenge_res.challenge.as_bytes());
+    let sig_b64 = BASE64_STANDARD.encode(sig.as_ref());
+
+    let good_dev_req = RegisterDeviceRequest {
+        device_name: "Verified-Device".to_string(),
+        signing_public_key: pk_b64,
+        agreement_public_key: agreement_pk,
+        challenge: Some(fresh_challenge_res.challenge),
+        challenge_signature: Some(sig_b64),
+    };
+    let req = Request::builder()
+        .uri("/api/v1/devices")
+        .method("POST")
+        .header(header::AUTHORIZATION, &auth_header)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&good_dev_req).unwrap()))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    let status = res.status();
+    let body = axum::body::to_bytes(res.into_body(), 1024 * 64)
+        .await
+        .unwrap();
+    println!("STATUS: {status}, BODY: {}", String::from_utf8_lossy(&body));
+    assert_eq!(status, StatusCode::CREATED);
+    let dev_res: DeviceResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(dev_res.device_name, "Verified-Device");
 }

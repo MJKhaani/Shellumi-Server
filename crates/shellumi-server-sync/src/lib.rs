@@ -2,8 +2,8 @@
 
 use sha2::{Digest, Sha256};
 use shellumi_server_crypto::{
-    canonical_mutation_preimage, compute_ciphertext_digest, validate_envelope,
-    verify_device_signature,
+    canonical_mutation_preimage, canonical_mutation_preimage_bytes, compute_ciphertext_digest,
+    validate_envelope, verify_device_signature,
 };
 use shellumi_server_domain::{
     ChangeLogEntry, DomainError, Record, Vault, VaultMember, VaultRole, VaultType,
@@ -271,9 +271,15 @@ impl<S: Store> SyncEngine<S> {
                     provided: mutation.key_epoch,
                 });
             }
+            if mutation.key_epoch > vault.active_key_epoch {
+                return Err(DomainError::FutureKeyEpoch {
+                    current: vault.active_key_epoch,
+                    provided: mutation.key_epoch,
+                });
+            }
 
             let digest = compute_ciphertext_digest(mutation.encrypted_envelope.as_ref());
-            let preimage = canonical_mutation_preimage(
+            let preimage_bytes = canonical_mutation_preimage_bytes(
                 req.vault_id,
                 &mutation.object_id,
                 &mutation.entity_type,
@@ -284,12 +290,30 @@ impl<S: Store> SyncEngine<S> {
                 &digest,
             );
 
-            verify_device_signature(
+            // Verify using binary preimage, falling back to legacy UTF-8 string preimage
+            let sig_res = verify_device_signature(
                 &device.signing_public_key,
-                preimage.as_bytes(),
+                &preimage_bytes,
                 &mutation.device_signature,
-            )
-            .map_err(|e| DomainError::InvalidSignature(e.to_string()))?;
+            );
+            if sig_res.is_err() {
+                let legacy_preimage = canonical_mutation_preimage(
+                    req.vault_id,
+                    &mutation.object_id,
+                    &mutation.entity_type,
+                    mutation.expected_revision,
+                    mutation.deleted,
+                    mutation.key_epoch,
+                    mutation.device_counter,
+                    &digest,
+                );
+                verify_device_signature(
+                    &device.signing_public_key,
+                    legacy_preimage.as_bytes(),
+                    &mutation.device_signature,
+                )
+                .map_err(|e| DomainError::InvalidSignature(e.to_string()))?;
+            }
 
             if mutation.deleted {
                 if mutation.encrypted_envelope.is_some() {
@@ -309,13 +333,14 @@ impl<S: Store> SyncEngine<S> {
         }
 
         // Monotonic sequence allocation and CAS revision checks
-        let new_sequence = vault.server_sequence + 1;
+        let base_sequence = vault.server_sequence;
         let now = chrono::Utc::now().timestamp();
         let mut records_to_upsert = Vec::with_capacity(req.mutations.len());
         let mut change_log_entries = Vec::with_capacity(req.mutations.len());
         let mut applied_acks = Vec::with_capacity(req.mutations.len());
 
-        for mutation in &req.mutations {
+        for (idx, mutation) in req.mutations.iter().enumerate() {
+            let mutation_seq = base_sequence + 1 + idx as u64;
             let existing = self
                 .store
                 .find_record(req.vault_id, &mutation.object_id)
@@ -368,13 +393,13 @@ impl<S: Store> SyncEngine<S> {
                 deleted: mutation.deleted,
                 encrypted_envelope: envelope_json.clone(),
                 ciphertext_digest: digest.clone(),
-                last_server_sequence: new_sequence,
+                last_server_sequence: mutation_seq,
                 updated_at: now,
             };
 
             let entry = ChangeLogEntry {
                 vault_id: req.vault_id,
-                sequence: new_sequence,
+                sequence: mutation_seq,
                 object_id: mutation.object_id.clone(),
                 entity_type: mutation.entity_type.clone(),
                 revision: assigned_revision,
@@ -390,15 +415,16 @@ impl<S: Store> SyncEngine<S> {
             applied_acks.push(MutationAck {
                 object_id: mutation.object_id.clone(),
                 assigned_revision,
-                server_sequence: new_sequence,
+                server_sequence: mutation_seq,
                 deleted: mutation.deleted,
             });
         }
 
-        let next_cursor = format!("seq:{}", new_sequence);
+        let final_sequence = base_sequence + req.mutations.len() as u64;
+        let next_cursor = format!("seq:{}", final_sequence);
         let response = CommitBatchResponse {
             vault_id: req.vault_id,
-            commit_sequence: new_sequence,
+            commit_sequence: final_sequence,
             next_cursor,
             applied: applied_acks,
         };
@@ -415,7 +441,7 @@ impl<S: Store> SyncEngine<S> {
                 &response_payload,
                 &records_to_upsert,
                 &change_log_entries,
-                new_sequence,
+                final_sequence,
             )
             .await?;
 
@@ -446,6 +472,10 @@ impl<S: Store> SyncEngine<S> {
             .await?
             .ok_or(DomainError::NotFound)?;
 
+        if since_sequence > vault.server_sequence {
+            return Err(DomainError::CursorExpired);
+        }
+
         let capped_limit = limit.clamp(1, 500);
         // Fetch capped_limit + 1 to check has_more
         let mut entries = self
@@ -461,24 +491,26 @@ impl<S: Store> SyncEngine<S> {
         let latest_entry_seq = entries.last().map(|e| e.sequence).unwrap_or(since_sequence);
         let next_cursor = format!("seq:{}", latest_entry_seq);
 
-        let records = entries
-            .into_iter()
-            .map(|e| {
-                let env = e
-                    .encrypted_envelope
-                    .and_then(|json| serde_json::from_str::<EncryptedEnvelope>(&json).ok());
-                SyncChangeItem {
-                    sequence: e.sequence,
-                    object_id: e.object_id,
-                    entity_type: e.entity_type,
-                    revision: e.revision,
-                    deleted: e.deleted,
-                    author_device_id: e.author_device_id,
-                    encrypted_envelope: env,
-                    updated_at: e.created_at,
-                }
-            })
-            .collect();
+        let mut records = Vec::with_capacity(entries.len());
+        for e in entries {
+            let env = match e.encrypted_envelope {
+                Some(json) => Some(
+                    serde_json::from_str::<EncryptedEnvelope>(&json)
+                        .map_err(|err| DomainError::InvalidEnvelope(err.to_string()))?,
+                ),
+                None => None,
+            };
+            records.push(SyncChangeItem {
+                sequence: e.sequence,
+                object_id: e.object_id,
+                entity_type: e.entity_type,
+                revision: e.revision,
+                deleted: e.deleted,
+                author_device_id: e.author_device_id,
+                encrypted_envelope: env,
+                updated_at: e.created_at,
+            });
+        }
 
         Ok(ChangeFeedResponse {
             vault_id,
@@ -512,24 +544,26 @@ impl<S: Store> SyncEngine<S> {
             .ok_or(DomainError::NotFound)?;
 
         let records_raw = self.store.get_snapshot_records(vault_id).await?;
-        let records = records_raw
-            .into_iter()
-            .map(|r| {
-                let env = r
-                    .encrypted_envelope
-                    .and_then(|json| serde_json::from_str::<EncryptedEnvelope>(&json).ok());
-                SyncChangeItem {
-                    sequence: r.last_server_sequence,
-                    object_id: r.object_id,
-                    entity_type: r.entity_type,
-                    revision: r.current_revision,
-                    deleted: r.deleted,
-                    author_device_id: r.author_device_id,
-                    encrypted_envelope: env,
-                    updated_at: r.updated_at,
-                }
-            })
-            .collect();
+        let mut records = Vec::with_capacity(records_raw.len());
+        for r in records_raw {
+            let env = match r.encrypted_envelope {
+                Some(json) => Some(
+                    serde_json::from_str::<EncryptedEnvelope>(&json)
+                        .map_err(|err| DomainError::InvalidEnvelope(err.to_string()))?,
+                ),
+                None => None,
+            };
+            records.push(SyncChangeItem {
+                sequence: r.last_server_sequence,
+                object_id: r.object_id,
+                entity_type: r.entity_type,
+                revision: r.current_revision,
+                deleted: r.deleted,
+                author_device_id: r.author_device_id,
+                encrypted_envelope: env,
+                updated_at: r.updated_at,
+            });
+        }
 
         Ok(SnapshotResponse {
             vault_id,
@@ -589,7 +623,7 @@ mod tests {
             user_id,
             device_name: "Test Device".to_string(),
             signing_public_key: public_key_b64,
-            agreement_public_key: "agree-key".to_string(),
+            agreement_public_key: BASE64_STANDARD.encode([3u8; 32]),
             created_at: now,
             last_seen_at: None,
             revoked_at: None,
@@ -601,11 +635,14 @@ mod tests {
 
     fn sample_envelope() -> EncryptedEnvelope {
         EncryptedEnvelope {
-            salt: BASE64_STANDARD.encode([1u8; 16]),
+            format_version: 1,
+            suite: "aes256gcm_dek_v1".to_string(),
+            key_epoch: 1,
+            salt: String::new(),
             nonce: BASE64_STANDARD.encode([2u8; 12]),
-            ciphertext: BASE64_STANDARD.encode(b"encrypted_secret_data"),
+            ciphertext: BASE64_STANDARD.encode(b"encrypted_secret_data_with_gcm_tag!"),
             associated_data: "host:001".to_string(),
-            kdf_iterations: 600_000,
+            kdf_iterations: 0,
         }
     }
 
@@ -734,10 +771,12 @@ mod tests {
             .commit_batch(user_id, device_id, commit_req)
             .await
             .unwrap();
-        assert_eq!(ack.commit_sequence, 1);
+        assert_eq!(ack.commit_sequence, 2);
         assert_eq!(ack.applied.len(), 2);
         assert_eq!(ack.applied[0].assigned_revision, 1);
+        assert_eq!(ack.applied[0].server_sequence, 1);
         assert_eq!(ack.applied[1].assigned_revision, 1);
+        assert_eq!(ack.applied[1].server_sequence, 2);
 
         // Delta change feed
         let feed = engine
@@ -745,12 +784,59 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(feed.records.len(), 2);
-        assert_eq!(feed.latest_sequence, 1);
+        assert_eq!(feed.latest_sequence, 2);
         assert!(!feed.has_more);
 
         // Snapshot
         let snap = engine.get_snapshot(user_id, vault.vault_id).await.unwrap();
         assert_eq!(snap.records.len(), 2);
+
+        // Future key epoch rejection test
+        let future_m = sign_test_mutation(
+            vault.vault_id,
+            "host-future",
+            "host",
+            0,
+            false,
+            2, // active is 1, so 2 is future
+            3,
+            Some(&env),
+            &keypair,
+        );
+        let future_req = CommitBatchRequest {
+            protocol_version: CURRENT_PROTOCOL_VERSION,
+            vault_id: vault.vault_id,
+            idempotency_key: "idem-future".to_string(),
+            base_cursor: None,
+            mutations: vec![future_m],
+        };
+        let future_err = engine
+            .commit_batch(user_id, device_id, future_req)
+            .await
+            .unwrap_err();
+        match future_err {
+            DomainError::FutureKeyEpoch { current, provided } => {
+                assert_eq!(current, 1);
+                assert_eq!(provided, 2);
+            }
+            other => panic!("expected FutureKeyEpoch, got {other:?}"),
+        }
+
+        // Cursor expired test (since_sequence > latest_sequence)
+        let cursor_err = engine
+            .get_changes(user_id, vault.vault_id, 999, 10)
+            .await
+            .unwrap_err();
+        assert!(matches!(cursor_err, DomainError::CursorExpired));
+
+        // Recipient devices test
+        let recip = engine
+            .list_recipient_devices(user_id, vault.vault_id)
+            .await
+            .unwrap();
+        assert_eq!(recip.vault_id, vault.vault_id);
+        assert_eq!(recip.devices.len(), 1);
+        assert_eq!(recip.devices[0].device_id, device_id);
     }
 
     #[tokio::test]

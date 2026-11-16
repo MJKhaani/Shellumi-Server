@@ -63,7 +63,9 @@ async fn register_test_device(
     let reg_req = RegisterDeviceRequest {
         device_name: name.to_string(),
         signing_public_key: public_key_b64.clone(),
-        agreement_public_key: "agree-key".to_string(),
+        agreement_public_key: BASE64_STANDARD.encode([2u8; 32]),
+        challenge: None,
+        challenge_signature: None,
     };
 
     let req = Request::builder()
@@ -88,11 +90,14 @@ async fn register_test_device(
 
 fn sample_envelope() -> EncryptedEnvelope {
     EncryptedEnvelope {
-        salt: BASE64_STANDARD.encode([1u8; 16]),
+        format_version: 1,
+        suite: "aes256gcm_dek_v1".to_string(),
+        key_epoch: 1,
+        salt: String::new(),
         nonce: BASE64_STANDARD.encode([2u8; 12]),
-        ciphertext: BASE64_STANDARD.encode(b"ciphertext_sample_payload"),
+        ciphertext: BASE64_STANDARD.encode(b"ciphertext_sample_payload_with_gcm_tag!"),
         associated_data: "host:001".to_string(),
-        kdf_iterations: 600_000,
+        kdf_iterations: 0,
     }
 }
 

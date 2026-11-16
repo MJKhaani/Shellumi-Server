@@ -11,8 +11,12 @@ repository.workspace = true
 shellumi-server-protocol.workspace = true
 shellumi-server-domain.workspace = true
 shellumi-server-store.workspace = true
+shellumi-server-crypto.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+base64.workspace = true
 argon2.workspace = true
 sha2.workspace = true
+ring.workspace = true
 subtle.workspace = true
 rand.workspace = true
 chrono.workspace = true

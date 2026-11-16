@@ -1042,24 +1042,128 @@ Sensitive endpoints are protected by in-memory sliding-window rate limiters:
 
 
 
-### Experimental sync notification WebSocket
+### Real-Time Event Stream WebSocket (`/api/v1/events/ws`)
 
-`GET /api/v1/sync/events` upgrades to a WebSocket. Send the existing
-`Authorization: Bearer <access token>` and `X-Device-Id: <device UUID>` headers.
-For an accessible team vault, a successful REST commit or metadata, membership,
-or key-epoch change can produce `{"type":"vault_changed","vault_id":"...","latest_sequence":42}`.
-This is an advisory hint: clients must pull the REST change feed and refresh
-vault metadata. Reconnect and pull all accessible vaults after any disconnect;
-notifications are volatile, may be duplicated, and are not a durable feed.
-The server closes lagging connections and limits concurrent connections to 1024.
-The connection checks current session, device status and membership before delivering a
-hint and closes when the access token expires. Logout signals all sockets for the
-user to close; a revoked session cannot reconnect. Vault deletion emits a
-`vault_deleted` hint. Access tokens issued before session binding cannot open a
-socket; clients must log in or refresh. Use TLS/WSS for
-non-loopback deployments. Client integration is not implemented.
+`GET /api/v1/events/ws` provides canonical bidirectional real-time notifications per `SHELLUMI_PROTOCOL_V1.md` §7.
 
-### Sync notification long poll
+**Headers required for upgrade:**
+- `Authorization: Bearer <access_token>`
+- `X-Device-Id: <device_id>`
+
+The server authenticates the token, verifies the active session binding, and checks that the device exists and is active. Unauthenticated or revoked sessions are rejected with `401 Unauthorized`. Heartbeat pings are transmitted by the server every 30 seconds.
+
+**Client-to-Server Messages (`action` tag):**
+- **Subscribe:**
+  ```json
+  {
+    "action": "subscribe",
+    "request_id": "req-1",
+    "vault_ids": ["019abcde-0001-7000-8000-000000000001"]
+  }
+  ```
+- **Unsubscribe:**
+  ```json
+  {
+    "action": "unsubscribe",
+    "request_id": "req-2",
+    "vault_ids": ["019abcde-0001-7000-8000-000000000001"]
+  }
+  ```
+- **Ping:**
+  ```json
+  {
+    "action": "ping"
+  }
+  ```
+
+**Server-to-Client Messages (`event` tag):**
+- **Subscribed Confirmation:**
+  ```json
+  {
+    "event": "subscribed",
+    "request_id": "req-1",
+    "vaults": [
+      { "vault_id": "019abcde-0001-7000-8000-000000000001", "latest_sequence": 42 }
+    ]
+  }
+  ```
+- **Vault Changed Notification:**
+  ```json
+  {
+    "event": "vault.changed",
+    "vault_id": "019abcde-0001-7000-8000-000000000001",
+    "latest_sequence": 43,
+    "notification_id": "019abcde-0002-7000-8000-000000000002"
+  }
+  ```
+- **Key Epoch Rotated Notification:**
+  ```json
+  {
+    "event": "vault.key_rotated",
+    "vault_id": "019abcde-0001-7000-8000-000000000001",
+    "epoch": 2,
+    "notification_id": "019abcde-0003-7000-8000-000000000003"
+  }
+  ```
+- **Vault Access Revoked Notification:**
+  ```json
+  {
+    "event": "vault.access_revoked",
+    "vault_id": "019abcde-0001-7000-8000-000000000001",
+    "notification_id": "019abcde-0004-7000-8000-000000000004"
+  }
+  ```
+- **Pong:**
+  ```json
+  {
+    "event": "pong"
+  }
+  ```
+- **Error:**
+  ```json
+  {
+    "event": "error",
+    "code": "SUBSCRIPTION_DENIED",
+    "message": "User is not an active member of vault 019abcde-0001-7000-8000-000000000001",
+    "request_id": "req-1"
+  }
+  ```
+
+### Device Enrollment Challenge Nonce
+
+- **Path:** `POST /api/v1/devices/challenge`
+- **Auth:** Public
+- **Description:** Issues a single-use 32-byte hex challenge nonce with 5-minute expiry for proof-of-possession device enrollment.
+- **Response:** `200 OK`
+  ```json
+  {
+    "challenge": "a1b2c3d4e5f6...",
+    "expires_at": 1731300300
+  }
+  ```
+
+### Recipient Device Discovery
+
+- **Path:** `GET /api/v1/vaults/:id/recipient-devices`
+- **Auth:** Bearer Token (Any active member of the vault)
+- **Description:** Returns active member devices capable of receiving wrapped DEKs, with their X25519 agreement keys and SHA-256 fingerprints.
+- **Response:** `200 OK`
+  ```json
+  {
+    "vault_id": "019abcde-0001-7000-8000-000000000001",
+    "devices": [
+      {
+        "device_id": "019abcde-0002-7000-8000-000000000002",
+        "user_id": "019abcde-0003-7000-8000-000000000003",
+        "device_name": "Workstation-01",
+        "agreement_public_key": "x25519-public-key-base64",
+        "key_fingerprint": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    ]
+  }
+  ```
+
+### Sync notification long poll (Advisory fallback)
 
 `GET /api/v1/sync/poll` accepts the same bearer and `X-Device-Id` headers as
 the WebSocket endpoint. It returns one `vault_changed` or `vault_deleted` JSON

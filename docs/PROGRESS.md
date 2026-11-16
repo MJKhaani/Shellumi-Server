@@ -798,3 +798,64 @@ This journal records every increment, decision, test execution, and verification
 - Known limitations / failed attempts: Dependency audit and CI remain unverified; feature and persistence limitations remain documented.
 - Next precise step: Install and run cargo-audit and complete the missing notification security tests before merge.
 - Issue / PR / CI evidence: Review branch `https://github.com/MJKhaani/Shellumi-Server/tree/codex/sync-notifications-docs`; no PR or CI evidence.
+
+---
+
+## 2026-11-16T04:55:00Z — TASK-012 — Phase 11 Audit, Protocol v1 Finalization, and Live Sync Notifications
+- Status: complete
+- Baseline / commit: `79d6560578346a3ffae10e1e8ea4cdc23ad479d8` (forked from `40f3b4ed4bfc0e7173baf20e1df48cae728afcba`).
+- Objective and acceptance criteria:
+  - Perform comprehensive static and runtime verification of findings S-01 through S-16 from the Phase 11 plan.
+  - Finalize protocol v1 in place without creating `/api/v2` or breaking wire abstractions.
+  - Implement full database-backed runtime persistence with PostgreSQL (`PgStore` and `AnyStore` for all repository traits), real transactional SQL migrations, real health and readiness checks.
+  - Upgrade session and token authentication to standard HMAC-SHA256 with cryptographically generated signing secrets, active session validation, and strict device binding.
+  - Enforce device challenge / proof-of-possession (`POST /api/v1/devices/challenge`) and strict 32-byte key encoding checks.
+  - Separate direct-DEK `RecordEnvelopeV1` from passphrase `RecoveryEnvelopeV1`, replace ambiguous colon-joined preimages with length-delimited canonical preimages, and reject both stale and future key epochs.
+  - Implement atomic commit batch transactions, distinct monotonically increasing event sequence numbers per mutation in change log, robust cursor validation, and consistent snapshot watermarks.
+  - Implement standard WebSocket instant vault-change notifications (`GET /api/v1/events/ws`) supporting `subscribe`, `subscribed`, `vault.changed`, `vault.key_rotated`, `vault.access_revoked`, and `error` frames with post-commit fan-out.
+  - Reconcile `docs/ROADMAP.md`, `README.md`, `docs/API.md`, `openapi/shellumi-server-v1.yaml`, and `docs/COMPATIBILITY.md` to truthfully reflect production status and limits.
+- Implementation / files changed:
+  - `Cargo.toml`, `Cargo.lock`
+  - `crates/shellumi-server-protocol/src/lib.rs`
+  - `crates/shellumi-server-domain/src/lib.rs`
+  - `crates/shellumi-server-crypto/src/lib.rs`
+  - `crates/shellumi-server-store/Cargo.toml`, `crates/shellumi-server-store/src/lib.rs`, `crates/shellumi-server-store/src/pg.rs`
+  - `crates/shellumi-server-auth/Cargo.toml`, `crates/shellumi-server-auth/src/lib.rs`
+  - `crates/shellumi-server-sync/src/lib.rs`, `crates/shellumi-server-sync/src/collab.rs`
+  - `crates/shellumi-server/Cargo.toml`, `crates/shellumi-server/src/server.rs`, `crates/shellumi-server/src/config.rs`, `crates/shellumi-server/src/main.rs`, `crates/shellumi-server/src/cli/doctor.rs`, `crates/shellumi-server/src/cli/migrate.rs`
+  - `crates/shellumi-server/tests/auth_and_devices.rs`, `crates/shellumi-server/tests/sync_events.rs`, `crates/shellumi-server/tests/sync_and_vaults.rs`, `crates/shellumi-server/tests/team_and_keys.rs`, `crates/shellumi-server/tests/collab_relay.rs`, `crates/shellumi-server/tests/ops_and_resilience.rs`, `crates/shellumi-server/tests/contract_fixtures.rs`
+  - `openapi/shellumi-server-v1.yaml`, `docs/API.md`, `docs/COMPATIBILITY.md`, `docs/ROADMAP.md`, `CHANGELOG.md`, `docs/PROGRESS.md`, `docs/PROTOCOL_V1.md`, `SHELLUMI_PROTOCOL_V1.md`
+- Data migration or API compatibility:
+  - Protocol v1 maintained in place.
+  - Additive endpoints: `GET /api/v1/events/ws`, `POST /api/v1/devices/challenge`, `GET /api/v1/vaults/{id}/recipient-devices`.
+  - Replaces experimental `/api/v1/sync/events` and `/api/v1/sync/poll` with canonical `/api/v1/events/ws`.
+  - E2EE record envelope updated to support direct-DEK `aes256gcm_dek_v1` without mandatory PBKDF2 parameters.
+  - Forward-only database migration runner added via `sqlx::migrate!("../../migrations")`.
+- Security / privacy review:
+  - Removes hard-coded bearer token HMAC secret; derives or securely loads server token secret.
+  - Upgrades hand-rolled SHA256 MAC to standard RFC 2104 HMAC-SHA256 (`ring::hmac`).
+  - Closes device enrollment spoofing by validating Ed25519/X25519 32-byte lengths and requiring signature over a fresh challenge nonce.
+  - Disallows past and future key epoch commits to prevent epoch skipping attacks.
+  - Zero-knowledge invariant preserved: server never receives plaintext DEKs or SSH credentials.
+- Tests added (file + test names):
+  - `crates/shellumi-server/tests/auth_and_devices.rs`: `test_device_challenge_and_pop_registration`
+  - `crates/shellumi-server/tests/sync_events.rs`: `test_ws_protocol_v1_messages_serialization`, `websocket_rejects_unauthenticated_upgrade`, `poll_rejects_unauthenticated_requests`, `team_metadata_change_sends_hint`
+  - `crates/shellumi-server-store/src/lib.rs`: `test_any_store_delegation_and_readiness`
+  - `crates/shellumi-server/src/cli/migrate.rs`: `test_run_database_migrations_on_in_memory_config`
+  - `crates/shellumi-server-sync/src/collab.rs`: `test_publish_key_envelopes_rejects_non_member_device`, `test_rotate_key_epoch_enforces_monotonic_advancement`
+  - `crates/shellumi-server-crypto/src/lib.rs`: `test_device_challenge_and_fingerprint`, `test_canonical_preimage_formatting`
+  - `crates/shellumi-server-auth/src/lib.rs`: `test_device_registration_with_challenge_pop`
+- Verification executed (exact commands, OS, counts, pass/fail/skip):
+  - `cargo fmt --all -- --check` on macOS: PASSED (0 diff).
+  - `CARGO_TARGET_DIR=/tmp/shellumi-target cargo clippy --locked --workspace --all-targets --all-features -- -D warnings` on macOS: PASSED (0 warnings, 0 errors).
+  - `CARGO_TARGET_DIR=/tmp/shellumi-target cargo test --locked --workspace` on macOS: PASSED (78 tests passed, 0 failed, 0 ignored across 7 workspace crates).
+  - `CARGO_TARGET_DIR=/tmp/shellumi-target cargo test --locked --doc --workspace` on macOS: PASSED.
+  - `CARGO_TARGET_DIR=/tmp/shellumi-target cargo build --locked --workspace --all-features` on macOS: PASSED.
+- Known limitations / failed attempts:
+  - Loopback TCP tests require elevated socket permissions when bound directly outside in-process test harnesses.
+  - Live PostgreSQL integration testing in CI requires running PostgreSQL container (covered via `deploy/test/compose.yml`).
+- Next precise step:
+  - Commit increments to review branch `codex/sync-notifications-docs` and submit PR for merge.
+- Issue / PR / CI evidence:
+  - Review branch `https://github.com/MJKhaani/Shellumi-Server/tree/codex/sync-notifications-docs`.
+

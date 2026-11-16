@@ -15,6 +15,7 @@ fn test_capabilities_and_health_contract_fixture() {
     assert_eq!(health, deserialized);
 
     let caps = CapabilitiesResponse {
+        server_instance_id: Uuid::new_v4(),
         server_version: "0.1.0".to_string(),
         protocol_version: CURRENT_PROTOCOL_VERSION,
         min_protocol_version: MIN_PROTOCOL_VERSION,
@@ -26,13 +27,18 @@ fn test_capabilities_and_health_contract_fixture() {
             "terminal_collab_v1".to_string(),
         ],
         supported_e2ee_suites: vec![
-            "x25519_hkdf_aes256gcm".to_string(),
+            "aes256gcm_dek_v1".to_string(),
             "argon2id_aes256gcm_legacy".to_string(),
         ],
+        websocket: Some(WebSocketCapability {
+            endpoint: "/api/v1/events/ws".to_string(),
+            heartbeat_seconds: 25,
+        }),
         limits: ServerLimits {
             max_request_bytes: 10485760,
             max_record_bytes: 1048576,
             max_mutations_per_commit: 1000,
+            max_change_page: 500,
         },
     };
     let json = serde_json::to_string(&caps).expect("serialize caps");
@@ -113,6 +119,8 @@ fn test_device_registration_contract_fixtures() {
         device_name: "MacBook Pro M3".to_string(),
         signing_public_key: "ed25519_pk_base64".to_string(),
         agreement_public_key: "x25519_pk_base64".to_string(),
+        challenge: None,
+        challenge_signature: None,
     };
     let json = serde_json::to_string(&reg_req).expect("serialize reg req");
     let de_reg: RegisterDeviceRequest = serde_json::from_str(&json).expect("deserialize reg req");
@@ -142,11 +150,14 @@ fn test_encrypted_envelope_and_vault_contract_fixtures() {
     let owner_id = Uuid::new_v4();
 
     let envelope = EncryptedEnvelope {
+        format_version: 1,
+        suite: "aes256gcm_dek_v1".to_string(),
+        key_epoch: 1,
         salt: "salt_base64".to_string(),
         nonce: "nonce_base64".to_string(),
         ciphertext: "ciphertext_base64".to_string(),
         associated_data: "aad_string".to_string(),
-        kdf_iterations: 3,
+        kdf_iterations: 0,
     };
     let json = serde_json::to_string(&envelope).expect("serialize envelope");
     let de_env: EncryptedEnvelope = serde_json::from_str(&json).expect("deserialize envelope");
@@ -185,11 +196,14 @@ fn test_commit_batch_and_change_feed_contract_fixtures() {
     let author_device_id = Uuid::new_v4();
 
     let envelope = EncryptedEnvelope {
+        format_version: 1,
+        suite: "aes256gcm_dek_v1".to_string(),
+        key_epoch: 1,
         salt: "salt_base64".to_string(),
         nonce: "nonce_base64".to_string(),
         ciphertext: "ciphertext_base64".to_string(),
         associated_data: "aad_string".to_string(),
-        kdf_iterations: 3,
+        kdf_iterations: 0,
     };
 
     let mutation = MutationItem {

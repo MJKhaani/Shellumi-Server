@@ -8,6 +8,40 @@ info:
     url: https://opensource.org/licenses/MIT
 
 paths:
+  /api/v1/events/ws:
+    get:
+      summary: Real-time event stream WebSocket
+      description: >-
+        Connect to live notification stream per SHELLUMI_PROTOCOL_V1.md Section 7.
+        Requires active session token and X-Device-Id header. Client subscribes to vault IDs.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: X-Device-Id
+          in: header
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '101':
+          description: WebSocket upgrade accepted
+        '401':
+          description: Unauthenticated or inactive session/device
+        '429':
+          description: Connection limit reached
+  /api/v1/devices/challenge:
+    post:
+      summary: Request single-use device registration challenge nonce
+      description: >-
+        Issues a cryptographically secure 32-byte hex challenge nonce with 5-minute TTL for device proof-of-possession enrollment.
+      responses:
+        '200':
+          description: Challenge nonce issued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeviceChallengeResponse'
   /api/v1/sync/events:
     get:
       summary: Upgrade to the advisory sync notification WebSocket
@@ -366,6 +400,32 @@ paths:
       responses:
         '200':
           description: Vault deleted
+
+  /api/v1/vaults/{id}/recipient-devices:
+    get:
+      summary: Discover active recipient devices for key wrapping
+      description: >-
+        Returns active devices of all members of the vault, including X25519 agreement public keys and SHA-256 fingerprints.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Active recipient devices for vault
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecipientDevicesResponse'
+        '401':
+          description: Unauthenticated
+        '404':
+          description: Vault not found or access denied
 
   /api/v1/vaults/{id}/commits:
     post:
@@ -1057,6 +1117,7 @@ components:
     CapabilitiesResponse:
       type: object
       required:
+        - server_instance_id
         - server_version
         - protocol_version
         - min_protocol_version
@@ -1064,6 +1125,9 @@ components:
         - supported_e2ee_suites
         - limits
       properties:
+        server_instance_id:
+          type: string
+          format: uuid
         server_version:
           type: string
           example: 0.1.0
@@ -1081,6 +1145,13 @@ components:
           type: array
           items:
             type: string
+        websocket:
+          type: object
+          properties:
+            endpoint:
+              type: string
+            heartbeat_seconds:
+              type: integer
         limits:
           $ref: '#/components/schemas/ServerLimits'
 
@@ -1090,12 +1161,15 @@ components:
         - max_request_bytes
         - max_record_bytes
         - max_mutations_per_commit
+        - max_change_page
       properties:
         max_request_bytes:
           type: integer
         max_record_bytes:
           type: integer
         max_mutations_per_commit:
+          type: integer
+        max_change_page:
           type: integer
 
     BootstrapRequest:
@@ -1218,8 +1292,29 @@ components:
           type: string
         signing_public_key:
           type: string
+          description: Base64-encoded 32-byte Ed25519 signing public key
         agreement_public_key:
           type: string
+          description: Base64-encoded 32-byte X25519 key agreement public key
+        challenge:
+          type: string
+          description: Optional single-use challenge nonce from /api/v1/devices/challenge
+          nullable: true
+        challenge_signature:
+          type: string
+          description: Optional Ed25519 signature over challenge nonce
+          nullable: true
+
+    DeviceChallengeResponse:
+      type: object
+      required:
+        - challenge
+        - expires_at
+      properties:
+        challenge:
+          type: string
+        expires_at:
+          type: integer
 
     DeviceResponse:
       type: object
@@ -1304,27 +1399,74 @@ components:
     EncryptedEnvelope:
       type: object
       required:
-        - salt
+        - format_version
+        - suite
+        - key_epoch
         - nonce
         - ciphertext
-        - associated_data
-        - kdf_iterations
       properties:
+        format_version:
+          type: integer
+          default: 1
+        suite:
+          type: string
+          example: aes256gcm_dek_v1
+        key_epoch:
+          type: integer
+          default: 1
         salt:
           type: string
-          description: Base64-encoded KDF salt (16 bytes)
+          description: Base64-encoded KDF salt (optional for direct-DEK records)
         nonce:
           type: string
           description: Base64-encoded AEAD nonce (12 bytes)
         ciphertext:
           type: string
-          description: Base64-encoded ciphertext with authentication tag
+          description: Base64-encoded ciphertext with authentication tag (min 16 bytes)
         associated_data:
           type: string
           description: Authenticated associated data (e.g. host:uuid)
         kdf_iterations:
           type: integer
-          description: PBKDF2 iteration count
+          description: PBKDF2 iteration count (0 for direct-DEK records)
+
+    RecipientDeviceResponse:
+      type: object
+      required:
+        - device_id
+        - user_id
+        - device_name
+        - agreement_public_key
+        - key_fingerprint
+      properties:
+        device_id:
+          type: string
+          format: uuid
+        user_id:
+          type: string
+          format: uuid
+        device_name:
+          type: string
+        agreement_public_key:
+          type: string
+          description: Base64-encoded 32-byte X25519 public key
+        key_fingerprint:
+          type: string
+          description: SHA-256 hex fingerprint of agreement public key
+
+    RecipientDevicesResponse:
+      type: object
+      required:
+        - vault_id
+        - devices
+      properties:
+        vault_id:
+          type: string
+          format: uuid
+        devices:
+          type: array
+          items:
+            $ref: '#/components/schemas/RecipientDeviceResponse'
 
     CreateVaultRequest:
       type: object

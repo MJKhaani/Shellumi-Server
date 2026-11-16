@@ -28,6 +28,7 @@ use uuid::Uuid;
 
 fn test_config() -> ServerConfig {
     ServerConfig {
+        server_instance_id: Uuid::new_v4(),
         listen_addr: "127.0.0.1:8080".parse().unwrap(),
         public_url: "http://127.0.0.1:8080".to_string(),
         database_url: None,
@@ -36,6 +37,7 @@ fn test_config() -> ServerConfig {
         registration: shellumi_server::config::RegistrationMode::InviteOnly,
         access_token_ttl_secs: 900,
         refresh_token_ttl_secs: 2_592_000,
+        token_signing_key: None,
         max_request_bytes: 10 * 1024 * 1024,
         max_record_bytes: 1024 * 1024,
         collab_enabled: false,
@@ -152,7 +154,7 @@ async fn test_prometheus_metrics_endpoint_exposition() {
 #[tokio::test]
 async fn test_cli_doctor_diagnostics_report() {
     let config = test_config();
-    let report = doctor::run_diagnostics(&config);
+    let report = doctor::run_diagnostics(&config).await;
     assert!(report.all_passed);
     assert!(report
         .checks

@@ -22,7 +22,7 @@ use shellumi_server_protocol::{
     CURRENT_PROTOCOL_VERSION,
 };
 use shellumi_server_store::{
-    compute_audit_hash, InMemoryStore, OrgRepository, UserRepository, VaultRepository,
+    compute_audit_hash, AnyStore, OrgRepository, UserRepository, VaultRepository,
     GENESIS_AUDIT_HASH,
 };
 use shellumi_server_sync::SyncEngine;
@@ -32,7 +32,7 @@ use uuid::Uuid;
 
 struct TestContext {
     app: axum::Router,
-    store: Arc<InMemoryStore>,
+    store: Arc<AnyStore>,
     token_secret: Vec<u8>,
     owner_id: Uuid,
     owner_token: String,
@@ -43,11 +43,14 @@ struct TestContext {
 
 fn sample_envelope() -> EncryptedEnvelope {
     EncryptedEnvelope {
-        salt: BASE64_STANDARD.encode([1u8; 16]),
+        format_version: 1,
+        suite: "aes256gcm_dek_v1".to_string(),
+        key_epoch: 1,
+        salt: String::new(),
         nonce: BASE64_STANDARD.encode([2u8; 12]),
-        ciphertext: BASE64_STANDARD.encode(b"ciphertext_sample_payload"),
+        ciphertext: BASE64_STANDARD.encode(b"ciphertext_sample_payload_with_gcm_tag!"),
         associated_data: "host:001".to_string(),
-        kdf_iterations: 600_000,
+        kdf_iterations: 0,
     }
 }
 
@@ -89,7 +92,7 @@ fn create_signed_mutation(
 }
 
 async fn setup_test_context() -> TestContext {
-    let store = Arc::new(InMemoryStore::new());
+    let store = Arc::new(AnyStore::memory());
     let token_secret = b"shellumi_server_test_hmac_secret_key_32bytes!!".to_vec();
     let auth = Arc::new(AuthService::new(
         store.clone(),
@@ -129,12 +132,13 @@ async fn setup_test_context() -> TestContext {
     let owner_token = create_access_token(owner_id, "vault_owner", &token_secret, 3600).unwrap();
 
     let (owner_keypair, public_key_b64) = generate_test_ed25519_keypair().unwrap();
+    let agree_pk_owner = BASE64_STANDARD.encode([1u8; 32]);
     let owner_device_id = register_device(
         &app,
         &owner_token,
         "owner_macbook",
         &public_key_b64,
-        "agree_pk_1",
+        &agree_pk_owner,
     )
     .await;
 
@@ -171,12 +175,13 @@ async fn create_user(
     let token = create_access_token(user_id, username, &ctx.token_secret, 3600).unwrap();
 
     let (keypair, public_key_b64) = generate_test_ed25519_keypair().unwrap();
+    let agree_pk_user = BASE64_STANDARD.encode([2u8; 32]);
     let device_id = register_device(
         &ctx.app,
         &token,
         &format!("{username}_device"),
         &public_key_b64,
-        &format!("agree_{username}"),
+        &agree_pk_user,
     )
     .await;
 
@@ -194,6 +199,8 @@ async fn register_device(
         device_name: name.to_string(),
         signing_public_key: signing_pk.to_string(),
         agreement_public_key: agree_pk.to_string(),
+        challenge: None,
+        challenge_signature: None,
     };
 
     let req = Request::builder()

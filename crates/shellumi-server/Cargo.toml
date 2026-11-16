@@ -36,6 +36,7 @@ rand.workspace = true
 sha2.workspace = true
 hex.workspace = true
 futures-util.workspace = true
+sqlx.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
