@@ -331,7 +331,19 @@ impl<S: Store> AuthService<S> {
             session_device_id = session.device_id;
         }
 
-        let effective_device = device_id.or(claims.device_id).or(session_device_id);
+        let mut bound_device = None;
+        for id in [claims.device_id, session_device_id, device_id]
+            .into_iter()
+            .flatten()
+        {
+            if bound_device.is_some_and(|bound| bound != id) {
+                return Err(DomainError::PermissionDenied(
+                    "Conflicting device bindings".to_string(),
+                ));
+            }
+            bound_device = Some(id);
+        }
+        let effective_device = bound_device;
         if let Some(did) = effective_device {
             let device = match self.store.find_device_by_id(did).await? {
                 Some(d) => d,
@@ -698,7 +710,92 @@ impl<S: Store> AuthService<S> {
 mod tests {
     use super::*;
     use ring::signature::KeyPair;
-    use shellumi_server_store::{InMemoryStore, UserRepository};
+    use shellumi_server_store::{
+        DeviceRepository, InMemoryStore, SessionRepository, UserRepository,
+    };
+
+    #[tokio::test]
+    async fn test_session_device_binding_rejects_conflicting_token_and_header() {
+        let store = Arc::new(InMemoryStore::new());
+        let auth = AuthService::new(
+            store.clone(),
+            b"test-secret-32-byte-minimum-value".to_vec(),
+            900,
+            3600,
+        );
+        let user_id = Uuid::new_v4();
+        store
+            .create_user(&User {
+                id: user_id,
+                username: "binding".into(),
+                email: "binding@example.com".into(),
+                password_hash: "unused".into(),
+                created_at: 1,
+                updated_at: 1,
+                is_active: true,
+            })
+            .await
+            .unwrap();
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        for id in [first, second] {
+            store
+                .create_device(&Device {
+                    id,
+                    user_id,
+                    device_name: "test".into(),
+                    signing_public_key: id.to_string(),
+                    agreement_public_key: "test".into(),
+                    created_at: 1,
+                    last_seen_at: None,
+                    revoked_at: None,
+                })
+                .await
+                .unwrap();
+        }
+        let session_id = Uuid::new_v4();
+        store
+            .create_session(&Session {
+                id: session_id,
+                user_id,
+                device_id: Some(first),
+                refresh_token_hash: "unique".into(),
+                expires_at: chrono::Utc::now().timestamp() + 3600,
+                created_at: 1,
+                revoked_at: None,
+            })
+            .await
+            .unwrap();
+        let claims = AccessTokenClaims {
+            sub: user_id,
+            username: "binding".into(),
+            exp: chrono::Utc::now().timestamp() + 900,
+            iat: chrono::Utc::now().timestamp(),
+            session_id: Some(session_id),
+            device_id: Some(first),
+            iss: None,
+        };
+        assert!(auth
+            .validate_active_session(&claims, Some(first))
+            .await
+            .is_ok());
+        assert!(auth
+            .validate_active_session(&claims, Some(second))
+            .await
+            .is_err());
+        let mut conflicting = claims.clone();
+        conflicting.device_id = Some(second);
+        assert!(auth
+            .validate_active_session(&conflicting, None)
+            .await
+            .is_err());
+        let mut unbound_claim = claims;
+        unbound_claim.device_id = None;
+        assert!(auth
+            .validate_active_session(&unbound_claim, Some(second))
+            .await
+            .is_err());
+    }
 
     #[test]
     fn test_argon2id_hash_and_verification() {

@@ -58,3 +58,5 @@ OpenSSH authentication keys (e.g. `id_ed25519` or `id_rsa`) **MUST NEVER** be re
 3. Live terminal output (`CollabFrameType::Output`) and input keystrokes (`CollabFrameType::Input`) are encrypted under `SK_collab` before transmission to the relay.
 4. The server forwards ciphertext frames blindly without possessing `SK_collab`.
 5. Upon session termination, the key is wiped from client memory.
+
+PostgreSQL-backed startup without an operator-supplied signing key fails if the stored key cannot be loaded or is malformed; it does not intentionally fall back to an ephemeral key. The database key and its backups must be protected as authentication secrets. With an operator-supplied key, supply a stable server instance ID as well and distribute both consistently. Replacing the signing key invalidates access tokens; coordinated rotation, refresh continuity, and recovery have not yet been validated end-to-end.

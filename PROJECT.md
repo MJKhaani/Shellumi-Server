@@ -741,3 +741,7 @@ The first production candidate is acceptable only when:
 Implementation note: `/api/v1/sync/events` currently provides experimental,
 process-local team vault hints. Delivery is not durable; client integration remains outstanding. See
 `docs/API.md` and `docs/security/THREAT_MODEL.md` for current behavior.
+
+### Independent server connections (Phase 11 clarification)
+
+Each self-hosted server installation owns its database, identity, devices and vaults. Independent servers do not communicate. A client may maintain separate authenticated connections to multiple installations and multiple vault subscriptions per connection. Client connection management and end-to-end multi-server behavior require separate client-repository work and have not been verified by server tests.

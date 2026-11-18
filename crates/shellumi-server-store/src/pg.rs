@@ -395,12 +395,16 @@ impl SettingsRepository for PgStore {
             let stored_key: Option<String> = r.get("token_signing_key");
 
             if let Some(key_hex) = stored_key {
-                if let Ok(bytes) = hex::decode(&key_hex) {
-                    if !bytes.is_empty() {
-                        tx.commit().await.map_err(map_db_error)?;
-                        return Ok((install_id, bytes));
-                    }
+                let bytes = hex::decode(&key_hex).map_err(|_| {
+                    DomainError::Configuration("Stored signing key is invalid".into())
+                })?;
+                if bytes.len() != 32 {
+                    return Err(DomainError::Configuration(
+                        "Stored signing key has invalid length".into(),
+                    ));
                 }
+                tx.commit().await.map_err(map_db_error)?;
+                return Ok((install_id, bytes));
             }
 
             use ring::rand::SecureRandom;
@@ -1873,7 +1877,7 @@ impl SyncRepository for PgStore {
 
         // 3. Check idempotency within transaction lock
         let idem_row = sqlx::query(
-            "SELECT request_hash, response_payload FROM mutation_idempotency WHERE vault_id = $1 AND idempotency_key = $2",
+            "SELECT device_id, request_hash, response_payload FROM mutation_idempotency WHERE vault_id = $1 AND idempotency_key = $2",
         )
         .bind(vault_id)
         .bind(&req.idempotency_key)
@@ -1883,7 +1887,7 @@ impl SyncRepository for PgStore {
 
         if let Some(r) = idem_row {
             let existing_hash: String = r.get("request_hash");
-            if existing_hash == request_hash {
+            if r.get::<Uuid, _>("device_id") == device_id && existing_hash == request_hash {
                 let payload: serde_json::Value = r.get("response_payload");
                 let cached: CommitBatchResponse = serde_json::from_value(payload)
                     .map_err(|e| DomainError::Internal(e.to_string()))?;

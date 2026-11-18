@@ -583,6 +583,24 @@ async fn test_idempotent_retries_and_payload_tamper_rejection() {
     let retry_body: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(first_body, retry_body);
 
+    // Another active device must not replay a response signed by the first device.
+    let (other_device, _, _) = register_test_device(&app, &token, "Other Device").await;
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/api/v1/vaults/{vault_id}/commits"))
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header("X-Device-Id", other_device.to_string())
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&commit_req).unwrap()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let error: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(error["error_code"], "IDEMPOTENCY_CONFLICT");
+
     // Reusing same idempotency key with modified payload -> Returns HTTP 409 Conflict (IDEMPOTENCY_CONFLICT)
     let m_diff = create_signed_mutation(
         vault_id,
@@ -945,4 +963,157 @@ async fn test_snapshot_bounded_revision_and_watermark() {
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn test_repeated_object_batch_uses_sequential_cas() {
+    let (app, token, _user_id) = setup_app_and_bootstrap().await;
+    let (device_id, keypair, _) = register_test_device(&app, &token, "Batch Device").await;
+    let create = CreateVaultRequest {
+        name: Some("Batch vault".into()),
+        vault_type: "personal".into(),
+        encrypted_name: None,
+    };
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/vaults")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&create).unwrap()))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let value: Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let vault_id = Uuid::parse_str(value["vault_id"].as_str().unwrap()).unwrap();
+    let env = sample_envelope();
+    let batch = CommitBatchRequest {
+        protocol_version: CURRENT_PROTOCOL_VERSION,
+        vault_id,
+        idempotency_key: "sequential-batch".into(),
+        base_cursor: None,
+        mutations: vec![
+            create_signed_mutation(
+                vault_id,
+                "same",
+                "snippet",
+                0,
+                false,
+                1,
+                1,
+                Some(&env),
+                &keypair,
+            ),
+            create_signed_mutation(
+                vault_id,
+                "same",
+                "snippet",
+                1,
+                false,
+                1,
+                2,
+                Some(&env),
+                &keypair,
+            ),
+        ],
+    };
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("/api/v1/vaults/{vault_id}/commits"))
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header("x-device-id", device_id.to_string())
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&batch).unwrap()))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let value: Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(value["commit_sequence"], 2);
+    assert_eq!(value["applied"][0]["assigned_revision"], 1);
+    assert_eq!(value["applied"][1]["assigned_revision"], 2);
+    let failed = CommitBatchRequest {
+        protocol_version: CURRENT_PROTOCOL_VERSION,
+        vault_id,
+        idempotency_key: "rollback-batch".into(),
+        base_cursor: None,
+        mutations: vec![
+            create_signed_mutation(
+                vault_id,
+                "new",
+                "snippet",
+                0,
+                false,
+                1,
+                3,
+                Some(&env),
+                &keypair,
+            ),
+            create_signed_mutation(
+                vault_id,
+                "same",
+                "snippet",
+                1,
+                false,
+                1,
+                4,
+                Some(&env),
+                &keypair,
+            ),
+        ],
+    };
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("/api/v1/vaults/{vault_id}/commits"))
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header("x-device-id", device_id.to_string())
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&failed).unwrap()))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(request).await.unwrap().status(),
+        StatusCode::CONFLICT
+    );
+    let retry = CommitBatchRequest {
+        protocol_version: CURRENT_PROTOCOL_VERSION,
+        vault_id,
+        idempotency_key: "rollback-retry".into(),
+        base_cursor: None,
+        mutations: vec![create_signed_mutation(
+            vault_id,
+            "new",
+            "snippet",
+            0,
+            false,
+            1,
+            3,
+            Some(&env),
+            &keypair,
+        )],
+    };
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("/api/v1/vaults/{vault_id}/commits"))
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header("x-device-id", device_id.to_string())
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&retry).unwrap()))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let value: Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(value["commit_sequence"], 3);
 }

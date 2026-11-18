@@ -177,3 +177,5 @@ sudo systemctl status shellumi-server
    ```bash
    docker compose exec server shellumi-server doctor
    ```
+
+Run one server process per independent installation. Separate installations use separate databases and do not communicate; clients maintain separate connections and reconcile each server independently. Shared-database horizontal operation is experimental and is not a Phase 11 acceptance requirement.

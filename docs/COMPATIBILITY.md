@@ -149,3 +149,5 @@ The additive `/api/v1/sync/poll` endpoint supplies volatile hints to clients wit
 WebSocket support; clients must reconcile via REST across polling gaps.
 
 Revision-specific snapshots accept only the current watermark and return HTTP 422 for historical or future revisions. Clients should request the latest snapshot and resume the change feed from its watermark. This pre-release protocol v1 adjustment does not change local-only or direct Google Drive sync.
+
+Independent server installations have separate identities, databases, users, vaults and sessions; they do not communicate. A multi-server client must isolate credentials, WebSocket connections, vault IDs, cursors and offline queues by server identity and endpoint. Client implementation has not been verified here.

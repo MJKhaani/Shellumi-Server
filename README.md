@@ -46,7 +46,7 @@ The server treats all vault contents as **opaque, client-encrypted envelopes**.
 - **Monotonic Anti-Replay Protection:** Replay attacks and out-of-order mutations are rejected at the database boundary via strictly monotonic, per-device counters (`device_sync_counters`).
 - **Delta Sync & Watermark Snapshots:** Fast synchronization using monotonic change feeds (`GET /api/v1/vaults/:id/changes?cursor=seq:N`), durable tombstones, and consistent recovery snapshots (`GET /api/v1/vaults/:id/snapshots` and `/snapshots/:revision`).
 - **Cryptographic Team Sharing & RBAC:** Vault roles (`Owner`, `Administrator`, `Editor`, `Viewer`) enforced on every read/write. Key envelopes protect offline members, with forward-secure epoch rotation (`POST /api/v1/vaults/:id/rotate-epoch`) and single-use scoped invitations.
-- **Live Sync Hints & Cross-Instance Relay:** WebSockets (`/api/v1/events/ws`) and long-polling (`/api/v1/sync/poll`) notify active devices of changes. Backed by PostgreSQL `LISTEN`/`NOTIFY` (`shellumi_sync_events`), enabling horizontal multi-instance scaling.
+- **Live Sync Hints:** WebSockets (`/api/v1/events/ws`) and long-polling (`/api/v1/sync/poll`) provide advisory notifications. REST reconciliation is authoritative. Shared-database multi-process fanout is experimental and not a supported deployment guarantee.
 - **Real-Time Terminal Collaboration Relay:** Feature-gated (`collab_enabled`) encrypted frame relay with Server-Sent Events (SSE) `/api/v1/collab/sessions/:id/events`, single-writer token leases, and host overrides. Plaintext terminal data is never accessible to the server.
 - **Tamper-Evident Cryptographic Audit Log:** High-integrity, SHA-256 hash-chained audit trail for all vault membership, key rotations, and administrative events.
 - **Session Revocation & Anti-Theft Detection:** Automatic token family invalidation upon refresh token reuse, device revocation, and immediate rejection of logged-out sessions across all 38 REST endpoints.
@@ -99,7 +99,7 @@ Shellumi Server is built in Rust using Tokio, Axum, Tower, and SQLx.
        │      PostgreSQL Pool      │                 │    In-Memory Fast Store   │
        │    (Production / PgStore) │                 │   (Development & Testing) │
        │  • Atomic CAS & Sequences │                 │  • RwLock<MemoryState>    │
-       │  • LISTEN/NOTIFY Bus      │                 │  • Zero External Deps     │
+       │  • Optional event hints   │                 │  • Zero External Deps     │
        └───────────────────────────┘                 └───────────────────────────┘
 ```
 
@@ -380,3 +380,5 @@ Shellumi Server is released under the **[MIT License](LICENSE)**.
 
 Copyright (c) 2026 Shellumi Server Contributors.
 All contributions are welcome; please see [CONTRIBUTING.md](CONTRIBUTING.md) and [AGENT.md](AGENT.md) before submitting pull requests.
+
+Independent Shellumi Server installations do not communicate with each other. A client can maintain a separate connection to each server and subscribe to multiple vaults on each connection; WebSocket notifications are hints and REST reconciliation remains authoritative. Multi-server client support has not been verified end-to-end.

@@ -498,11 +498,15 @@ impl SettingsRepository for InMemoryStore {
         let mut lock = self.state.write().await;
         if let Some(ref mut settings) = lock.settings {
             if let Some(ref key_hex) = settings.token_signing_key {
-                if let Ok(bytes) = hex::decode(key_hex) {
-                    if !bytes.is_empty() {
-                        return Ok((settings.install_id, bytes));
-                    }
+                let bytes = hex::decode(key_hex).map_err(|_| {
+                    DomainError::Configuration("Stored signing key is invalid".into())
+                })?;
+                if bytes.len() != 32 {
+                    return Err(DomainError::Configuration(
+                        "Stored signing key has invalid length".into(),
+                    ));
                 }
+                return Ok((settings.install_id, bytes));
             }
             use ring::rand::SecureRandom;
             let rng = ring::rand::SystemRandom::new();
@@ -1296,7 +1300,7 @@ impl SyncRepository for InMemoryStore {
             .idempotency
             .get(&(vault_id, req.idempotency_key.clone()))
         {
-            if existing.request_hash == request_hash {
+            if existing.device_id == device_id && existing.request_hash == request_hash {
                 let cached: CommitBatchResponse = serde_json::from_str(&existing.response_payload)
                     .map_err(|e| DomainError::Internal(e.to_string()))?;
                 return Ok(cached);
@@ -1325,12 +1329,14 @@ impl SyncRepository for InMemoryStore {
 
         // 4. CAS and revision validation for each mutation
         let mut applied_acks = Vec::with_capacity(req.mutations.len());
-        let mut new_records = Vec::with_capacity(req.mutations.len());
+        let mut new_records: HashMap<String, Record> = HashMap::with_capacity(req.mutations.len());
         let mut new_changes = Vec::with_capacity(req.mutations.len());
 
         for (idx, mutation) in req.mutations.iter().enumerate() {
             let mutation_seq = base_sequence + 1 + idx as u64;
-            let existing = lock.records.get(&(vault_id, mutation.object_id.clone()));
+            let existing = new_records
+                .get(&mutation.object_id)
+                .or_else(|| lock.records.get(&(vault_id, mutation.object_id.clone())));
 
             let assigned_revision = match (mutation.expected_revision, existing) {
                 (0, None) => 1,
@@ -1398,7 +1404,7 @@ impl SyncRepository for InMemoryStore {
                 created_at: now,
             };
 
-            new_records.push(record);
+            new_records.insert(record.object_id.clone(), record);
             new_changes.push(entry);
             applied_acks.push(MutationAck {
                 object_id: mutation.object_id.clone(),
@@ -1416,7 +1422,7 @@ impl SyncRepository for InMemoryStore {
             vault.updated_at = now;
         }
 
-        for record in new_records {
+        for record in new_records.into_values() {
             lock.records
                 .insert((vault_id, record.object_id.clone()), record);
         }

@@ -20,7 +20,7 @@
 - Existing server routes (`/api/v1/vaults/{id}/commits`, `/changes`, `/snapshots/{revision}`, `/auth/*`, `/devices`, `/keys/envelopes`) and client DTOs are useful **starting material**, not a completed contract.
 - Existing server capability response advertises `vault_sync_v1`, `device_auth`, `team_sharing` and optional `terminal_collab_v1`; existing companion `docs/COMPATIBILITY.md` examples differ from runtime. Normalize to code-backed v1 feature names.
 - Existing client `VaultCipher` emits an empty salt and `kdf_iterations=0` for a random DEK, but the existing server crypto validator rejects that envelope. Replace the pre-release record wire envelope **in both projects** with a named suite and strict normative shape.
-- Existing server has an SSE endpoint for **terminal collaboration** (`/api/v1/collab/sessions/{id}/events`) but **no vault-change WebSocket route**. Keep terminal collaboration separate from the new sync notification channel.
+- The server exposes a vault-change WebSocket route and a separate SSE endpoint for terminal collaboration. Real-service coverage remains incomplete.
 - Do not claim implemented, secure or compatible merely because a feature string or OpenAPI schema exists.
 
 ## 3. Base transport and capabilities
@@ -85,17 +85,17 @@ Illustrative v1 response:
 - Suggested minimal JSON messages below:
 
 ```json
-{"type":"subscribe","request_id":"96d9956d-444b-4410-a96b-a2e5ff743ca6","vault_ids":["d888f1ee-0cae-4d64-91b0-bd5e1ee6d326"]}
-{"type":"subscribed","request_id":"96d9956d-444b-4410-a96b-a2e5ff743ca6","vaults":[{"vault_id":"d888f1ee-0cae-4d64-91b0-bd5e1ee6d326","latest_sequence":27}]}
-{"type":"vault.changed","vault_id":"d888f1ee-0cae-4d64-91b0-bd5e1ee6d326","latest_sequence":28,"notification_id":"aeb63ab6-cf15-422e-a53d-8f4e4bf998fe"}
-{"type":"vault.key_rotated","vault_id":"d888f1ee-0cae-4d64-91b0-bd5e1ee6d326","key_epoch":2,"notification_id":"9a86d8dc-454e-4e43-bb3c-bfdab9baf71e"}
-{"type":"vault.access_revoked","vault_id":"d888f1ee-0cae-4d64-91b0-bd5e1ee6d326","notification_id":"16d1636e-5a5f-4141-a1d6-d345a5d433a3"}
+{"action":"subscribe","request_id":"96d9956d-444b-4410-a96b-a2e5ff743ca6","vault_ids":["d888f1ee-0cae-4d64-91b0-bd5e1ee6d326"]}
+{"event":"subscribed","request_id":"96d9956d-444b-4410-a96b-a2e5ff743ca6","vaults":[{"vault_id":"d888f1ee-0cae-4d64-91b0-bd5e1ee6d326","latest_sequence":27}]}
+{"event":"vault.changed","vault_id":"d888f1ee-0cae-4d64-91b0-bd5e1ee6d326","latest_sequence":28,"notification_id":"aeb63ab6-cf15-422e-a53d-8f4e4bf998fe"}
+{"event":"vault.key_rotated","vault_id":"d888f1ee-0cae-4d64-91b0-bd5e1ee6d326","epoch":2,"notification_id":"9a86d8dc-454e-4e43-bb3c-bfdab9baf71e"}
+{"event":"vault.access_revoked","vault_id":"d888f1ee-0cae-4d64-91b0-bd5e1ee6d326","notification_id":"16d1636e-5a5f-4141-a1d6-d345a5d433a3"}
 ```
 
 ### Server delivery rules
 
 - Publish `vault.changed` **only after** a successful durable transaction commit (not during validation or rollback). One event per affected vault/commit is sufficient; its `latest_sequence` is authoritative and monotonic. Also notify authorized recipients of membership changes, new wrapped key availability, rotation, invite acceptance, and vault deletion when applicable; define minimally revealing event types.
-- Use a transactionally appended notification/outbox record and **PostgreSQL LISTEN/NOTIFY** (or equivalent post-commit dispatch) for cross-server-worker fan-out; an in-process broadcast channel may be used as a local optimization but must not be the only cross-instance mechanism. On startup/reconnect, the durable change feed heals missed dispatch. Reject permission changes promptly and remove unauthorized subscriptions before forwarding later events. Treat subscription and event delivery as server-authorized operations, not client-side filtering.
+- In the supported single-process installation, use the bounded in-process broadcast channel for advisory delivery. Independent servers do not communicate; optional shared-database multi-process notification code is experimental and not a Phase 11 requirement. On startup/reconnect, clients reconcile through the change feed. Reject permission changes promptly and remove unauthorized subscriptions before forwarding later events.
 - Notifications contain **NO plaintext record content, ciphertext, secrets, key wraps, email addresses or unnecessary object names**. Protect message count/size; enforce per-user connection counts, subscription limits, bounded queues/backpressure, heartbeat timeouts and connection teardown.
 - Do not guarantee exactly-once WebSocket event delivery; duplicate/lost/reordered notifications are safe because they are **hints**. Never advance the sync cursor from a WebSocket event.
 
@@ -148,3 +148,11 @@ Illustrative v1 response:
 - **Required docs sync:** server `docs/API.md`, `docs/COMPATIBILITY.md`, `docs/ARCHITECTURE.md`, `docs/ROADMAP.md`, `docs/PROGRESS.md`, `docs/security/{THREAT_MODEL,KEY_MANAGEMENT}.md`, `openapi/shellumi-server-v1.yaml`; client `docs/ROADMAP.md`, `docs/FEATURE_MATRIX.md`, `docs/GUI_STATUS.md`, `SYNC_DESIGN.md`, `PROJECT.md`, `docs/security/threat-model.md`, and a chronological client progress log. Record actual test commands and results. **No release-version upgrade to v2.**
 
 The revision-specific snapshot route currently accepts only the current watermark; historical and future revisions return 422. Use the latest snapshot for recovery.
+
+An authenticated WebSocket connection belongs to one independent server and may subscribe to multiple vaults there (up to 128). Subscription requests are applied only after all requested vaults pass authorization; a denied request adds none. Envelope publication sends a `vault.changed` reconciliation hint, not `vault.key_rotated`; actual epoch rotation sends `vault.key_rotated`. Hints are advisory; clients reconcile each server/vault through REST after reconnect and periodically.
+
+Mutations in one commit batch are evaluated in order. A later mutation for the same object must use the revision assigned by the preceding mutation; any failure rolls back the entire batch and its sequence and device-counter updates. The PostgreSQL integration test exercises this sequential CAS behavior and paginated change-feed tombstones.
+
+`CURSOR_EXPIRED` (410) is returned for a cursor ahead of the watermark or when the next expected change sequence is unavailable. Automatic feed retention pruning is not implemented; clients recover by taking a latest snapshot and resuming from its watermark.
+
+An idempotency key is bound to the originating device as well as the mutation payload. An exact retry from that device returns the saved acknowledgement; reusing the key from another device returns 409.

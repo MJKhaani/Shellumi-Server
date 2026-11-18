@@ -59,3 +59,5 @@ rate_limit_per_minute = 10
 trusted_proxies = ["127.0.0.1"]
 allowed_origins = []
 ```
+
+When PostgreSQL is configured and no `token_signing_key` is supplied, startup loads or creates the installation identity and signing key in PostgreSQL. Startup fails if this operation fails or the stored key is malformed. Protect database backups as authentication secrets. For an operator-supplied key, configure both `SHELLUMI_SERVER_TOKEN_SIGNING_KEY` and a stable `SHELLUMI_SERVER_INSTANCE_ID` identically across instances and restarts; this path does not load the database installation ID. Changing the signing key invalidates existing access tokens. Refresh/session recovery and coordinated key rotation require operational planning and are not yet verified end-to-end.

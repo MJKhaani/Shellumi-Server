@@ -13,7 +13,7 @@ paths:
       summary: Real-time event stream WebSocket
       description: >-
         Connect to live notification stream per SHELLUMI_PROTOCOL_V1.md Section 7.
-        Requires active session token and X-Device-Id header. Client subscribes to vault IDs.
+        Requires active session token and X-Device-Id header. Each connection can subscribe to up to 128 authorized vaults on this installation. A denied request adds no subscriptions. Hints are advisory; reconcile via REST.
       security:
         - BearerAuth: []
       parameters:

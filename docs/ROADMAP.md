@@ -17,7 +17,7 @@ The 2026-11-16 independent re-verification found production PostgreSQL, snapshot
 | **M4** | Resilience, Operations & Releases | **Partial** | Database-backed readiness probe, doctor DB diagnostic check, CLI admin commands backed by real storage, Prometheus telemetry, backup verification. |
 | **M5** | Optional Live Terminal Collaboration | **Partial** | Terminal collaboration SSE & polling relay (opt-in, separate from vault sync notifications). |
 | **M6** | Advanced Self-Hosting & Client Polish | **Partial** | Golden contract fixtures, client compatibility matrix alignment, pre-release v1 contract finalization. |
-| **Phase 11** | Protocol v1 Hardening & Live Sync Notifications | **Partial** | Standard WSS `/api/v1/events/ws` with `subscribe`/`subscribed`/`vault.changed`/`vault.key_rotated`/`vault.access_revoked` frames, PostgreSQL `LISTEN`/`NOTIFY` multi-instance bridge, post-commit dispatch, comprehensive audit remediation. |
+| **Phase 11** | Protocol v1 Hardening & Live Sync Notifications | **Partial** | Standard WSS `/api/v1/events/ws` with `subscribe`/`subscribed`/`vault.changed`/`vault.key_rotated`/`vault.access_revoked` frames, single-server post-commit hints, multi-vault subscriptions, REST recovery and PostgreSQL acceptance; shared-database clustering is optional and experimental. |
 | **M7** | Enterprise Integrations (Post-v1) | Planned | OIDC/SSO, optional SMTP notification delivery, S3-compatible large encrypted attachment storage, horizontal clustering enhancements. |
 
 ---
@@ -94,7 +94,7 @@ The 2026-11-16 independent re-verification found production PostgreSQL, snapshot
 - **OIDC/SSO:** Optional enterprise OpenID Connect identity provider integration alongside local Argon2id credentials.
 - **Transactional Email:** Optional SMTP provider for asynchronous delivery of invitation links and security notices.
 - **Large Encrypted Attachments:** S3-compatible object storage integration for bounded encrypted session recordings and file transfers.
-- **Clustered High Availability:** Multi-node horizontal scaling coordinated via PostgreSQL `LISTEN`/`NOTIFY` and advisory locks.
+- **Clustered High Availability:** Experimental multi-node horizontal scaling; not yet verified or supported.
 
 
 

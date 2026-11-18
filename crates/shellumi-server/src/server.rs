@@ -69,6 +69,7 @@ pub struct AppState {
     pub collab: Arc<CollabHub<AnyStore>>,
     pub rate_limiter: Arc<RateLimiter>,
     pub metrics: Arc<MetricsRegistry>,
+    notification_origin: Uuid,
     notifications: broadcast::Sender<SyncEvent>,
     notification_connections: Arc<Semaphore>,
 }
@@ -76,7 +77,7 @@ pub struct AppState {
 impl AppState {
     /// Broadcast an event locally and via PostgreSQL NOTIFY for multi-instance fanout.
     async fn broadcast_sync_event(&self, event: SyncEvent) {
-        let instance_id = self.config.server_instance_id;
+        let instance_id = self.notification_origin;
         let payload = match &event {
             SyncEvent::VaultChanged {
                 vault_id,
@@ -123,10 +124,13 @@ impl AppState {
         let _ = self.notifications.send(event);
 
         // Cross-instance via PostgreSQL NOTIFY (best-effort, non-blocking)
-        let _ = self
+        if let Err(error) = self
             .store
             .notify_sync_event("shellumi_sync_events", &payload.to_string())
-            .await;
+            .await
+        {
+            tracing::warn!("Failed to publish sync hint: {error}");
+        }
     }
 }
 
@@ -181,10 +185,12 @@ pub fn create_router_with_auth_and_sync(
     let collab = Arc::new(CollabHub::new(store.clone()));
     let (notifications, _) = broadcast::channel(256);
 
+    let notification_origin = Uuid::new_v4();
+
     // If PostgreSQL database is configured, bridge cross-instance events via LISTEN/NOTIFY
     if let Some(db_url) = config.database_url.clone() {
         let notif_tx = notifications.clone();
-        let instance_id = config.server_instance_id;
+        let instance_id = notification_origin;
         tokio::spawn(async move {
             let mut backoff_secs = 1u64;
             loop {
@@ -323,6 +329,7 @@ pub fn create_router_with_auth_and_sync(
         collab,
         rate_limiter,
         metrics,
+        notification_origin,
         notifications,
         notification_connections: Arc::new(Semaphore::new(1024)),
     };
@@ -1000,19 +1007,32 @@ async fn events_ws_socket(
             msg = socket.recv() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
+                        if !notification_access_valid(&state, &claims, device_id).await {
+                            break;
+                        }
                         let parsed: Result<WsClientMessage, _> = serde_json::from_str(&text);
                         match parsed {
                             Ok(WsClientMessage::Subscribe { request_id, vault_ids }) => {
                                 let mut watermarks = Vec::with_capacity(vault_ids.len());
                                 let mut error_occurred = false;
-
-                                for vid in vault_ids {
+                                let requested: HashSet<Uuid> = vault_ids.into_iter().collect();
+                                if subscribed_vaults.union(&requested).count() > 128 {
+                                    let err = WsServerMessage::Error {
+                                        code: "SUBSCRIPTION_LIMIT".to_string(),
+                                        message: "Too many vault subscriptions".to_string(),
+                                        request_id: Some(request_id.clone()),
+                                    };
+                                    if let Ok(json) = serde_json::to_string(&err) {
+                                        let _ = socket.send(Message::Text(json)).await;
+                                    }
+                                    continue;
+                                }
+                                for vid in requested {
                                     let role = state.auth.store().get_vault_member_role(vid, claims.sub).await;
                                     let vault = state.auth.store().find_vault_by_id(vid).await;
 
                                     match (role, vault) {
                                         (Ok(Some(_)), Ok(Some(v))) if v.deleted_at.is_none() => {
-                                            subscribed_vaults.insert(vid);
                                             watermarks.push(VaultWatermark {
                                                 vault_id: vid,
                                                 latest_sequence: v.server_sequence,
@@ -1034,6 +1054,7 @@ async fn events_ws_socket(
                                 }
 
                                 if !error_occurred {
+                                    subscribed_vaults.extend(watermarks.iter().map(|watermark| watermark.vault_id));
                                     let conf = WsServerMessage::Subscribed {
                                         request_id,
                                         vaults: watermarks,
@@ -1086,6 +1107,9 @@ async fn events_ws_socket(
                 }
             }
             event = rx.recv() => {
+                if !notification_access_valid(&state, &claims, device_id).await {
+                    break;
+                }
                 match event {
                     Ok(SyncEvent::VaultChanged { vault_id, latest_sequence, notification_id }) => {
                         if subscribed_vaults.contains(&vault_id) {
@@ -1268,11 +1292,13 @@ async fn update_vault_handler(
     match state.sync.update_vault(claims.sub, vault_id, req).await {
         Ok(resp) => {
             let notif_id = Uuid::new_v4();
-            let _ = state.notifications.send(SyncEvent::VaultChanged {
-                vault_id,
-                latest_sequence: resp.server_sequence,
-                notification_id: notif_id,
-            });
+            state
+                .broadcast_sync_event(SyncEvent::VaultChanged {
+                    vault_id,
+                    latest_sequence: resp.server_sequence,
+                    notification_id: notif_id,
+                })
+                .await;
             (StatusCode::OK, Json(serde_json::to_value(resp).unwrap()))
         }
         Err(err) => {
@@ -1298,11 +1324,13 @@ async fn delete_vault_handler(
     match state.sync.delete_vault(claims.sub, vault_id).await {
         Ok(()) => {
             let notif_id = Uuid::new_v4();
-            let _ = state.notifications.send(SyncEvent::AccessRevoked {
-                vault_id,
-                user_id: None,
-                notification_id: notif_id,
-            });
+            state
+                .broadcast_sync_event(SyncEvent::AccessRevoked {
+                    vault_id,
+                    user_id: None,
+                    notification_id: notif_id,
+                })
+                .await;
             (
                 StatusCode::OK,
                 Json(serde_json::json!({ "status": "deleted" })),
@@ -1357,11 +1385,13 @@ async fn commit_batch_handler(
     match state.sync.commit_batch(claims.sub, device_id, req).await {
         Ok(resp) => {
             let notif_id = Uuid::new_v4();
-            let _ = state.notifications.send(SyncEvent::VaultChanged {
-                vault_id: path_vault_id,
-                latest_sequence: resp.commit_sequence,
-                notification_id: notif_id,
-            });
+            state
+                .broadcast_sync_event(SyncEvent::VaultChanged {
+                    vault_id: path_vault_id,
+                    latest_sequence: resp.commit_sequence,
+                    notification_id: notif_id,
+                })
+                .await;
             (StatusCode::OK, Json(serde_json::to_value(resp).unwrap()))
         }
         Err(err) => {
@@ -1535,11 +1565,15 @@ async fn add_member_handler(
     {
         Ok(resp) => {
             let notif_id = Uuid::new_v4();
-            let _ = state.notifications.send(SyncEvent::VaultChanged {
-                vault_id,
-                latest_sequence: 0,
-                notification_id: notif_id,
-            });
+            if let Ok(Some(vault)) = state.store.find_vault_by_id(vault_id).await {
+                state
+                    .broadcast_sync_event(SyncEvent::VaultChanged {
+                        vault_id,
+                        latest_sequence: vault.server_sequence,
+                        notification_id: notif_id,
+                    })
+                    .await;
+            }
             (StatusCode::OK, Json(serde_json::to_value(resp).unwrap()))
         }
         Err(err) => {
@@ -1569,11 +1603,13 @@ async fn remove_member_handler(
     {
         Ok(()) => {
             let notif_id = Uuid::new_v4();
-            let _ = state.notifications.send(SyncEvent::AccessRevoked {
-                vault_id,
-                user_id: Some(target_user_id),
-                notification_id: notif_id,
-            });
+            state
+                .broadcast_sync_event(SyncEvent::AccessRevoked {
+                    vault_id,
+                    user_id: Some(target_user_id),
+                    notification_id: notif_id,
+                })
+                .await;
             (StatusCode::NO_CONTENT, Json(serde_json::Value::Null))
         }
         Err(err) => {
@@ -1680,11 +1716,15 @@ async fn accept_invite_handler(
     match state.sync.accept_invite(claims.sub, req).await {
         Ok(resp) => {
             let notif_id = Uuid::new_v4();
-            let _ = state.notifications.send(SyncEvent::VaultChanged {
-                vault_id: resp.vault_id,
-                latest_sequence: 0,
-                notification_id: notif_id,
-            });
+            if let Ok(Some(vault)) = state.store.find_vault_by_id(resp.vault_id).await {
+                state
+                    .broadcast_sync_event(SyncEvent::VaultChanged {
+                        vault_id: resp.vault_id,
+                        latest_sequence: vault.server_sequence,
+                        notification_id: notif_id,
+                    })
+                    .await;
+            }
             (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())).into_response()
         }
         Err(err) => {
@@ -1732,11 +1772,15 @@ async fn publish_key_envelopes_handler(
     {
         Ok(count) => {
             let notif_id = Uuid::new_v4();
-            let _ = state.notifications.send(SyncEvent::KeyRotated {
-                vault_id,
-                epoch: 0,
-                notification_id: notif_id,
-            });
+            if let Ok(Some(vault)) = state.store.find_vault_by_id(vault_id).await {
+                state
+                    .broadcast_sync_event(SyncEvent::VaultChanged {
+                        vault_id,
+                        latest_sequence: vault.server_sequence,
+                        notification_id: notif_id,
+                    })
+                    .await;
+            }
             (
                 StatusCode::CREATED,
                 Json(serde_json::json!({ "published": count })),
@@ -1813,11 +1857,13 @@ async fn rotate_key_epoch_handler(
     {
         Ok(resp) => {
             let notif_id = Uuid::new_v4();
-            let _ = state.notifications.send(SyncEvent::KeyRotated {
-                vault_id,
-                epoch: resp.active_key_epoch,
-                notification_id: notif_id,
-            });
+            state
+                .broadcast_sync_event(SyncEvent::KeyRotated {
+                    vault_id,
+                    epoch: resp.active_key_epoch,
+                    notification_id: notif_id,
+                })
+                .await;
             (StatusCode::OK, Json(serde_json::to_value(resp).unwrap()))
         }
         Err(err) => {
@@ -2415,16 +2461,10 @@ pub async fn run(mut config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     // Persist server identity and token signing key across restarts
     if config.token_signing_key.is_none() {
-        match store.get_or_init_server_keys().await {
-            Ok((install_id, key_bytes)) => {
-                config.server_instance_id = install_id;
-                config.token_signing_key = Some(hex::encode(&key_bytes));
-                info!("Loaded persistent server identity: {}", install_id);
-            }
-            Err(e) => {
-                tracing::warn!("Could not persist server keys: {e}; using ephemeral key");
-            }
-        }
+        let (install_id, key_bytes) = store.get_or_init_server_keys().await?;
+        config.server_instance_id = install_id;
+        config.token_signing_key = Some(hex::encode(&key_bytes));
+        info!("Loaded persistent server identity: {}", install_id);
     }
 
     let listen_addr = config.listen_addr;

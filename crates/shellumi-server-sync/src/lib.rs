@@ -250,7 +250,7 @@ impl<S: Store> SyncEngine<S> {
             .find_idempotency(req.vault_id, &req.idempotency_key)
             .await?
         {
-            if idem.request_hash == request_hash {
+            if idem.device_id == device_id && idem.request_hash == request_hash {
                 let cached: CommitBatchResponse = serde_json::from_str(&idem.response_payload)
                     .map_err(|e| DomainError::Internal(e.to_string()))?;
                 return Ok(cached);
@@ -356,6 +356,19 @@ impl<S: Store> SyncEngine<S> {
             .store
             .get_changes(vault_id, since_sequence, capped_limit + 1)
             .await?;
+
+        // Server sequence numbers are contiguous. If retained history has a gap,
+        // returning a later entry would silently skip a mutation or tombstone.
+        let mut expected = since_sequence;
+        for entry in &entries {
+            expected = expected.checked_add(1).ok_or(DomainError::CursorExpired)?;
+            if entry.sequence != expected {
+                return Err(DomainError::CursorExpired);
+            }
+        }
+        if entries.is_empty() && since_sequence < vault.server_sequence {
+            return Err(DomainError::CursorExpired);
+        }
 
         let has_more = entries.len() > capped_limit;
         if has_more {

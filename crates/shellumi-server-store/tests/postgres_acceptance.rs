@@ -32,6 +32,10 @@ fn bootstrap_data(name: &str) -> (User, Organization, Session) {
 #[tokio::test]
 async fn fresh_database_bootstrap_is_atomic_and_single_use() {
     let Ok(url) = std::env::var("SHELLUMI_TEST_DATABASE_URL") else {
+        assert!(
+            std::env::var_os("SHELLUMI_REQUIRE_POSTGRES").is_none(),
+            "SHELLUMI_TEST_DATABASE_URL is required for the PostgreSQL job"
+        );
         eprintln!("PostgreSQL acceptance skipped: SHELLUMI_TEST_DATABASE_URL is unset");
         return;
     };
@@ -65,11 +69,25 @@ async fn fresh_database_bootstrap_is_atomic_and_single_use() {
         .complete_bootstrap(None, &a, &oa, &sa)
         .await
         .is_err());
+    sqlx::query("UPDATE server_settings SET token_signing_key = 'invalid'")
+        .execute(reopened.pool())
+        .await
+        .unwrap();
+    assert!(reopened.get_or_init_server_keys().await.is_err());
+    let value: String = sqlx::query_scalar("SELECT token_signing_key FROM server_settings")
+        .fetch_one(reopened.pool())
+        .await
+        .unwrap();
+    assert_eq!(value, "invalid");
 }
 
 #[tokio::test]
 async fn singleton_migration_preserves_existing_settings_and_rejects_duplicates() {
     let Ok(url) = std::env::var("SHELLUMI_TEST_DATABASE_URL") else {
+        assert!(
+            std::env::var_os("SHELLUMI_REQUIRE_POSTGRES").is_none(),
+            "SHELLUMI_TEST_DATABASE_URL is required for the PostgreSQL job"
+        );
         eprintln!("PostgreSQL acceptance skipped: SHELLUMI_TEST_DATABASE_URL is unset");
         return;
     };

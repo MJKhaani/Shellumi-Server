@@ -1013,3 +1013,395 @@ This journal records every increment, decision, test execution, and verification
 - Known limitations / failed attempts: Full HTTP PostgreSQL lifecycle, historical snapshots, complete cross-instance notification/recovery, and signing-key lifecycle remain incomplete or unverified as described in TASK-015. Publication does not close these findings.
 - Next precise step: Commit and push the partial changes; continue the remaining remediation in a subsequent increment.
 - Issue / PR / CI evidence: No new CI run at this point.
+
+## 2026-11-16T09:34:14Z — TASK-017 — Cross-instance notification and key remediation
+- Status: planned
+- Baseline / commit: `a5b448708c30035f04856df6e6ff09daba6c983a`.
+- Objective and acceptance criteria: Route successful material changes through cross-instance notifications using per-process origins; fail closed on persistent signing-key errors; preserve latest-only snapshots and expand real PostgreSQL/WebSocket acceptance coverage.
+- Implementation / files changed: Planned server, integration tests, CI and operational documentation.
+- Data migration or API compatibility: Preserve protocol v1 and latest-only snapshot contract; notifications remain non-durable hints with REST reconciliation.
+- Security / privacy review: Verify event authorization, origin isolation, revoked access and persistent signing-key failure behavior.
+- Tests added (file + test names): Planned real PostgreSQL and subscribed WebSocket regressions, including separate origins and failure paths.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): Pending.
+- Known limitations / failed attempts: Phase 11 remains partial pending all stated acceptance gates.
+- Next precise step: Implement post-success fanout and per-process notification origin, then add real-network tests.
+- Issue / PR / CI evidence: User-supplied audit; no new CI run.
+
+## 2026-11-16T09:36:30Z — TASK-017 — Fanout implementation milestone
+- Status: in_progress
+- Baseline / commit: `a5b448708c30035f04856df6e6ff09daba6c983a`.
+- Objective and acceptance criteria: Correct process origin and route material event hints across PostgreSQL after successful operations; reject key persistence errors.
+- Implementation / files changed: `crates/shellumi-server/src/server.rs` uses a fresh router origin and publishes successful material events; `crates/shellumi-server-store/src/{lib,pg}.rs` rejects corrupt stored signing keys instead of silently replacing them. Added PostgreSQL WebSocket test and CI invocation.
+- Data migration or API compatibility: No schema or protocol change; PostgreSQL NOTIFY remains a transient hint and is not an outbox.
+- Security / privacy review: Event visibility continues to check vault membership; persistence errors now stop startup when generated signing key is used. Operator-supplied key identity behavior and comprehensive revocation tests remain open.
+- Tests added (file + test names): `postgres_websocket.rs::postgres_two_instances_deliver_subscribed_websocket_hints_both_directions`; extended `postgres_acceptance.rs::fresh_database_bootstrap_is_atomic_and_single_use` for corrupt signing key.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): `cargo check --locked --workspace --all-features` passed on Darwin 23.6.0 x86_64; PostgreSQL WebSocket regression running.
+- Known limitations / failed attempts: No durable event outbox; real independent process, full HTTP lifecycle, reconnect and failure recovery tests remain outstanding.
+- Next precise step: Complete and repair the running PostgreSQL regression, then exercise the key and standard quality gates.
+- Issue / PR / CI evidence: No new CI run.
+
+## 2026-11-16T09:39:00Z — TASK-017 — Live PostgreSQL notification regression
+- Status: in_progress
+- Baseline / commit: `a5b448708c30035f04856df6e6ff09daba6c983a`.
+- Objective and acceptance criteria: Exercise separate router origins with a shared installation ID and subscribed live WebSockets against PostgreSQL.
+- Implementation / files changed: Expanded `crates/shellumi-server/tests/postgres_websocket.rs` for bidirectional metadata hints, origin-free database notifications and deletion revocation; documented transient delivery, signing key operation and CI scope.
+- Data migration or API compatibility: No new wire format or migration; latest-only snapshots remain unchanged.
+- Security / privacy review: Tested that vault deletion produces access-revoked hints on both sockets. Other authorization, revocation and recovery paths remain unverified.
+- Tests added (file + test names): `postgres_two_instances_deliver_subscribed_websocket_hints_both_directions`; extended `fresh_database_bootstrap_is_atomic_and_single_use` for corrupt key rejection.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): Darwin 23.6.0 x86_64 with disposable PostgreSQL 16: `SHELLUMI_TEST_DATABASE_URL=postgres://postgres:testpassword@127.0.0.1:5433/shellumi_test cargo test --locked -p shellumi-server --test postgres_websocket` passed (1) after an initial test failure caused by an unhandled heartbeat; `SHELLUMI_TEST_DATABASE_URL=postgres://postgres:testpassword@127.0.0.1:5433/shellumi_test cargo test --locked -p shellumi-server-store --test postgres_acceptance` passed (2); `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings` passed. CI not run.
+- Known limitations / failed attempts: Routers are in one test process and setup uses in-process HTTP calls; no durable outbox, listener disconnect/recovery, full network HTTP, signed commit or broad permission matrix test. Key publication and rotation fanout need real-service regression.
+- Next precise step: Complete workspace quality checks and extend integration coverage before treating Phase 11 as complete.
+- Issue / PR / CI evidence: No new CI run.
+
+## 2026-11-16T09:42:00Z — TASK-017 — Partial verification and remaining acceptance gates
+- Status: partial
+- Baseline / commit: `a5b448708c30035f04856df6e6ff09daba6c983a`; uncommitted changes.
+- Objective and acceptance criteria: Correct cross-router notification origin and publication, fail closed on persistent-key errors, and expand PostgreSQL/WebSocket acceptance. Phase 11 remains partial.
+- Implementation / files changed: `crates/shellumi-server/src/server.rs` publishes material post-success hints using ephemeral router origins and emits actual envelope epoch; store implementations reject malformed signing keys. Updated `.github/workflows/ci.yml`, `crates/shellumi-server/tests/postgres_websocket.rs`, `crates/shellumi-server-store/tests/postgres_acceptance.rs`, `CHANGELOG.md`, `docs/ARCHITECTURE.md`, `docs/CONFIGURATION.md`, `docs/development/TESTING.md`, and `docs/security/KEY_MANAGEMENT.md`.
+- Data migration or API compatibility: No new migration or protocol version; snapshots remain latest-only. Hints remain transient and require REST reconciliation.
+- Security / privacy review: Corrupt keys fail instead of being replaced, and failed persistent-key initialization no longer falls back to an ephemeral key. The operator-provided key requires an explicitly stable instance ID. Authorization and independent-process recovery are not fully validated.
+- Tests added (file + test names): `postgres_two_instances_deliver_subscribed_websocket_hints_both_directions` exercises PostgreSQL, two routers sharing an installation ID, authenticated subscriptions, bidirectional metadata, envelope publication and rotation, origin-free hints and vault deletion; `fresh_database_bootstrap_is_atomic_and_single_use` includes corrupt key rejection.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): Darwin 23.6.0 x86_64: `cargo fmt --all -- --check`, `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings`, `cargo build --locked --workspace --all-features`, and `cargo test --locked --doc --workspace` passed (0 doc tests). `cargo test --locked --workspace --all-features` passed 92 tests; three PostgreSQL-dependent test functions returned early because their URL was unset. Separately, on disposable PostgreSQL 16, `SHELLUMI_TEST_DATABASE_URL=postgres://postgres:testpassword@127.0.0.1:5433/shellumi_test cargo test --locked -p shellumi-server-store --test postgres_acceptance` passed 2, and `SHELLUMI_TEST_DATABASE_URL=postgres://postgres:testpassword@127.0.0.1:5433/shellumi_test cargo test --locked -p shellumi-server --test postgres_websocket` passed 1 after the heartbeat correction. The expanded WebSocket test was rerun after key-epoch changes and passed. `cargo audit` could not run because cargo-audit is not installed. No CI run. Disposable PostgreSQL container removed.
+- Known limitations / failed attempts: Two test routers run in one process; HTTP setup uses in-process requests. Real two-process HTTP, signed PostgreSQL commits/CAS/replay, pagination, tenant isolation, member revocation, listener restart, backpressure, missed-event reconciliation and end-to-end token rotation remain untested. NOTIFY is not a durable outbox; publication failure can lose hints. The initial WebSocket test failed because it treated an empty heartbeat as JSON; test corrected and rerun. Full independent re-audit remains outstanding.
+- Next precise step: Implement independent-process PostgreSQL HTTP/WebSocket acceptance covering signed commit, authorization and REST recovery across listener disconnect and restart; add it to CI before closing Phase 11.
+- Issue / PR / CI evidence: No new commit or CI run.
+
+## 2026-11-16T09:46:00Z — TASK-018 — Corrected single-server Phase 11 scope
+- Status: planned
+- Baseline / commit: `a5b448708c30035f04856df6e6ff09daba6c983a` plus uncommitted TASK-017 work, retained.
+- Objective and acceptance criteria: Implement and verify one-server multi-client/multi-vault notifications, security and PostgreSQL recovery against the corrected user prompt; keep Phase 11 partial until A1–A11 pass.
+- Implementation / files changed: Planned server subscription and event fixes, real socket/database tests, CI and documentation. Prior shared-DB cross-instance findings are optional HA work, not Phase 11 requirements.
+- Data migration or API compatibility: Preserve protocol v1, latest-only snapshots, bootstrap migration, and direct Google Drive/local modes.
+- Security / privacy review: Evaluate partial subscription authorization, resource bounds, event metadata and revoked sessions; no payload or secret logging.
+- Tests added (file + test names): Planned real WebSocket multi-vault, negative authorization, unsubscribe, commit and recovery tests, plus real PostgreSQL integration where feasible.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): Pending.
+- Known limitations / failed attempts: Existing TASK-017 shared-database test does not satisfy the corrected single-server acceptance matrix.
+- Next precise step: Fix atomic subscription validation and event semantics, then add real one-server tests.
+- Issue / PR / CI evidence: Corrected user-supplied Phase 11 prompt; no new CI run.
+- Tracking matrix: A1 bootstrap — store PostgreSQL tests exist, HTTP lifecycle incomplete; A2 identity — persistence implementation and store tests, restart test incomplete; A3–A7 real single-server sockets, multi-vault, signed reconciliation and revocation — incomplete; A8 PostgreSQL CAS/security — incomplete; A9 latest-only snapshots — implemented, concurrent PostgreSQL test incomplete; A10 CI — incomplete; A11 documentation — partial.
+
+## 2026-11-16T10:47:00Z — TASK-018 — Subscription security and event semantics milestone
+- Status: in_progress
+- Baseline / commit: `a5b448708c30035f04856df6e6ff09daba6c983a` plus uncommitted TASK-017 work.
+- Objective and acceptance criteria: Correct multi-vault subscription behavior and avoid false epoch/watermark hints within one server.
+- Implementation / files changed: `server.rs` applies subscriptions only after all vaults authorize, caps each connection at 128, validates session/device before messages and event delivery, emits real watermarks for membership changes and envelope publication, and reserves key-rotation hints for rotation. Added multi-vault authorization/unsubscribe checks to the PostgreSQL WebSocket regression; updated architecture and protocol docs.
+- Data migration or API compatibility: Protocol v1 retained; envelope publication hint changes from `vault.key_rotated` to `vault.changed`; latest-only snapshots retained.
+- Security / privacy review: Denied mixed requests no longer partially subscribe; per-event session validation limits revoked-device exposure. Remaining security and concurrency tests remain open.
+- Tests added (file + test names): Extended `postgres_two_instances_deliver_subscribed_websocket_hints_both_directions` with same-server multi-vault, mixed-denial and unsubscribe cases; test currently running.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): `cargo check --locked --workspace --all-features` passed on Darwin 23.6.0 x86_64 before test expansion; database tests pending.
+- Known limitations / failed attempts: A1–A11 remain partial; shared-database fanout is optional HA and not a Phase 11 acceptance criterion.
+- Next precise step: Complete PostgreSQL socket test, fix failures, and add real HTTP/signed mutation and recovery tests.
+- Issue / PR / CI evidence: No new CI run.
+
+## 2026-11-16T10:52:00Z — TASK-018 — Signed PostgreSQL sync and multi-vault socket milestone
+- Status: in_progress
+- Baseline / commit: `a5b448708c30035f04856df6e6ff09daba6c983a` plus uncommitted changes.
+- Objective and acceptance criteria: Demonstrate real signed HTTP commit, subscribed device hint and REST ciphertext reconciliation, plus atomic multi-vault authorization and unsubscribe.
+- Implementation / files changed: Expanded `crates/shellumi-server/tests/postgres_websocket.rs` with two enrolled devices on one server, a real loopback HTTP signed commit and change-feed read, mixed authorized/unauthorized subscription rejection and unsubscribe. Required PostgreSQL CI steps explicitly require the database URL.
+- Data migration or API compatibility: Protocol v1 retained; optional two-router coverage is not a Phase 11 gate.
+- Security / privacy review: Confirmed invalid mixed subscriptions add no vault, and a second device receives an authorized hint followed by matching ciphertext from REST. Full tenant, role and revocation matrix remains outstanding.
+- Tests added (file + test names): Expanded `postgres_two_instances_deliver_subscribed_websocket_hints_both_directions`.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): Darwin 23.6.0 x86_64, PostgreSQL 16 disposable container: `SHELLUMI_TEST_DATABASE_URL=postgres://postgres:testpassword@127.0.0.1:5433/shellumi_test cargo test --locked -p shellumi-server --test postgres_websocket` passed (1) after the additions. No CI run.
+- Known limitations / failed attempts: Setup still uses in-process HTTP for bootstrap and device registration; the test also includes optional shared-database router coverage. Full independent-user socket authorization, restart, pagination/recovery and real PostgreSQL CAS/security matrix remain incomplete.
+- Next precise step: Add PostgreSQL missed-event recovery and concurrent CAS tests; complete remaining quality gates and update A1–A11 status.
+- Issue / PR / CI evidence: No new CI run.
+
+## 2026-11-16T10:54:00Z — TASK-018 — Missed tombstone recovery milestone
+- Status: in_progress
+- Baseline / commit: `a5b448708c30035f04856df6e6ff09daba6c983a` plus working changes.
+- Objective and acceptance criteria: Show a disconnected device can recover a missed tombstone using its saved cursor after reconnecting to the same installation.
+- Implementation / files changed: Extended `crates/shellumi-server/tests/postgres_websocket.rs`; required PostgreSQL CI steps set `SHELLUMI_REQUIRE_POSTGRES` so missing database configuration fails rather than silently skipping.
+- Data migration or API compatibility: No schema change; latest-only snapshot contract unchanged.
+- Security / privacy review: Recovery uses the second enrolled device's authenticated REST request; broader membership and tenant isolation remain open.
+- Tests added (file + test names): Extended `postgres_two_instances_deliver_subscribed_websocket_hints_both_directions` with signed tombstone, disconnect, reconnect watermark and cursor feed assertion.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): On Darwin 23.6.0 x86_64 with disposable PostgreSQL 16, `SHELLUMI_REQUIRE_POSTGRES=1 SHELLUMI_TEST_DATABASE_URL=postgres://postgres:testpassword@127.0.0.1:5433/shellumi_test cargo test --locked -p shellumi-server --test postgres_websocket` passed (1). No CI run.
+- Known limitations / failed attempts: Full pagination, cursor expiry, snapshot concurrency, independent-user authorization, true process restart and real-PostgreSQL race/replay matrix remain open.
+- Next precise step: Add PostgreSQL concurrency/security tests and run all mandatory quality gates.
+- Issue / PR / CI evidence: No new CI run.
+
+## 2026-11-16T10:56:00Z — TASK-018 — PostgreSQL CAS and retry milestone
+- Status: in_progress
+- Baseline / commit: `a5b448708c30035f04856df6e6ff09daba6c983a` plus working changes.
+- Objective and acceptance criteria: Exercise two device writes racing on the same object and idempotent retry on a real PostgreSQL database.
+- Implementation / files changed: Extended `crates/shellumi-server/tests/postgres_websocket.rs` with concurrently submitted signed mutations and exact retry assertions.
+- Data migration or API compatibility: No changes; duplicate hints from an idempotent retry are advisory and clients reconcile through REST.
+- Security / privacy review: Both device signatures and per-device counters are verified on the production PostgreSQL path; broader replay, tenant and role cases remain open.
+- Tests added (file + test names): Extended `postgres_two_instances_deliver_subscribed_websocket_hints_both_directions` with same-object race, 409, exact retry and stable server sequence.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): Darwin 23.6.0 x86_64, PostgreSQL 16: `SHELLUMI_REQUIRE_POSTGRES=1 SHELLUMI_TEST_DATABASE_URL=postgres://postgres:testpassword@127.0.0.1:5433/shellumi_test cargo test --locked -p shellumi-server --test postgres_websocket` passed (1). No CI run.
+- Known limitations / failed attempts: Concurrent requests use router calls against a real database; complete different-object races, equivocation, counter rollback, independent users and restart coverage remain incomplete.
+- Next precise step: Validate required quality gates and document remaining A1–A11 gaps.
+- Issue / PR / CI evidence: No new CI run.
+
+## 2026-11-16T10:58:00Z — TASK-018 — Persistent server restart milestone
+- Status: in_progress
+- Baseline / commit: `a5b448708c30035f04856df6e6ff09daba6c983a` plus working changes.
+- Objective and acceptance criteria: Test ordinary PostgreSQL installation identity and token continuity through a real server process restart and verify corrupt-key startup fails.
+- Implementation / files changed: Added `postgres_server_process_restart_preserves_identity_and_fails_on_corrupt_key` in `crates/shellumi-server/tests/postgres_websocket.rs`; second sync device now obtains its own device-bound session. Updated testing documentation.
+- Data migration or API compatibility: No new migration or wire change.
+- Security / privacy review: Test starts the production binary with a database-generated key, bootstraps over loopback HTTP, kills and restarts the process, checks identity and active bearer session, then corrupts the persisted key and expects startup failure. Operator-provided key rotation remains untested.
+- Tests added (file + test names): `postgres_server_process_restart_preserves_identity_and_fails_on_corrupt_key`; expanded `postgres_two_instances_deliver_subscribed_websocket_hints_both_directions` with independent login and failure-path assertions.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): Darwin 23.6.0 x86_64 with PostgreSQL 16: `SHELLUMI_REQUIRE_POSTGRES=1 SHELLUMI_TEST_DATABASE_URL=postgres://postgres:testpassword@127.0.0.1:5433/shellumi_test cargo test --locked -p shellumi-server --test postgres_websocket postgres_server_process_restart_preserves_identity_and_fails_on_corrupt_key` passed (1); the multi-device regression separately passed (1). No CI run.
+- Known limitations / failed attempts: Test uses forced process termination rather than graceful SIGTERM. Additional user/tenant isolation, revocation, rollback, pagination, snapshot concurrency and Docker image restart gates remain open.
+- Next precise step: Run both PostgreSQL server tests together and finish final quality checks; retain Phase 11 partial until all A1–A11 gates pass.
+- Issue / PR / CI evidence: No new CI run.
+
+## 2026-11-16T11:00:00Z — TASK-018 — Device revocation regression
+- Status: in_progress
+- Baseline / commit: `a5b448708c30035f04856df6e6ff09daba6c983a` plus working changes.
+- Objective and acceptance criteria: Verify an independently authenticated revoked device stops receiving application frames and loses REST access.
+- Implementation / files changed: Extended `crates/shellumi-server/tests/postgres_websocket.rs` with active-socket device revocation and REST rejection; isolated test databases are deleted after successful runs.
+- Data migration or API compatibility: No schema or protocol change; revoked-device REST error remains 403 `DEVICE_REVOKED`.
+- Security / privacy review: The server checks the active device before handling subsequent WebSocket messages or forwarding notifications; full user deactivation and membership removal coverage remains open.
+- Tests added (file + test names): Extended `postgres_two_instances_deliver_subscribed_websocket_hints_both_directions`.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): Darwin 23.6.0 x86_64, PostgreSQL 16: first `SHELLUMI_REQUIRE_POSTGRES=1 SHELLUMI_TEST_DATABASE_URL=postgres://postgres:testpassword@127.0.0.1:5433/shellumi_test cargo test --locked -p shellumi-server --test postgres_websocket` run failed (1 pass, 1 fail) because the test expected 401 but the server returned 403; corrected the assertion and rerun is pending.
+- Known limitations / failed attempts: Other authorization and failure recovery paths remain incomplete; no CI run.
+- Next precise step: Verify corrected test, rerun quality gates and record the A1–A11 status.
+- Issue / PR / CI evidence: No new CI run.
+
+## 2026-11-18T05:10:27Z — TASK-019 — Device-bound session enforcement
+- Status: planned
+- Baseline / commit: `a5b448708c30035f04856df6e6ff09daba6c983a` plus TASK-017/018 uncommitted changes.
+- Objective and acceptance criteria: Reject conflicting token, session and request device identities; preserve unbound bootstrap-session enrollment; add a real PostgreSQL WebSocket regression and execute applicable checks.
+- Implementation / files changed: Planned authentication service and PostgreSQL socket integration test.
+- Data migration or API compatibility: No schema change; requests that substitute a different device for a bound session must fail.
+- Security / privacy review: Prevent a valid token bound to one device from authorizing another device via an overridden header.
+- Tests added (file + test names): Planned bound-device mismatch regression in `postgres_websocket.rs`.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): Previously running workspace and doc-test commands passed; test details recorded in prior session. New verification pending.
+- Known limitations / failed attempts: Prior TASK-018 progress headings with later times on 2026-11-16 were mistakenly written ahead of actual execution clock; their timestamps are approximate rather than verified event times. Results are retained without alteration.
+- Next precise step: Add regression for using a bound device token with another active device, then enforce equality.
+- Issue / PR / CI evidence: No new CI run.
+
+## 2026-11-18T05:15:00Z — TASK-019 — Session device binding regression and fix
+- Status: in_progress
+- Baseline / commit: `a5b448708c30035f04856df6e6ff09daba6c983a` plus existing work.
+- Objective and acceptance criteria: Enforce agreement among device IDs in token, persisted session, and request header without changing unbound enrollment sessions.
+- Implementation / files changed: `crates/shellumi-server-auth/src/lib.rs` now rejects conflicting non-empty bindings; PostgreSQL WebSocket test asserts the existing HTTP adapter rejects token/header substitution with 403.
+- Data migration or API compatibility: No schema change. Requests with conflicting device identities are rejected rather than selecting the request device.
+- Security / privacy review: The HTTP adapter already rejected direct token/header mismatch; the authentication service previously chose one ID without checking the stored session device, leaving inconsistent session/token combinations unchecked.
+- Tests added (file + test names): `tests::test_session_device_binding_rejects_conflicting_token_and_header`; extended `postgres_two_instances_deliver_subscribed_websocket_hints_both_directions`.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): On Darwin x86_64, `cargo test --locked -p shellumi-server-auth test_session_device_binding_rejects_conflicting_token_and_header` initially failed because the test fixture reused a unique public key; after correcting the fixture it failed at the intended binding assertion (old behavior); after the fix it passed (1). The initial PostgreSQL adapter test expected 401 and observed existing 403 rejection; expectation corrected, rerun pending.
+- Known limitations / failed attempts: Complete Phase 11 acceptance matrix and CI remain open.
+- Next precise step: Run PostgreSQL WebSocket tests and workspace quality gates, then document actual results.
+- Issue / PR / CI evidence: No new CI run.
+
+## 2026-11-18T05:17:00Z — TASK-019 — PostgreSQL binding and batch rollback milestone
+- Status: in_progress
+- Baseline / commit: `a5b448708c30035f04856df6e6ff09daba6c983a` plus uncommitted work.
+- Objective and acceptance criteria: Verify device-bound session protection and production PostgreSQL rollback with no partial sequence/counter update.
+- Implementation / files changed: Expanded `crates/shellumi-server/tests/postgres_websocket.rs` with a failed two-item batch followed by a successful retry using the rolled-back counter; authentication service fix and docs from previous milestone retained.
+- Data migration or API compatibility: No schema or protocol change.
+- Security / privacy review: A failed batch did not persist its first mutation, advance the watermark or consume the earlier counter; successful retry emitted the next sequence. Full tenant, independent-object race and snapshot isolation remain unverified.
+- Tests added (file + test names): Extended `postgres_two_instances_deliver_subscribed_websocket_hints_both_directions`; retained `test_session_device_binding_rejects_conflicting_token_and_header`.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): Darwin x86_64 with PostgreSQL 16: `SHELLUMI_REQUIRE_POSTGRES=1 SHELLUMI_TEST_DATABASE_URL=postgres://postgres:testpassword@127.0.0.1:5433/shellumi_test cargo test --locked -p shellumi-server --test postgres_websocket` passed (2), including restart and rollback. No CI run.
+- Known limitations / failed attempts: Phase 11 acceptance remains partial; this test uses one account with separately authenticated devices and includes optional shared-database router coverage.
+- Next precise step: Run full required local quality gates on current tree and update the acceptance matrix.
+- Issue / PR / CI evidence: No new CI run.
+
+## 2026-11-18T05:15:16Z — TASK-019 — Concurrent snapshot regression
+- Status: in_progress
+- Baseline / commit: `a5b448708c30035f04856df6e6ff09daba6c983a` plus working changes.
+- Objective and acceptance criteria: Verify a PostgreSQL snapshot racing a committed write returns a coherent watermark and record set.
+- Implementation / files changed: Expanded `crates/shellumi-server/tests/postgres_websocket.rs` with a concurrent snapshot/commit check.
+- Data migration or API compatibility: No schema or wire change; latest-only snapshots retained.
+- Security / privacy review: The test confirms the racing record's presence agrees with sequence 4 or 5, but it does not force every possible transaction interleaving.
+- Tests added (file + test names): Extended `postgres_two_instances_deliver_subscribed_websocket_hints_both_directions`.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): Darwin x86_64, PostgreSQL 16: `SHELLUMI_REQUIRE_POSTGRES=1 SHELLUMI_TEST_DATABASE_URL=postgres://postgres:testpassword@127.0.0.1:5433/shellumi_test cargo test --locked -p shellumi-server --test postgres_websocket` initially failed to compile due to a test temporary lifetime, then passed (2 tests) after correction. No CI run.
+- Known limitations / failed attempts: Deterministic isolation interleavings, comprehensive tenant and recovery matrix, and final CI remain outstanding.
+- Next precise step: Execute workspace format, Clippy, test, doc-test and build gates on current tree and record evidence.
+- Issue / PR / CI evidence: No new CI run.
+
+## 2026-11-18T05:16:44Z — TASK-019 — Independent-object PostgreSQL concurrency
+- Status: in_progress
+- Baseline / commit: `a5b448708c30035f04856df6e6ff09daba6c983a` plus working changes.
+- Objective and acceptance criteria: Confirm concurrent independent-object writes succeed with distinct consecutive PostgreSQL sequences.
+- Implementation / files changed: Expanded `crates/shellumi-server/tests/postgres_websocket.rs`; clarified independent installation boundaries and backup sensitivity in `PROJECT.md`, `docs/DEPLOYMENT.md`, and `docs/BACKUP_RESTORE.md`.
+- Data migration or API compatibility: No schema or protocol change.
+- Security / privacy review: Two signed device mutations yielded distinct sequences; multi-tenant and offline recovery edge cases remain open.
+- Tests added (file + test names): Extended `postgres_two_instances_deliver_subscribed_websocket_hints_both_directions` with independent-object race.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): Darwin x86_64 with PostgreSQL 16: `SHELLUMI_REQUIRE_POSTGRES=1 SHELLUMI_TEST_DATABASE_URL=postgres://postgres:testpassword@127.0.0.1:5433/shellumi_test cargo test --locked -p shellumi-server --test postgres_websocket` passed (2). Full workspace checks are in progress. No CI run.
+- Known limitations / failed attempts: Full independent-user authorization, repeated-object batch contracts, old cursor recovery, deterministic snapshot interleavings, release smoke and CI remain outstanding.
+- Next precise step: Finish workspace checks, update the acceptance matrix, and continue the remaining security and recovery cases.
+- Issue / PR / CI evidence: No new CI run.
+
+## 2026-11-18T05:17:25Z — TASK-019 — Repeated-object and pagination PostgreSQL coverage
+- Status: in_progress
+- Baseline / commit: `a5b448708c30035f04856df6e6ff09daba6c983a` plus working changes.
+- Objective and acceptance criteria: Verify repeated-object edits in a batch use sequential CAS and verify ordered, paginated PostgreSQL change feed including tombstones.
+- Implementation / files changed: Extended `crates/shellumi-server/tests/postgres_websocket.rs` with a two-mutation same-object batch and paginated HTTP change-feed assertions.
+- Data migration or API compatibility: No wire or schema changes; sequential CAS behavior is now documented.
+- Security / privacy review: Feed assertions cover sequence continuity and tombstone presence; tenant isolation and invalid cursor retention remain open.
+- Tests added (file + test names): Extended `postgres_two_instances_deliver_subscribed_websocket_hints_both_directions`.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): Darwin x86_64 with PostgreSQL 16: `SHELLUMI_REQUIRE_POSTGRES=1 SHELLUMI_TEST_DATABASE_URL=postgres://postgres:testpassword@127.0.0.1:5433/shellumi_test cargo test --locked -p shellumi-server --test postgres_websocket` passed (2). Workspace test run passed before this test-only addition; PostgreSQL tests executed separately. No CI run.
+- Known limitations / failed attempts: Concurrent tenant isolation, cursor expiry, deterministic snapshot interleavings and full release gate remain open.
+- Next precise step: Run strict quality gates on the current tree and continue the remaining authorization/recovery acceptance work.
+- Issue / PR / CI evidence: No new CI run.
+
+## 2026-11-18T05:17:40Z — TASK-020 — In-memory sequential batch parity
+- Status: planned
+- Baseline / commit: `a5b448708c30035f04856df6e6ff09daba6c983a` plus working changes.
+- Objective and acceptance criteria: Make repeated edits to one object within an in-memory batch follow the same sequential CAS and all-or-nothing semantics tested against PostgreSQL.
+- Implementation / files changed: Planned `crates/shellumi-server-store/src/lib.rs` and `crates/shellumi-server/tests/sync_and_vaults.rs`.
+- Data migration or API compatibility: No database or wire migration; aligns in-memory behavior with documented protocol v1.
+- Security / privacy review: Keep failed batches from applying partial records, sequences or counters.
+- Tests added (file + test names): Planned `test_repeated_object_batch_uses_sequential_cas`.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): Pending.
+- Known limitations / failed attempts: In-memory validation currently reads only pre-batch records.
+- Next precise step: Add a failing HTTP regression, stage records during validation, rerun tests.
+- Issue / PR / CI evidence: No new CI run.
+
+## 2026-11-18T05:18:28Z — TASK-020 — Sequential CAS parity and rollback regression
+- Status: in_progress
+- Baseline / commit: `a5b448708c30035f04856df6e6ff09daba6c983a` plus working changes.
+- Objective and acceptance criteria: Align in-memory repeated-object batch behavior with PostgreSQL while retaining rollback.
+- Implementation / files changed: `crates/shellumi-server-store/src/lib.rs` stages records by object ID during validation; `crates/shellumi-server/tests/sync_and_vaults.rs` exercises sequential revisions and failed-batch retry.
+- Data migration or API compatibility: No schema or wire changes; in-memory behavior now follows the existing protocol contract.
+- Security / privacy review: Staged changes are not committed before every mutation validates; regression verifies the failed batch does not consume its device counter or sequence.
+- Tests added (file + test names): `test_repeated_object_batch_uses_sequential_cas`.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): Darwin x86_64: `cargo test --locked -p shellumi-server --test sync_and_vaults test_repeated_object_batch_uses_sequential_cas` initially failed with 409 on the pre-fix behavior, then passed (1) after the fix; expanded rollback assertion passed on rerun. No CI run.
+- Known limitations / failed attempts: Broader Phase 11 acceptance remains partial.
+- Next precise step: Run workspace and PostgreSQL regressions after the store change, then verify outstanding security and recovery cases.
+- Issue / PR / CI evidence: No new CI run.
+
+## 2026-11-18T05:20:56Z — TASK-020 — Independent member socket and revocation
+- Status: in_progress
+- Baseline / commit: `a5b448708c30035f04856df6e6ff09daba6c983a` plus working changes.
+- Objective and acceptance criteria: Exercise a separately authenticated user sharing a vault, receiving a signed-change hint, then losing access after removal.
+- Implementation / files changed: Extended `crates/shellumi-server/tests/postgres_websocket.rs` with PostgreSQL user setup, device proof of possession, bound login, live subscription, HTTP reconciliation and membership revocation.
+- Data migration or API compatibility: No protocol or schema changes.
+- Security / privacy review: The removed member received `vault.access_revoked` and its subsequent REST change-feed request returned 404. Other tenant and role cases remain unverified.
+- Tests added (file + test names): Extended `postgres_two_instances_deliver_subscribed_websocket_hints_both_directions`.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): Darwin x86_64, PostgreSQL 16: `SHELLUMI_REQUIRE_POSTGRES=1 SHELLUMI_TEST_DATABASE_URL=postgres://postgres:testpassword@127.0.0.1:5433/shellumi_test cargo test --locked -p shellumi-server --test postgres_websocket` passed (2). No CI run.
+- Known limitations / failed attempts: User provisioning and initial membership use direct database/test router setup; full HTTP onboarding, cross-tenant tests, reconnect overflow, release smoke and CI remain open.
+- Next precise step: Rerun strict quality checks after the latest test additions and extend security and recovery coverage.
+- Issue / PR / CI evidence: No new CI run.
+
+## 2026-11-18T05:22:21Z — TASK-020 — PostgreSQL viewer and deactivated-user restrictions
+- Status: in_progress
+- Baseline / commit: `a5b448708c30035f04856df6e6ff09daba6c983a` plus working changes.
+- Objective and acceptance criteria: Verify viewer write denial, removed-member resubscription denial and deactivated-user session enforcement over live sockets.
+- Implementation / files changed: Expanded `crates/shellumi-server/tests/postgres_websocket.rs` with signed viewer-write denial, removed-member subscription denial and deactivation checks.
+- Data migration or API compatibility: No schema or wire changes.
+- Security / privacy review: A viewer received 403 for a signed commit; a removed member could not resubscribe; a deactivated user lost its active socket and REST access. Cross-tenant and full role matrix remain open.
+- Tests added (file + test names): Extended `postgres_two_instances_deliver_subscribed_websocket_hints_both_directions`.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): Darwin x86_64 with PostgreSQL 16: `SHELLUMI_REQUIRE_POSTGRES=1 SHELLUMI_TEST_DATABASE_URL=postgres://postgres:testpassword@127.0.0.1:5433/shellumi_test cargo test --locked -p shellumi-server --test postgres_websocket` passed (2). No CI run.
+- Known limitations / failed attempts: User deactivation is performed directly in test database; full HTTP admin and cross-tenant flows remain untested.
+- Next precise step: Run strict quality gates on the current tree and extend the remaining authorization/recovery cases.
+- Issue / PR / CI evidence: No new CI run.
+
+## 2026-11-18T05:23:14Z — TASK-020 — Cross-tenant read and subscription isolation
+- Status: in_progress
+- Baseline / commit: `a5b448708c30035f04856df6e6ff09daba6c983a` plus working changes.
+- Objective and acceptance criteria: Verify that one tenant cannot read or subscribe to another tenant's unshared vault while explicit sharing remains functional.
+- Implementation / files changed: Extended `crates/shellumi-server/tests/postgres_websocket.rs` to create a second tenant and assert inaccessible vault HTTP and WebSocket denial.
+- Data migration or API compatibility: No schema or wire changes.
+- Security / privacy review: The unshared cross-tenant vault returned 404 to REST and `SUBSCRIPTION_DENIED` to WebSocket; explicitly shared membership remained accessible until removal. Other tenant-swapped IDs and role endpoints remain untested.
+- Tests added (file + test names): Extended `postgres_two_instances_deliver_subscribed_websocket_hints_both_directions`.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): Darwin x86_64 with PostgreSQL 16: `SHELLUMI_REQUIRE_POSTGRES=1 SHELLUMI_TEST_DATABASE_URL=postgres://postgres:testpassword@127.0.0.1:5433/shellumi_test cargo test --locked -p shellumi-server --test postgres_websocket` passed (2). No CI run.
+- Known limitations / failed attempts: Tenant creation uses test-store setup; broader IDOR matrix remains open.
+- Next precise step: Verify signed cross-vault transplantation rejection and finish full quality checks.
+- Issue / PR / CI evidence: No new CI run.
+
+## 2026-11-18T05:24:07Z — TASK-020 — Signed cross-vault transplant rejection
+- Status: in_progress
+- Baseline / commit: `a5b448708c30035f04856df6e6ff09daba6c983a` plus working changes.
+- Objective and acceptance criteria: Verify that a valid signed mutation cannot be transplanted into another vault.
+- Implementation / files changed: Extended `crates/shellumi-server/tests/postgres_websocket.rs` with a signed-vault-ID transplantation attempt.
+- Data migration or API compatibility: No changes.
+- Security / privacy review: The PostgreSQL-backed API rejected the transplanted signature with 403. Other AAD and tenant-swapped payload cases remain unverified.
+- Tests added (file + test names): Extended `postgres_two_instances_deliver_subscribed_websocket_hints_both_directions`.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): Darwin x86_64 with PostgreSQL 16: `SHELLUMI_REQUIRE_POSTGRES=1 SHELLUMI_TEST_DATABASE_URL=postgres://postgres:testpassword@127.0.0.1:5433/shellumi_test cargo test --locked -p shellumi-server --test postgres_websocket` passed (2). No CI run.
+- Known limitations / failed attempts: Change-feed retention expiry is not implemented; the current 410 path rejects cursors beyond the watermark. Remaining A1–A11 cases and CI are open.
+- Next precise step: Add real PostgreSQL invalid-cursor and latest-snapshot recovery checks and document the retention limitation.
+- Issue / PR / CI evidence: No new CI run.
+
+## 2026-11-18T05:24:56Z — TASK-020 — Cursor and latest snapshot recovery checks
+- Status: in_progress
+- Baseline / commit: `a5b448708c30035f04856df6e6ff09daba6c983a` plus working changes.
+- Objective and acceptance criteria: Verify PostgreSQL-backed malformed/future cursor errors and latest-only snapshot behavior.
+- Implementation / files changed: Extended `crates/shellumi-server/tests/postgres_websocket.rs`; documented the missing retention-based expiry behavior in `docs/API.md`, `docs/PROTOCOL_V1.md`, and `docs/development/TESTING.md`.
+- Data migration or API compatibility: No schema or protocol change. Current 410 covers a cursor ahead of the current watermark, not an old cursor pruned by retention.
+- Security / privacy review: Latest snapshot excludes a deleted record, preserves the high watermark, and historical revision requests reject with 422; no plaintext was introduced.
+- Tests added (file + test names): Extended `postgres_two_instances_deliver_subscribed_websocket_hints_both_directions`.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): Darwin x86_64 with PostgreSQL 16: `SHELLUMI_REQUIRE_POSTGRES=1 SHELLUMI_TEST_DATABASE_URL=postgres://postgres:testpassword@127.0.0.1:5433/shellumi_test cargo test --locked -p shellumi-server --test postgres_websocket` passed (2). No CI run.
+- Known limitations / failed attempts: Retention pruning and detection of older-than-retained cursors are not implemented; broad security and recovery matrix remains open.
+- Next precise step: Implement or explicitly scope retention semantics, then rerun required quality checks and finish other A1–A11 acceptance gaps.
+- Issue / PR / CI evidence: No new CI run.
+
+## 2026-11-18T05:25:40Z — TASK-021 — Change-feed gap detection
+- Status: planned
+- Baseline / commit: `a5b448708c30035f04856df6e6ff09daba6c983a` plus working changes.
+- Objective and acceptance criteria: Reject a cursor when the next expected durable sequence is no longer available; permit latest-snapshot recovery and prevent silent partial feeds. Test PostgreSQL simulated pruning and unaffected contiguous pages.
+- Implementation / files changed: Planned `crates/shellumi-server-sync/src/lib.rs`, PostgreSQL integration test and cursor documentation.
+- Data migration or API compatibility: No migration; HTTP 410 `CURSOR_EXPIRED` will cover unavailable earlier change sequences as well as cursors ahead of the watermark.
+- Security / privacy review: Gap detection prevents silently omitting a committed change or tombstone; it does not implement automatic retention pruning.
+- Tests added (file + test names): Planned regression in `postgres_two_instances_deliver_subscribed_websocket_hints_both_directions`.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): Pending.
+- Known limitations / failed attempts: No automatic feed pruning exists; tests will remove entries only in a disposable database.
+- Next precise step: Add failing simulated-pruning regression, implement sequence-gap detection and rerun PostgreSQL and workspace checks.
+- Issue / PR / CI evidence: No new CI run.
+
+## 2026-11-18T05:27:42Z — TASK-021 — Change-feed gap detection regression
+- Status: in_progress
+- Baseline / commit: `a5b448708c30035f04856df6e6ff09daba6c983a` plus working changes.
+- Objective and acceptance criteria: Return 410 for missing required change sequences and allow a cursor immediately before the retained range.
+- Implementation / files changed: `crates/shellumi-server-sync/src/lib.rs` checks contiguous sequence delivery and rejects absent history; `crates/shellumi-server/tests/postgres_websocket.rs` simulates prefix, internal and complete history loss; API, protocol, testing and changelog docs describe recovery.
+- Data migration or API compatibility: No migration; HTTP 410 `CURSOR_EXPIRED` now also indicates an unavailable change-feed sequence. Automatic pruning is not implemented.
+- Security / privacy review: Missing changes and tombstones are no longer silently skipped; clients must recover from a latest snapshot. No automatic history deletion was added.
+- Tests added (file + test names): Extended `postgres_two_instances_deliver_subscribed_websocket_hints_both_directions` for pruned prefix, middle gap, entirely missing log, and valid retained cursor.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): Darwin x86_64, PostgreSQL 16: `SHELLUMI_REQUIRE_POSTGRES=1 SHELLUMI_TEST_DATABASE_URL=postgres://postgres:testpassword@127.0.0.1:5433/shellumi_test cargo test --locked -p shellumi-server --test postgres_websocket postgres_two_instances_deliver_subscribed_websocket_hints_both_directions` failed on the old behavior (200 instead of 410), then the unfiltered PostgreSQL test command passed (2) after implementation and again after additional gap cases. No CI run.
+- Known limitations / failed attempts: Automatic retention pruning and deterministic concurrent pruning are not implemented or verified; other Phase 11 acceptance gaps remain.
+- Next precise step: Run workspace quality gates on the current code and continue outstanding authorization and recovery coverage.
+- Issue / PR / CI evidence: No new CI run.
+
+## 2026-11-18T10:41:36Z — TASK-022 — Bind idempotent retries to originating device
+- Status: planned
+- Baseline / commit: `a5b448708c30035f04856df6e6ff09daba6c983a` plus existing uncommitted changes.
+- Objective and acceptance criteria: Reject a replay of another device's cached idempotent mutation response while preserving exact retries by the originating device; enforce this both before and within the transaction.
+- Implementation / files changed: Planned sync engine, in-memory and PostgreSQL store implementations, and HTTP regression.
+- Data migration or API compatibility: No migration; same key and payload submitted under a different device will return 409.
+- Security / privacy review: Prevent copied signatures from bypassing the retry's device identity via the pre-validation cache path and transaction race.
+- Tests added (file + test names): Planned extension of `test_idempotent_retries_and_payload_tamper_rejection`.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): Pending.
+- Known limitations / failed attempts: PostgreSQL and localhost escalation are currently unavailable because automatic approval review hit the usage limit; no bypass attempted.
+- Next precise step: Reproduce the cache mismatch in the in-memory HTTP test, fix all repository paths, and run local checks.
+- Issue / PR / CI evidence: No new CI run.
+
+## 2026-11-18T10:43:29Z — TASK-022 — Device-bound idempotency implementation
+- Status: in_progress
+- Baseline / commit: `a5b448708c30035f04856df6e6ff09daba6c983a` plus existing working tree.
+- Objective and acceptance criteria: A cached commit response may be replayed only by its originating device with the same payload.
+- Implementation / files changed: Updated `crates/shellumi-server-sync/src/lib.rs` and both `crates/shellumi-server-store/src/{lib,pg}.rs` idempotency checks; extended in-memory and PostgreSQL integration tests and documented 409 behavior in API/protocol/changelog.
+- Data migration or API compatibility: No migration; cross-device reuse of an idempotency key now returns `IDEMPOTENCY_CONFLICT` (409).
+- Security / privacy review: Both pre-validation cache lookup and transactional cache check bind the saved response to the original device. PostgreSQL behavior is not yet rerun due to local approval-review usage limit.
+- Tests added (file + test names): `test_idempotent_retries_and_payload_tamper_rejection` now covers another active device; `postgres_two_instances_deliver_subscribed_websocket_hints_both_directions` has a matching PostgreSQL assertion.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): On Darwin x86_64, `cargo test --locked -p shellumi-server --test sync_and_vaults test_idempotent_retries_and_payload_tamper_rejection` failed before the fix (200 instead of 409), then passed after the fix (1). PostgreSQL integration remains unexecuted for this change.
+- Known limitations / failed attempts: Automatic approval review could not complete the requested PostgreSQL test because the usage limit was reached; no escalation bypass was attempted. Phase 11 remains partial.
+- Next precise step: Run local format, lint, unit and build checks; rerun PostgreSQL integration once approval review is available.
+- Issue / PR / CI evidence: No new CI run.
+
+## 2026-11-18T10:44:56Z — TASK-022 — Local quality checks and acceptance status
+- Status: partial
+- Baseline / commit: `a5b448708c30035f04856df6e6ff09daba6c983a`; all changes remain uncommitted.
+- Objective and acceptance criteria: Verify current local changes and record the corrected single-server Phase 11 matrix without overstating coverage.
+- Implementation / files changed: Device-bound idempotency checks and regression from the preceding TASK-022 milestone; no additional runtime change in this entry.
+- Data migration or API compatibility: Cross-device idempotency-key reuse now returns 409; no migration.
+- Security / privacy review: Cross-device cached-response replay is covered in-memory. PostgreSQL transaction-path assertion is added but not yet executed after this change.
+- Tests added (file + test names): `test_idempotent_retries_and_payload_tamper_rejection` and an additional assertion in `postgres_two_instances_deliver_subscribed_websocket_hints_both_directions`.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): Darwin x86_64: `cargo fmt --all -- --check`, `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings`, `cargo build --locked --workspace --all-features`, and `cargo test --locked --doc --workspace` passed (0 doc tests). `cargo test --locked --workspace --all-features` passed 94 non-PostgreSQL tests; four PostgreSQL-dependent test functions returned early without the database URL and must not be counted as database execution. The targeted in-memory regression passed after first failing on the prior 200 response. PostgreSQL tests were last run before TASK-022, not after it. `cargo audit` was not available. No CI run for the current tree.
+- Known limitations / failed attempts: Automatic approval review did not execute the requested PostgreSQL test because its usage limit was reached; this was a review failure, not a safety determination. No bypass attempted. Full process/network, authorization, overflow, retention and release gates remain open.
+- Next precise step: Once approval review is available, run `SHELLUMI_REQUIRE_POSTGRES=1 SHELLUMI_TEST_DATABASE_URL=postgres://postgres:testpassword@127.0.0.1:5433/shellumi_test cargo test --locked -p shellumi-server --test postgres_websocket`; then complete the remaining matrix and obtain CI evidence for an authorized final commit.
+- Issue / PR / CI evidence: No new commit or CI run.
+- Acceptance matrix: A1 partial (PostgreSQL bootstrap/migration tests, CI for final tree pending); A2 partial (process restart/default key tested, operator-key lifecycle open); A3–A5 partial (live multi-user/multi-vault and signed HTTP/feed assertions tested before latest change, full cases/CI open); A6 partial (member/device/user revocation and role checks tested, remaining logout/key cases open); A7 partial (cursor pagination, gap detection, tombstone reconnect tested, overflow and retention pruning open); A8 partial (CAS, counters, rollback and cross-vault checks tested, latest device-binding PostgreSQL assertion and full matrix open); A9 partial (concurrent snapshot and error checks, exhaustive interleavings open); A10 open (no final commit/CI, audit unavailable); A11 partial (documentation updated, further reconciliation remains).
+
+## 2026-11-18T11:09:11Z — TASK-023 — Publish partial Phase 11 work
+- Status: partial
+- Baseline / commit: `a5b448708c30035f04856df6e6ff09daba6c983a` plus the uncommitted TASK-017–022 changes.
+- Objective and acceptance criteria: At the user's request, document, commit and push the current single-server Phase 11 work without claiming completion.
+- Implementation / files changed: Authentication and device-bound idempotency checks; in-memory sequential CAS parity; change-feed gap detection; subscription authorization and event semantics; PostgreSQL and WebSocket regressions; CI and related architecture, API, configuration, security, deployment, compatibility and progress documentation. See the commit diff and prior milestone entries for exact paths.
+- Data migration or API compatibility: No new migration in this increment. Cross-device idempotency-key reuse returns 409, missing change sequences return 410, and key-envelope publication uses a `vault.changed` hint; protocol remains v1.
+- Security / privacy review: Session, device, vault and retry checks were strengthened. Automatic retention pruning, full authorization/recovery coverage and independently audited security remain outstanding.
+- Tests added (file + test names): See TASK-017–022, including `test_session_device_binding_rejects_conflicting_token_and_header`, `test_repeated_object_batch_uses_sequential_cas`, `test_idempotent_retries_and_payload_tamper_rejection`, and PostgreSQL server acceptance tests.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): Previous TASK-022 entry records local fmt, strict Clippy, workspace tests (94 non-PostgreSQL tests; four PostgreSQL-dependent functions returned early), doc-tests and build passing on Darwin x86_64. The latest cross-device idempotency PostgreSQL assertion was not run; earlier PostgreSQL runs passed before that change. `git diff --check` passed before publication. `cargo audit` unavailable; no CI run for the current tree.
+- Known limitations / failed attempts: Automatic approval review could not execute the latest PostgreSQL test due to a usage limit; Phase 11 and the A1–A11 acceptance matrix remain partial. Single-process server architecture is authoritative; shared-database fanout is experimental, not a release gate.
+- Next precise step: Commit and push these partial changes; then run the required PostgreSQL acceptance suite and review CI for the resulting commit when approval access permits.
+- Issue / PR / CI evidence: Commit and push are requested; no new CI evidence at the time this entry was written.

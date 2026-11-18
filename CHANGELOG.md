@@ -8,8 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Idempotent commit retries are bound to the originating device; another device cannot replay a copied cached response.
+- Change-feed requests now return `CURSOR_EXPIRED` when a required sequence is missing, allowing clients to recover from a latest snapshot. Automatic retention pruning remains unimplemented.
+- In-memory batches now apply sequential compare-and-set semantics for repeated edits to the same object, matching PostgreSQL.
+- Material changes emit advisory sync hints after success; shared-database multi-process fanout is experimental. Persistent signing-key initialization errors fail startup.
 - Historical snapshot revision requests return 422 rather than incorrect state; the PostgreSQL singleton migration preserves one prior installation and rejects duplicate settings rows.
-- PostgreSQL acceptance coverage now exercises bootstrap and settings migration, but the complete HTTP and cross-instance WebSocket paths remain unfinished.
+- PostgreSQL acceptance coverage now includes bootstrap, migration, server restart, signed sync and WebSocket scenarios; the full single-server authorization and recovery matrix remains unfinished.
 
 ### Added
 - **Milestone M0: Repository foundations and project hygiene**
@@ -91,3 +95,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Database-backed migration status reporting (`shellumi-server migrate status`).
   - Complete overhaul of `README.md` with project description, architecture diagrams, operating modes, CLI usage, deployment guides, and status badges.
 
+
+- Corrected Phase 11 scope to one server process per independent installation; subscription requests are atomic and capped at 128 vaults, and envelope publication emits a change hint rather than claiming a key rotation.

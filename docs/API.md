@@ -1174,3 +1174,11 @@ volatile and polling has gaps: reconcile through REST before beginning or
 resuming polling and after every 204, disconnect, error, or overflow.
 
 Historical snapshots are not available: `GET /api/v1/vaults/{id}/snapshots/{revision}` accepts only the current watermark; older and future revisions return 422. Use the latest snapshot and resume from its watermark.
+
+Each authenticated WebSocket is scoped to one independent server and permits up to 128 vault subscriptions. A subscribe request containing any inaccessible vault is rejected without adding any of its vaults. Envelope publication produces a `vault.changed` hint; `vault.key_rotated` indicates actual epoch rotation. Hints require REST reconciliation.
+
+A device-bound session rejects a request when its token, stored session and device header specify conflicting devices. Unbound bootstrap sessions can enroll devices.
+
+`CURSOR_EXPIRED` (410) is returned for a cursor ahead of the watermark or when the next expected change sequence is unavailable. Automatic feed retention pruning is not implemented; clients recover by taking a latest snapshot and resuming from its watermark.
+
+An idempotency key is bound to the originating device as well as the mutation payload. An exact retry from that device returns the saved acknowledgement; reusing the key from another device returns 409.
