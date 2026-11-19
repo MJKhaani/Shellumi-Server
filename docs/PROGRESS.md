@@ -1626,3 +1626,16 @@ This journal records every increment, decision, test execution, and verification
 - Known limitations / failed attempts: None. Single-server architecture is verified; cross-instance notification recovery is experimental.
 - Next precise step: Commit changes, tag `v0.1.0-alpha`, and push commit and tag to remote.
 - Issue / PR / CI evidence: User approved commit, tag, and push.
+
+## 2026-11-19T12:08:45Z — TASK-025 — Multi-platform release matrix expansion
+- Status: complete
+- Baseline / commit: `a08d30e645013d84536394b700f9421f530f971a`.
+- Objective and acceptance criteria: Expand `.github/workflows/release.yml` native binary release matrix to include Windows (`x86_64-pc-windows-msvc`) and macOS (`x86_64-apple-darwin`, `aarch64-apple-darwin`), package platform-specific archives (.tar.gz and .zip) with SHA256 checksums, and update release asset publication.
+- Implementation / files changed: `.github/workflows/release.yml`, `docs/PROGRESS.md`.
+- Data migration or API compatibility: None; build and workflow automation only.
+- Security / privacy review: Preserves pinned toolchains, non-root container packaging, and independent artifact SHA256 checksum generation.
+- Tests added (file + test names): Workflow syntax and YAML structure verification.
+- Verification executed (exact commands, OS, counts, pass/fail/skip): Darwin: `git diff --check` passed; YAML structure validated.
+- Known limitations / failed attempts: Initial tag was deleted locally and remotely to ensure release workflow incorporates multi-platform matrix before publishing.
+- Next precise step: Commit changes, push main, recreate tag v0.1.0-alpha and push tag to origin.
+- Issue / PR / CI evidence: User requested multi-platform support, local/remote tag deletion, and re-push.
