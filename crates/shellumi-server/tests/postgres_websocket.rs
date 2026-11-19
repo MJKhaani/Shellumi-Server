@@ -3,7 +3,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use shellumi_server::{config::ServerConfig, server::create_router_with_store};
-use shellumi_server_store::{AnyStore, OrgRepository, PgStore, UserRepository};
+use shellumi_server_store::{AnyStore, OrgRepository, PgStore, SyncRepository, UserRepository};
 use std::future::IntoFuture;
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
@@ -293,6 +293,72 @@ async fn postgres_two_instances_deliver_subscribed_websocket_hints_both_directio
         "subscribed"
     );
 
+    // Deletion notifications must not disclose an unrelated tenant's vault ID.
+    let owner_extra = call(
+        &app1,
+        "POST",
+        "/api/v1/vaults",
+        Some(token),
+        json!({"vault_type":"personal","encrypted_name":"owner-extra"}),
+    )
+    .await;
+    let owner_extra = owner_extra["vault_id"].as_str().unwrap();
+    let poll_request = |access: &str, device_id: &str| {
+        Request::builder()
+            .uri("/api/v1/sync/poll")
+            .header("authorization", format!("Bearer {access}"))
+            .header("x-device-id", device_id)
+            .body(Body::empty())
+            .unwrap()
+    };
+    let mut owner_poll = tokio::spawn(app1.clone().oneshot(poll_request(token, device)));
+    let member_poll = tokio::spawn(
+        app1.clone()
+            .oneshot(poll_request(member_token, member_device)),
+    );
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    call(
+        &app1,
+        "DELETE",
+        &format!("/api/v1/vaults/{other_tenant_vault}"),
+        Some(member_token),
+        json!({}),
+    )
+    .await;
+    let member_response = member_poll.await.unwrap().unwrap();
+    assert_eq!(
+        member_response.status(),
+        200,
+        "authorized deletion poll must receive a hint"
+    );
+    let member_event: Value = serde_json::from_slice(
+        &axum::body::to_bytes(member_response.into_body(), 4096)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(member_event["vault_id"], other_tenant_vault);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), &mut owner_poll)
+            .await
+            .is_err()
+    );
+    call(
+        &app1,
+        "DELETE",
+        &format!("/api/v1/vaults/{owner_extra}"),
+        Some(token),
+        json!({}),
+    )
+    .await;
+    let owner_event: Value = serde_json::from_slice(
+        &axum::body::to_bytes(owner_poll.await.unwrap().unwrap().into_body(), 4096)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(owner_event["vault_id"], owner_extra);
+
     // A second authenticated device subscribes to the same installation.
     let (other_key, other_public) =
         shellumi_server_crypto::generate_test_ed25519_keypair().unwrap();
@@ -397,6 +463,172 @@ async fn postgres_two_instances_deliver_subscribed_websocket_hints_both_directio
     )
     .await;
     assert_eq!(committed["commit_sequence"], 1);
+    // Commit and retry must wait for concurrent authorization changes and then
+    // observe the committed result, without allocating a sequence or writing data.
+    let owner_id = Uuid::parse_str(boot["user_id"].as_str().unwrap()).unwrap();
+    let device_uuid = Uuid::parse_str(device).unwrap();
+    let hash = {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(
+            serde_json::to_vec(&batch.mutations).unwrap(),
+        ))
+    };
+    let mut new_batch = batch.clone();
+    new_batch.idempotency_key = "authorization-race".into();
+    new_batch.mutations[0].object_id = "authorization-race".into();
+    new_batch.mutations[0].device_counter = 2;
+    for (sql, retry) in [
+        (
+            "UPDATE vault_members SET role = 'viewer' WHERE vault_id = $1 AND user_id = $2",
+            false,
+        ),
+        (
+            "UPDATE devices SET revoked_at = 1 WHERE id = $1 AND user_id = $2",
+            true,
+        ),
+        (
+            "DELETE FROM vault_members WHERE vault_id = $1 AND user_id = $2",
+            true,
+        ),
+    ] {
+        let mut blocker = pg.pool().begin().await.unwrap();
+        let first_id = if sql.contains("devices") {
+            device_uuid
+        } else {
+            vault_uuid
+        };
+        sqlx::query(sql)
+            .bind(first_id)
+            .bind(owner_id)
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+        let store = pg.clone();
+        let request = if retry {
+            batch.clone()
+        } else {
+            new_batch.clone()
+        };
+        let request_hash = hash.clone();
+        let mut commit = tokio::spawn(async move {
+            store
+                .apply_commit_batch(vault_uuid, device_uuid, &request, &request_hash)
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), &mut commit)
+                .await
+                .is_err(),
+            "commit should wait for the authorization change"
+        );
+        blocker.commit().await.unwrap();
+        assert!(commit.await.unwrap().is_err());
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM change_log WHERE vault_id = $1")
+            .bind(vault_uuid)
+            .fetch_one(pg.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "denied commit must not write a change");
+        if sql.contains("devices") {
+            sqlx::query("UPDATE devices SET revoked_at = NULL WHERE id = $1")
+                .bind(device_uuid)
+                .execute(pg.pool())
+                .await
+                .unwrap();
+        } else if sql.starts_with("DELETE") {
+            sqlx::query(
+                "INSERT INTO vault_members (vault_id, user_id, role) VALUES ($1, $2, 'owner')",
+            )
+            .bind(vault_uuid)
+            .bind(owner_id)
+            .execute(pg.pool())
+            .await
+            .unwrap();
+        } else {
+            sqlx::query(
+                "UPDATE vault_members SET role = 'owner' WHERE vault_id = $1 AND user_id = $2",
+            )
+            .bind(vault_uuid)
+            .bind(owner_id)
+            .execute(pg.pool())
+            .await
+            .unwrap();
+        }
+    }
+    // Exercise the sync engine's cached response path while a role change is
+    // uncommitted. The initial read sees the old role; the transactional retry
+    // must wait and reject after the downgrade commits.
+    let mut role_tx = pg.pool().begin().await.unwrap();
+    sqlx::query("UPDATE vault_members SET role = 'viewer' WHERE vault_id = $1 AND user_id = $2")
+        .bind(vault_uuid)
+        .bind(owner_id)
+        .execute(&mut *role_tx)
+        .await
+        .unwrap();
+    let retry_request = Request::builder()
+        .method("POST")
+        .uri(format!("/api/v1/vaults/{vault}/commits"))
+        .header("authorization", format!("Bearer {token}"))
+        .header("x-device-id", device)
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&batch).unwrap()))
+        .unwrap();
+    let mut retry = tokio::spawn(app1.clone().oneshot(retry_request));
+    assert!(tokio::time::timeout(Duration::from_millis(150), &mut retry)
+        .await
+        .is_err());
+    role_tx.commit().await.unwrap();
+    assert_eq!(retry.await.unwrap().unwrap().status(), 403);
+    sqlx::query("UPDATE vault_members SET role = 'owner' WHERE vault_id = $1 AND user_id = $2")
+        .bind(vault_uuid)
+        .bind(owner_id)
+        .execute(pg.pool())
+        .await
+        .unwrap();
+
+    let mut epoch_tx = pg.pool().begin().await.unwrap();
+    sqlx::query("UPDATE vaults SET active_key_epoch = 2 WHERE id = $1")
+        .bind(vault_uuid)
+        .execute(&mut *epoch_tx)
+        .await
+        .unwrap();
+    let store = pg.clone();
+    let epoch_request = new_batch.clone();
+    let epoch_hash = hash.clone();
+    let mut epoch_commit = tokio::spawn(async move {
+        store
+            .apply_commit_batch(vault_uuid, device_uuid, &epoch_request, &epoch_hash)
+            .await
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), &mut epoch_commit)
+            .await
+            .is_err()
+    );
+    epoch_tx.commit().await.unwrap();
+    assert!(matches!(
+        epoch_commit.await.unwrap(),
+        Err(shellumi_server_domain::DomainError::StaleKeyEpoch { .. })
+    ));
+    assert!(
+        pg.apply_commit_batch(vault_uuid, device_uuid, &batch, &hash)
+            .await
+            .is_ok(),
+        "an authorized exact retry remains valid after rotation"
+    );
+    sqlx::query("UPDATE vaults SET active_key_epoch = 1 WHERE id = $1")
+        .bind(vault_uuid)
+        .execute(pg.pool())
+        .await
+        .unwrap();
+    let state: (i64, i64, i64) = sqlx::query_as("SELECT server_sequence, (SELECT COUNT(*) FROM records WHERE vault_id = $1), (SELECT COUNT(*) FROM mutation_idempotency WHERE vault_id = $1) FROM vaults WHERE id = $1")
+        .bind(vault_uuid).fetch_one(pg.pool()).await.unwrap();
+    assert_eq!(
+        state,
+        (1, 1, 1),
+        "rejected attempts must leave no partial writes"
+    );
+
     for ws in [&mut ws1, &mut ws2, &mut ws3, &mut member_ws] {
         let msg = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -478,6 +710,11 @@ async fn postgres_two_instances_deliver_subscribed_websocket_hints_both_directio
         app1.clone().oneshot(viewer_request).await.unwrap().status(),
         403
     );
+    let revoked_poll = tokio::spawn(
+        app1.clone()
+            .oneshot(poll_request(member_token, member_device)),
+    );
+    tokio::time::sleep(Duration::from_secs(1)).await;
     let remove_member = Request::builder()
         .method("DELETE")
         .uri(format!("/api/v1/vaults/{vault}/members/{member_id}"))
@@ -488,6 +725,14 @@ async fn postgres_two_instances_deliver_subscribed_websocket_hints_both_directio
         app1.clone().oneshot(remove_member).await.unwrap().status(),
         204
     );
+    let revoked_event: Value = serde_json::from_slice(
+        &axum::body::to_bytes(revoked_poll.await.unwrap().unwrap().into_body(), 4096)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(revoked_event["vault_id"], vault);
+
     let revoked = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let msg = member_ws.next().await.unwrap().unwrap();
@@ -1551,6 +1796,129 @@ async fn postgres_two_instances_deliver_subscribed_websocket_hints_both_directio
             "vault.access_revoked"
         );
     }
+    // Revoking one refresh token closes only that session; all-session logout
+    // subsequently closes the remaining session.
+    let session_a = call(
+        &app1,
+        "POST",
+        "/api/v1/auth/login",
+        None,
+        json!({"identifier":"tester","password":"AdminSecurePassword123!","device_id":device}),
+    )
+    .await;
+    let session_b = call(
+        &app1,
+        "POST",
+        "/api/v1/auth/login",
+        None,
+        json!({"identifier":"tester","password":"AdminSecurePassword123!","device_id":device}),
+    )
+    .await;
+    let ws_request = |access: &str| {
+        let mut request = format!("ws://{addr1}/api/v1/events/ws")
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert("authorization", format!("Bearer {access}").parse().unwrap());
+        request
+            .headers_mut()
+            .insert("x-device-id", device.parse().unwrap());
+        request
+    };
+    let (mut session_a_ws, _) =
+        tokio_tungstenite::connect_async(ws_request(session_a["access_token"].as_str().unwrap()))
+            .await
+            .unwrap();
+    let (mut session_b_ws, _) =
+        tokio_tungstenite::connect_async(ws_request(session_b["access_token"].as_str().unwrap()))
+            .await
+            .unwrap();
+    // A delayed all-session hint must not disconnect a session created after
+    // the corresponding revocation has already completed.
+    sqlx::query("SELECT pg_notify('shellumi_sync_events', $1)")
+        .bind(json!({"type":"logout", "user_id":owner_id, "session_id":null}).to_string())
+        .execute(pg.pool())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    session_b_ws
+        .send(Message::Text(
+            json!({"action":"subscribe","request_id":"new-session","vault_ids":[]}).to_string(),
+        ))
+        .await
+        .unwrap();
+    let new_session_ack = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let message = session_b_ws.next().await.unwrap().unwrap();
+            if message.is_text() {
+                break message;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(new_session_ack.to_text().unwrap()).unwrap()["event"],
+        "subscribed"
+    );
+    call(
+        &app1,
+        "POST",
+        "/api/v1/auth/logout",
+        Some(token),
+        json!({"refresh_token":session_a["refresh_token"]}),
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match session_a_ws.next().await {
+                None | Some(Ok(Message::Close(_))) | Some(Err(_)) => break,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("revoked session websocket should close");
+    session_b_ws
+        .send(Message::Text(
+            json!({"action":"subscribe","request_id":"still-active","vault_ids":[]}).to_string(),
+        ))
+        .await
+        .unwrap();
+    let active = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let message = session_b_ws.next().await.unwrap().unwrap();
+            if message.is_text() {
+                break message;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(active.to_text().unwrap()).unwrap()["event"],
+        "subscribed"
+    );
+    call(
+        &app1,
+        "POST",
+        "/api/v1/auth/logout",
+        Some(session_b["access_token"].as_str().unwrap()),
+        json!({}),
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match session_b_ws.next().await {
+                None | Some(Ok(Message::Close(_))) | Some(Err(_)) => break,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("all-session logout should close remaining websocket");
+
     server1.abort();
     server2.abort();
     sqlx::query(&format!("DROP DATABASE {db} WITH (FORCE)"))

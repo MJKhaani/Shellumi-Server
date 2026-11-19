@@ -70,3 +70,5 @@ a bounded connection pool and a 20-second timeout. Hints remain process-local.
 The pending installation-key migration stores the token-signing secret in PostgreSQL. A database reader or backup recipient can obtain it and forge tokens; protect database access and backups as authentication secrets. The new storage and restart paths are not independently audited, and cross-instance notification recovery remains unverified.
 
 Device-bound authentication rejects conflicting non-empty device identities in the request, signed token and persisted session. Unbound bootstrap sessions remain usable for enrollment. Broader authorization and session lifecycle coverage remains incomplete.
+
+Commit transactions recheck membership, write role and device revocation while holding PostgreSQL row locks; the locked vault row coordinates deletion and key epoch changes. Cached retries cross the same boundary. These controls are implemented but not independently audited; notification hints are ephemeral and require REST reconciliation.

@@ -101,3 +101,5 @@ The 2026-11-16 independent re-verification found production PostgreSQL, snapshot
 Experimental sync WebSocket hints are implemented in the server; client integration,
 durable multi-process fanout,
 and comprehensive network and authorization tests remain outstanding.
+
+Phase 11 follow-up (TASK-024): deletion poll authorization, session-specific logout notifications, and transactional write and cached-retry authorization are implemented; final quality gates and CI remain pending. See [progress](PROGRESS.md#2026-11-19t050432z--task-024--postgresql-and-lint-verification).

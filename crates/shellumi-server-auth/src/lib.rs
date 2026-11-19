@@ -558,18 +558,24 @@ impl<S: Store> AuthService<S> {
     }
 
     /// Revokes a session / refresh token.
-    pub async fn logout(&self, user_id: Uuid, req: LogoutRequest) -> Result<(), DomainError> {
+    pub async fn logout(
+        &self,
+        user_id: Uuid,
+        req: LogoutRequest,
+    ) -> Result<Option<Option<Uuid>>, DomainError> {
         if let Some(token) = req.refresh_token {
             let hash = hash_refresh_token(&token);
             if let Some(session) = self.store.find_active_by_token_hash(&hash).await? {
                 if session.user_id == user_id {
                     self.store.revoke_session(session.id).await?;
+                    return Ok(Some(Some(session.id)));
                 }
             }
         } else {
             self.store.revoke_all_for_user(user_id).await?;
+            return Ok(Some(None));
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Retrieves user profile and organization memberships.

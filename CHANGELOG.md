@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Long-poll deletion hints now honor vault membership and targeted revocations; logout disconnects only revoked sessions unless all sessions are revoked. PostgreSQL commit and cached-retry authorization now coordinate with device, membership, and key epoch changes.
 - Idempotent commit retries are bound to the originating device; another device cannot replay a copied cached response.
 - Change-feed requests now return `CURSOR_EXPIRED` when a required sequence is missing, allowing clients to recover from a latest snapshot. Automatic retention pruning remains unimplemented.
 - In-memory batches now apply sequential compare-and-set semantics for repeated edits to the same object, matching PostgreSQL.

@@ -83,10 +83,12 @@ vault change hints. Each connection rechecks device status and vault membership
 before forwarding a hint; the change feed remains authoritative. The channel is
 not durable or shared across server processes. Disconnect or receiver lag requires
 a full client reconciliation. WebSocket authentication requires a session-bound
-access token; logout signals the user’s sockets to close, while session validity,
+access token; a single-session logout signals that session’s sockets to close, and an all-session logout signals all of the user’s sockets, while session validity,
 token expiry, and device revocation are checked during delivery and heartbeat. The bounded long-poll fallback uses the same process-local broadcast channel;
 it has gaps between requests and requires REST reconciliation.
 
 Each running router has an ephemeral notification origin distinct from the persistent server installation identity. Successful material HTTP operations publish best-effort PostgreSQL NOTIFY hints and dispatch locally; peer listeners suppress only their own origin. NOTIFY is transient, has no durable outbox, and can be lost during disconnects or publication failures. Clients must reconcile from authenticated REST snapshots and change feeds after reconnect or a resync indication; multi-instance recovery is not yet fully tested.
 
 The supported deployment is one server process per independent installation and database. Independent servers do not communicate or replicate. A client maintains a separate authenticated connection per server and may subscribe to multiple vaults on each connection. Shared-database multi-process fanout is experimental and is not a Phase 11 gate.
+
+PostgreSQL commit transactions lock the vault, device, and membership rows through authorization and mutation, including cached retries. Device revocation, role changes and key epoch changes therefore serialize with the affected commit; denied commits do not allocate a sequence.

@@ -1859,23 +1859,35 @@ impl SyncRepository for PgStore {
             None => return Err(DomainError::VaultNotFound(vault_id)),
         };
 
-        // 2. Validate key epochs
-        for m in &req.mutations {
-            if m.key_epoch < active_key_epoch {
-                return Err(DomainError::StaleKeyEpoch {
-                    current: active_key_epoch,
-                    provided: m.key_epoch,
-                });
-            }
-            if m.key_epoch > active_key_epoch {
-                return Err(DomainError::FutureKeyEpoch {
-                    current: active_key_epoch,
-                    provided: m.key_epoch,
-                });
-            }
+        // Serialize authorization with device revocation and membership updates.
+        // The vault lock above also serializes key rotation and deletion.
+        let device = sqlx::query("SELECT user_id, revoked_at FROM devices WHERE id = $1 FOR SHARE")
+            .bind(device_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(map_db_error)?
+            .ok_or(DomainError::DeviceNotFound)?;
+        if device.get::<Option<i64>, _>("revoked_at").is_some() {
+            return Err(DomainError::DeviceRevoked);
+        }
+        let user_id: Uuid = device.get("user_id");
+        let member = sqlx::query(
+            "SELECT role FROM vault_members WHERE vault_id = $1 AND user_id = $2 FOR SHARE",
+        )
+        .bind(vault_id)
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_db_error)?
+        .ok_or(DomainError::NotFound)?;
+        let role: String = member.get("role");
+        if !matches!(role.as_str(), "owner" | "administrator" | "editor") {
+            return Err(DomainError::PermissionDenied(
+                "Viewers do not have write access to this vault".to_string(),
+            ));
         }
 
-        // 3. Check idempotency within transaction lock
+        // Return an authorized exact retry without applying another mutation.
         let idem_row = sqlx::query(
             "SELECT device_id, request_hash, response_payload FROM mutation_idempotency WHERE vault_id = $1 AND idempotency_key = $2",
         )
@@ -1895,6 +1907,22 @@ impl SyncRepository for PgStore {
             } else {
                 return Err(DomainError::IdempotencyConflict {
                     key: req.idempotency_key.clone(),
+                });
+            }
+        }
+
+        // Validate key epoch for a new mutation.
+        for m in &req.mutations {
+            if m.key_epoch < active_key_epoch {
+                return Err(DomainError::StaleKeyEpoch {
+                    current: active_key_epoch,
+                    provided: m.key_epoch,
+                });
+            }
+            if m.key_epoch > active_key_epoch {
+                return Err(DomainError::FutureKeyEpoch {
+                    current: active_key_epoch,
+                    provided: m.key_epoch,
                 });
             }
         }

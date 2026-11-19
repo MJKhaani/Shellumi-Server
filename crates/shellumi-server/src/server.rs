@@ -57,7 +57,10 @@ enum SyncEvent {
         user_id: Option<Uuid>,
         notification_id: Uuid,
     },
-    Logout(Uuid),
+    Logout {
+        user_id: Uuid,
+        session_id: Option<Uuid>,
+    },
 }
 
 #[derive(Clone)]
@@ -111,10 +114,14 @@ impl AppState {
                     "source_instance": instance_id,
                 })
             }
-            SyncEvent::Logout(user_id) => {
+            SyncEvent::Logout {
+                user_id,
+                session_id,
+            } => {
                 serde_json::json!({
                     "type": "logout",
                     "user_id": user_id,
+                    "session_id": session_id,
                     "source_instance": instance_id,
                 })
             }
@@ -292,8 +299,16 @@ pub fn create_router_with_auth_and_sync(
                                                         if let Ok(user_id) =
                                                             Uuid::parse_str(uid_str)
                                                         {
-                                                            let _ = notif_tx
-                                                                .send(SyncEvent::Logout(user_id));
+                                                            let _ =
+                                                                notif_tx.send(SyncEvent::Logout {
+                                                                    user_id,
+                                                                    session_id: val
+                                                                        .get("session_id")
+                                                                        .and_then(|v| v.as_str())
+                                                                        .and_then(|s| {
+                                                                            Uuid::parse_str(s).ok()
+                                                                        }),
+                                                                });
                                                         }
                                                     }
                                                 }
@@ -685,10 +700,15 @@ async fn logout_handler(
     };
 
     match state.auth.logout(claims.sub, req).await {
-        Ok(()) => {
-            state
-                .broadcast_sync_event(SyncEvent::Logout(claims.sub))
-                .await;
+        Ok(scope) => {
+            if let Some(session_id) = scope {
+                state
+                    .broadcast_sync_event(SyncEvent::Logout {
+                        user_id: claims.sub,
+                        session_id,
+                    })
+                    .await;
+            }
             (
                 StatusCode::OK,
                 Json(serde_json::json!({ "status": "logged_out" })),
@@ -886,10 +906,18 @@ async fn sync_poll_handler(State(state): State<AppState>, headers: HeaderMap) ->
     let result = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             match rx.recv().await {
-                Ok(SyncEvent::Logout(user)) if user == claims.sub => {
-                    return StatusCode::UNAUTHORIZED.into_response()
+                Ok(SyncEvent::Logout {
+                    user_id,
+                    session_id,
+                }) if user_id == claims.sub
+                    && (session_id.is_none() || session_id == claims.session_id) =>
+                {
+                    if !notification_access_valid(&state, &claims, device_id).await {
+                        return StatusCode::UNAUTHORIZED.into_response();
+                    }
+                    continue;
                 }
-                Ok(SyncEvent::Logout(_)) => continue,
+                Ok(SyncEvent::Logout { .. }) => continue,
                 Err(_) => {
                     return (
                         StatusCode::CONFLICT,
@@ -926,7 +954,17 @@ async fn sync_poll_handler(State(state): State<AppState>, headers: HeaderMap) ->
                         SyncEvent::AccessRevoked {
                             vault_id, user_id, ..
                         } => {
-                            if user_id.is_none() || user_id == Some(claims.sub) {
+                            if user_id == Some(claims.sub)
+                                || (user_id.is_none()
+                                    && matches!(
+                                        state
+                                            .auth
+                                            .store()
+                                            .get_vault_member_role(vault_id, claims.sub)
+                                            .await,
+                                        Ok(Some(_))
+                                    ))
+                            {
                                 return Json(serde_json::json!({
                                     "type": "vault_deleted",
                                     "vault_id": vault_id,
@@ -953,7 +991,7 @@ async fn sync_poll_handler(State(state): State<AppState>, headers: HeaderMap) ->
                                 }
                             }
                         }
-                        SyncEvent::Logout(_) => continue,
+                        SyncEvent::Logout { .. } => continue,
                     }
                 }
             }
@@ -1165,11 +1203,9 @@ async fn events_ws_socket(
                             }
                         }
                     }
-                    Ok(SyncEvent::Logout(user_id)) => {
-                        if user_id == claims.sub {
-                            break;
-                        }
-                    }
+                    // Session validity was rechecked above; an active session may
+                    // have been created after an all-sessions logout completed.
+                    Ok(SyncEvent::Logout { .. }) => {}
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         let err_msg = WsServerMessage::Error {
                             code: "RESYNC_REQUIRED".to_string(),

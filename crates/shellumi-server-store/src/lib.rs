@@ -1279,23 +1279,25 @@ impl SyncRepository for InMemoryStore {
             (vault.server_sequence, vault.active_key_epoch)
         };
 
-        // 1. Key epoch validation
-        for m in &req.mutations {
-            if m.key_epoch < active_key_epoch {
-                return Err(DomainError::StaleKeyEpoch {
-                    current: active_key_epoch,
-                    provided: m.key_epoch,
-                });
-            }
-            if m.key_epoch > active_key_epoch {
-                return Err(DomainError::FutureKeyEpoch {
-                    current: active_key_epoch,
-                    provided: m.key_epoch,
-                });
-            }
+        let device = lock
+            .devices
+            .get(&device_id)
+            .ok_or(DomainError::DeviceNotFound)?;
+        if device.revoked_at.is_some() {
+            return Err(DomainError::DeviceRevoked);
+        }
+        let member = lock
+            .vault_members
+            .iter()
+            .find(|m| m.vault_id == vault_id && m.user_id == device.user_id)
+            .ok_or(DomainError::NotFound)?;
+        if !member.role.can_write() {
+            return Err(DomainError::PermissionDenied(
+                "Viewers do not have write access to this vault".to_string(),
+            ));
         }
 
-        // 2. Idempotency validation
+        // Return an authorized exact retry without applying another mutation.
         if let Some(existing) = lock
             .idempotency
             .get(&(vault_id, req.idempotency_key.clone()))
@@ -1307,6 +1309,22 @@ impl SyncRepository for InMemoryStore {
             } else {
                 return Err(DomainError::IdempotencyConflict {
                     key: req.idempotency_key.clone(),
+                });
+            }
+        }
+
+        // Validate key epoch for a new mutation.
+        for m in &req.mutations {
+            if m.key_epoch < active_key_epoch {
+                return Err(DomainError::StaleKeyEpoch {
+                    current: active_key_epoch,
+                    provided: m.key_epoch,
+                });
+            }
+            if m.key_epoch > active_key_epoch {
+                return Err(DomainError::FutureKeyEpoch {
+                    current: active_key_epoch,
+                    provided: m.key_epoch,
                 });
             }
         }
@@ -1963,6 +1981,20 @@ mod tests {
             .await
             .unwrap();
 
+        store
+            .create_device(&Device {
+                id: device_id,
+                user_id,
+                device_name: "test".into(),
+                signing_public_key: "signing".into(),
+                agreement_public_key: "agreement".into(),
+                created_at: now,
+                last_seen_at: None,
+                revoked_at: None,
+            })
+            .await
+            .unwrap();
+
         let req = CommitBatchRequest {
             protocol_version: 1,
             vault_id,
@@ -2012,6 +2044,49 @@ mod tests {
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].object_id, "host-1");
         assert_eq!(changes[0].sequence, 1);
+        assert!(store
+            .apply_commit_batch(vault_id, device_id, &req, "request-hash-1")
+            .await
+            .is_ok());
+        store
+            .add_vault_member(&VaultMember {
+                vault_id,
+                user_id,
+                role: VaultRole::Viewer,
+                joined_at: now,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .apply_commit_batch(vault_id, device_id, &req, "request-hash-1")
+                .await,
+            Err(DomainError::PermissionDenied(_))
+        ));
+        store.remove_vault_member(vault_id, user_id).await.unwrap();
+        assert!(matches!(
+            store
+                .apply_commit_batch(vault_id, device_id, &req, "request-hash-1")
+                .await,
+            Err(DomainError::NotFound)
+        ));
+        store
+            .add_vault_member(&VaultMember {
+                vault_id,
+                user_id,
+                role: VaultRole::Owner,
+                joined_at: now,
+            })
+            .await
+            .unwrap();
+        store.revoke_device(device_id, user_id).await.unwrap();
+        assert!(matches!(
+            store
+                .apply_commit_batch(vault_id, device_id, &req, "request-hash-1")
+                .await,
+            Err(DomainError::DeviceRevoked)
+        ));
+        assert_eq!(store.get_changes(vault_id, 0, 10).await.unwrap().len(), 1);
     }
 
     #[tokio::test]

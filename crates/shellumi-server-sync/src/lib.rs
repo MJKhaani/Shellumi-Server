@@ -251,9 +251,10 @@ impl<S: Store> SyncEngine<S> {
             .await?
         {
             if idem.device_id == device_id && idem.request_hash == request_hash {
-                let cached: CommitBatchResponse = serde_json::from_str(&idem.response_payload)
-                    .map_err(|e| DomainError::Internal(e.to_string()))?;
-                return Ok(cached);
+                return self
+                    .store
+                    .apply_commit_batch(req.vault_id, device_id, &req, &request_hash)
+                    .await;
             } else {
                 return Err(DomainError::IdempotencyConflict {
                     key: req.idempotency_key,

@@ -82,7 +82,7 @@ The loopback delivery test also checks a vault deletion hint, socket closure on
 logout, and rejection of a reconnect using the revoked session token.
 
 The notification integration test exercises a long-poll hint and unauthenticated
-long-poll rejection; timeout, overflow and cross-tenant isolation remain untested.
+long-poll rejection. PostgreSQL acceptance also covers deletion isolation and targeted member revocation; timeout and overflow remain untested.
 
 The PostgreSQL CI job also runs `cargo test --locked -p shellumi-server --test postgres_websocket`, using `SHELLUMI_TEST_DATABASE_URL`. It starts two routers and real subscribed loopback WebSockets sharing a PostgreSQL database; it exercises signed HTTP commits and cursor recovery, metadata, key publication, rotation, origin-free hints and deletion. A separate test starts and restarts a real PostgreSQL-backed server process and checks identity, token continuity and corrupt-key startup failure. Full HTTP setup, overload, listener reconnection and the authorization matrix remain incomplete.
 
@@ -91,3 +91,5 @@ Phase 11 targets one server process per installation, multiple client sockets an
 The PostgreSQL socket test also exercises conflicting and independent concurrent writes, sequential repeated-object CAS, transaction rollback, cursor pagination, tombstone recovery, and snapshot/write concurrency. These checks do not exhaust all race interleavings or the tenant and authorization matrix.
 
 `CURSOR_EXPIRED` (410) is returned for a cursor ahead of the watermark or when the next expected change sequence is unavailable. Automatic feed retention pruning is not implemented; clients recover by taking a latest snapshot and resuming from its watermark.
+
+The PostgreSQL WebSocket acceptance test races commit and cached retry against membership downgrade/removal, device revocation, and key epoch changes; it checks atomic rejection, session-scoped logout, all-session logout, and cross-tenant poll isolation.

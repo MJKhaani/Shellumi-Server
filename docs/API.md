@@ -144,6 +144,7 @@ All JSON error responses use standard status codes and the following body struct
 }
 ```
 - **Response:** `200 OK`
+- A supplied refresh token revokes only its session; omitting it revokes all sessions for the authenticated user. Active notification sockets for revoked sessions close.
 
 ### Current User Profile
 - **Path:** `GET /api/v1/me`
@@ -1170,7 +1171,7 @@ the WebSocket endpoint. It returns one `vault_changed` or `vault_deleted` JSON
 hint with 200, 204 after 20 seconds without an authorized hint, 401 if the
 session or device is invalid, 429 when the shared connection limit is reached,
 and 409 with `RESYNC_REQUIRED` if its broadcast receiver falls behind. Hints are
-volatile and polling has gaps: reconcile through REST before beginning or
+volatile and polling has gaps. Deletion hints are delivered only to retained vault members or explicitly revoked members; unrelated users do not receive vault IDs. Reconcile through REST before beginning or
 resuming polling and after every 204, disconnect, error, or overflow.
 
 Historical snapshots are not available: `GET /api/v1/vaults/{id}/snapshots/{revision}` accepts only the current watermark; older and future revisions return 422. Use the latest snapshot and resume from its watermark.
@@ -1181,4 +1182,4 @@ A device-bound session rejects a request when its token, stored session and devi
 
 `CURSOR_EXPIRED` (410) is returned for a cursor ahead of the watermark or when the next expected change sequence is unavailable. Automatic feed retention pruning is not implemented; clients recover by taking a latest snapshot and resuming from its watermark.
 
-An idempotency key is bound to the originating device as well as the mutation payload. An exact retry from that device returns the saved acknowledgement; reusing the key from another device returns 409.
+An idempotency key is bound to the originating device as well as the mutation payload. An exact retry from that device returns the saved acknowledgement only while the device remains active and its user has write access to the vault; reusing the key from another device returns 409.
